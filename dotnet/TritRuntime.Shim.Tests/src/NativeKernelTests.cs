@@ -71,6 +71,52 @@ public abstract class NativeKernelTestBase
 /// <summary>原生内核（Rust trit_rt.dll）测试；本机没有构建产物时自动跳过。</summary>
 public sealed class NativeKernelTests : NativeKernelTestBase
 {
+    /// <summary>
+    /// 回归：显式路径加载时，落盘文件名与 DllImport 声明名<b>不一致</b>也必须加载成功。
+    /// </summary>
+    /// <remarks>
+    /// 真机（tML 专用服务器实测）上原生库从 <c>.tmod</c> 取出后按「内容摘要 + 文件名」落盘，
+    /// 变成 <c>f5324a5d3721286d_trit_rt.dll</c>。而登记到解析器的名字曾是从路径推导的，
+    /// 于是得到 <c>f5324a5d3721286d_trit_rt</c>，与 <see cref="NativeBindings.LibraryName"/>
+    /// 常量 <c>trit_rt</c> 不等，解析器永不命中，退回默认探测后抛
+    /// <c>DllNotFoundException: Unable to load DLL 'trit_rt' ... (0x8007007E)</c>。
+    /// 测试进程里 dll 恰好就叫 trit_rt.dll，所以这条路径长期没被覆盖到。
+    /// </remarks>
+    [Fact]
+    public void ExplicitPathLoadSucceedsWhenFileNameIsPrefixed()
+    {
+        var source = LibraryPath ?? throw new InvalidOperationException(MissingLibraryHint);
+
+        var directory = Path.Combine(Path.GetTempPath(), "trit-shim-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var staged = Path.Combine(directory, "deadbeefcafe1234_trit_rt.dll");
+        File.Copy(source, staged, overwrite: true);
+
+        try
+        {
+            using var kernel = NativeKernel.Load(staged);
+            Assert.Equal(KernelMode.Native, kernel.Mode);
+            Assert.Equal(NativeKernel.ExpectedAbiVersion, NativeBindings.AbiVersion());
+
+            // 不只是加载成功，还要真的能用：订阅 → 发布 → 推进。
+            kernel.Subscribe(1, 100, 0, Array.Empty<uint>());
+            kernel.Publish(100, new[] { TritDelta.Pos });
+            Assert.NotEmpty(kernel.Step(1).Intents);
+        }
+        finally
+        {
+            // Windows 上已加载的 DLL 文件被进程锁定，删不掉——忽略即可，目录在临时目录下。
+            try
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+            catch (Exception)
+            {
+                // 清理失败不影响测试结论
+            }
+        }
+    }
+
     [Fact]
     public void AbiAndVersionAreAccepted()
     {

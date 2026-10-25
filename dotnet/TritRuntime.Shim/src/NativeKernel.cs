@@ -36,9 +36,13 @@ public sealed class NativeKernel : ITritKernel
     /// <param name="configJson">配置 JSON（空 = 默认）。</param>
     public static NativeKernel Load(string libraryPath, string configJson = "")
     {
-        var libraryName = System.IO.Path.GetFileNameWithoutExtension(libraryPath);
         var handle = NativeLibrary.Load(libraryPath);
-        NativeImportResolver.RegisterExplicitLibrary(libraryName, handle);
+
+        // 登记名必须是 DllImport 声明用的名字，绝不能从落盘文件名推导：
+        // 真机上原生库按「内容摘要 + 文件名」落盘（避免覆盖仍在占用中的旧版本），
+        // 从路径推导会得到 "<hash>_trit_rt"，与 DllImport 的 "trit_rt" 不等，
+        // 解析器永不命中，于是退回默认探测并抛 DllNotFoundException（0x8007007E）。
+        NativeImportResolver.RegisterExplicitLibrary(NativeBindings.LibraryName, handle);
 
         var abi = NativeBindings.AbiVersion();
         if (abi != ExpectedAbiVersion)

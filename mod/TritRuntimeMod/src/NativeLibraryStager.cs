@@ -87,21 +87,60 @@ internal static class NativeLibraryStager
         {
             Directory.CreateDirectory(root);
 
-            // 内容摘要做前缀：内容一变就是新路径，不会撞上仍在占用中的旧文件。
+            // 内容摘要做「目录」而不是文件名前缀：
+            // 文件名必须保持 trit_rt.dll —— DllImport 声明的库名是常量 "trit_rt"，
+            // 一旦文件名被加了前缀，从路径推导出来的名字就与它对不上，
+            // 解析器不命中，加载必然失败（真机实测 0x8007007E）。
+            // 用目录隔离同样能避免覆盖仍在占用中的旧版本。
             string tag = Convert.ToHexString(SHA256.HashData(bytes).AsSpan(0, 8)).ToLowerInvariant();
-            string path = Path.Combine(root, tag + "_" + fileName);
+            string directory = Path.Combine(root, tag);
+            Directory.CreateDirectory(directory);
+            string path = Path.Combine(directory, fileName);
 
             if (!File.Exists(path) || new FileInfo(path).Length != bytes.Length)
             {
                 File.WriteAllBytes(path, bytes);
             }
 
+            PruneOldVersions(root, tag);
             return path;
         }
         catch (Exception ex)
         {
             mod.Logger.Warn($"[trit] 原生内核落盘失败（本次会话使用托管回退）：{ex.Message}");
             return null;
+        }
+    }
+
+    /// <summary>
+    /// 清掉非当前版本的落盘目录。
+    /// 摘要目录只增不删，否则每次升级都白留一份 2.5 MB；
+    /// 旧目录可能被上一个尚未退出的进程占用，删除失败一律忽略。
+    /// </summary>
+    private static void PruneOldVersions(string root, string keep)
+    {
+        try
+        {
+            foreach (string directory in Directory.EnumerateDirectories(root))
+            {
+                if (string.Equals(Path.GetFileName(directory), keep, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    Directory.Delete(directory, recursive: true);
+                }
+                catch (Exception)
+                {
+                    // 被占用就下次再清
+                }
+            }
+        }
+        catch (Exception)
+        {
+            // 枚举失败（目录不存在 / 权限）不影响本次加载
         }
     }
 
