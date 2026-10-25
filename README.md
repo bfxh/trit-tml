@@ -87,12 +87,14 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 |---|---|---|
 | Rust 内核测试 | ✅ 42/42 | `cargo test -p trit-rt --release` |
 | Rust clippy / fmt | ✅ 0 警告 / 干净 | `cargo clippy --all-targets`、`cargo fmt --check` |
-| C# 兼容壳测试 | ✅ 109/109 | `dotnet test`，含原生 vs 托管 51 步逐字节对拍 |
+| C# 兼容壳测试 | ✅ 110/110 | `dotnet test`，含原生 vs 托管 51 步逐字节对拍 |
 | 原生 / 托管语义等价 | ✅ 快照字节、统计、PRNG 流、冲突诊断全部对拍 | `ParityTests` |
 | 已知能力差异 | 仅 `Capabilities` 一处：托管回退无 AI 投票（`caps` 少 `0x100` 位、`abi=0`） | 测试中逐字节钉死 |
 | 模组编译 | ✅ 0 警告 0 错误（Debug/Release） | `dotnet build` |
 | 模组 `.tmod` 打包 | ✅ 走 tML 官方管线，含 `lib/TritRuntime.Shim.dll` + `lib/Native/trit_rt.dll` | `-p:BuildMod=true`（需先关游戏） |
-| 模组**进游戏实跑** | ✅ 已跑通（本机 tML 1.4.4.9，客户端） | 见下 |
+| 模组**进游戏实跑**（客户端） | ✅ 已跑通（本机 tML 1.4.4.9） | 见下 |
+| 模组**专用服务器实跑**（无头） | ✅ 装载 / 自检 / 原生库加载全通；`mode=Native` | 见下 |
+| 服务器侧 tick 数据 | ❌ 未取得 | 无玩家连接时服务器不跑世界更新循环（引擎行为），见 issue |
 
 ### 真机实跑记录（2026-10-26）
 
@@ -122,13 +124,47 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 > 读两个内核的实现才确认语义是「每元素一个 trit 值」，已回退并补测试钉死。
 > 这条现在写在 `ShadowDiffer.Fingerprint` 的注释里，免得再踩。
 
+### 专用服务器实跑记录（2026-10-26，无头 `-server`）
+
+客户端跑能验证「装得上」，但每次都要开 Steam GUI。专用服务器可以无头启动，
+于是我自己闭环跑了一遍 —— 这一轮的价值是**证明 Rust 原生内核真的在真机上跑起来了**：
+
+```
+[trit] 已从模组包取出原生内核：...\TritRuntime\native\f5324a5d3721286d\trit_rt.dll
+[trit] 运行时装配完成 mode=Native abi=1 caps=0x1FF arbitration=Majority
+[trit] 自检 snapshot=1 commit(applied=1,seq=1) ... => PASS
+[trit] 钩子安装完成：3/3
+```
+
+`mode` 从 `Managed` 变成 `Native`，`caps` 从 `0xFF` 变成 `0x1FF`（AI 投票位回归）——
+上一轮修的「原生库随包分发」到这里才算真的闭环。
+
+**同时又揪出 1 个 bug（第 4 个）：**
+
+| # | 问题 | 根因 | 修法 |
+|---|---|---|---|
+| 4 | 原生库取出来了却加载失败：`Unable to load DLL 'trit_rt' (0x8007007E)` | 解析器登记名从落盘路径推导，落盘名是 `<hash>_trit_rt.dll`，于是登记成 `<hash>_trit_rt`；而 `DllImport` 用的是常量 `"trit_rt"`，**永不命中**。测试进程里 dll 恰好就叫 `trit_rt.dll`，所以这个组合长期没被覆盖 | 登记改用 `NativeBindings.LibraryName` 常量；落盘改为 `native/<hash>/trit_rt.dll`（摘要降为目录名，文件名保持原样） |
+
+**还发现一个「装好了但全程空转」的静默故障：**
+
+服务器上跑 100+ 秒，一条 tick 日志都没有。逐层二分定位：
+
+1. `Terraria.Main.Update(GameTime)` **在服务器端从不触发**（服务器走 `Main.DedServ` 自己的循环）
+2. 换成官方 `ModSystem.PostUpdateEverything()` 后**依然不触发**；已确认 `TritWorldSystem`
+   被 tML 实例化（`OnModLoad` 日志打出来了），回调却一次没到
+3. 服务器 85 秒内日志零世界更新 → **无玩家连接时服务器不跑世界更新循环**，是引擎行为
+
+tick 驱动因此从 MonoMod 钩子改为官方 `ModSystem`（不依赖内部方法签名，客户端服务器一致），
+并补了两条可观测性日志（首次采样确认、`GameUpdateCount` 恒定时告警）——
+没有这类日志，「装好了但不动」只能靠猜。服务器侧的 tick 数据留 issue 跟踪，等有玩家连接再验。
+
 ## 落地顺序对照
 
 | 步骤 | 状态 |
 |---|---|
 | 1. C# Shim + `Mod.Call` 契约 | ✅ 20 个命令，强类型 + 字符串两套入口 |
 | 2. Rust 最小内核 | ✅ 路由 / 事务 / 快照 / 差分 / 仲裁 / PRNG / 编解码 / 影子 |
-| 3. 1~2 个热点 Harmony 钩子 + 影子差分 | ✅（用 tML 的 `On_*` 而非 Harmony，见下）`On_Main.Update` / `On_NPC.AI` / `On_Projectile.Update` / `On_NetMessage.SendData` |
+| 3. 1~2 个热点 Harmony 钩子 + 影子差分 | ✅（用 tML 的 `On_*` 而非 Harmony，见下）`On_NPC.AI` / `On_Projectile.Update` / `On_NetMessage.SendData`；tick 驱动用官方 `ModSystem.PostUpdateEverything`（`Main.Update` 在服务器端不触发，实测） |
 | 4. 一致后切默认、保留回退 | ⏳ 未切：当前**只观测不回写**，不接管任何原版逻辑 |
 | 5. 依赖图调度 / 网络压缩 / 回滚 / 热重载 | 🟡 调度与回滚的内核能力已就绪；网络压缩只有观测统计 |
 
@@ -148,6 +184,13 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
    不是旧文档里的 `On.Terraria.*`。后者在本版本**编译不过**。签名全部由 `tools/SignatureProbe` 反射导出。
 2. **附加程序集**：tML 只从 `.tmod` 内的 `lib/<名字>.dll` 加载附加程序集（要配 `build.txt` 的
    `dllReferences`）。references 拷贝到输出目录并不够——漏了这步，运行时就是 `TypeLoadException`。
+   原生 DLL 不能走这条路（`dllReferences` 只认托管程序集），只能当普通资源打包后运行时取出落盘。
+3. **原生库文件名不能改**：`SetDllImportResolver` 登记的名字必须等于 `DllImport` 声明里的常量。
+   若把库落盘成 `<hash>_trit_rt.dll` 并从路径推导登记名，就与常量 `"trit_rt"` 对不上，
+   解析器永不命中，表现为 `Unable to load DLL (0x8007007E)`。要版本隔离就改**目录**名，别改文件名。
+4. **服务器不调用 `Main.Update`**：专用服务器走 `Main.DedServ` 自己的循环，
+   `On_Main.Update` 挂上去不会触发；且无玩家连接时世界更新循环压根不跑（连 `ModSystem` 回调也不到）。
+   需要每 tick 驱动就走官方 `ModSystem`，别 hook 内部方法。
 
 ## 不做什么
 
