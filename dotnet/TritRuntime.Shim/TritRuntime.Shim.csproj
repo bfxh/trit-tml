@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>TritRuntime.Shim</AssemblyName>
+    <RootNamespace>TritRuntime</RootNamespace>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- tModLoader 模组直接引用本工程输出的 DLL；这里保持零第三方依赖，
+         避免污染模组的依赖闭包。 -->
+    <Version>0.1.0</Version>
+    <Authors>trit-tml contributors</Authors>
+    <Description>tModLoader 旁路三进制运行时的 C# 兼容壳：Mod.Call 契约 + 原生 FFI + 托管回退 + 影子差分</Description>
+  </PropertyGroup>
+
+</Project>

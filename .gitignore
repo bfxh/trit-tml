@@ -1,0 +1,20 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+.vs/
+
+# 模组打包产物：lib/ 下的 DLL 由 csproj 的 TritStageShimAssembly 目标自动生成，
+# 不纳入版本控制（避免仓库里躺二进制）。
+mod/TritRuntimeMod/lib/
+
+# tML 打包中间产物
+*.tmod
+
+# 本机设置
+TritRuntimeMod.settings.json

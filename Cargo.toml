@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/trit-rt"]
+# third_party/trit 是独立仓库的子模块：必须排除，否则它的 crate 会被当成
+# 本工作区的隐式成员，`version.workspace = true` 会错误地继承本区的版本号。
+exclude = ["third_party"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/bfxh/trit-tml"
+readme = "README.md"
+
+# 三进制内核只「调用」本地库 third_party/trit（bfxh/trit 的子模块，钉在公开提交上），
+# 不复制、不修改、不重新实现其任何算法。
+[workspace.dependencies]
+trit-core = { path = "third_party/trit/crates/trit-core", version = "0.12.0" }
+trit-codec = { path = "third_party/trit/crates/trit-codec", version = "0.12.0" }
+trit-schedule = { path = "third_party/trit/crates/trit-schedule", version = "0.12.0" }
+trit-net = { path = "third_party/trit/crates/trit-net", version = "0.12.0" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"

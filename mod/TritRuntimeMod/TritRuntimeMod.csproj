@@ -1,0 +1,67 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AssemblyName>TritRuntimeMod</AssemblyName>
+    <RootNamespace>TritRuntimeMod</RootNamespace>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <Version>0.1.0</Version>
+
+    <!-- 本机默认 tML 安装目录。换机器：dotnet build -p:TMLInstallDir="E:\...\tModLoader\" （必须以分隔符结尾）。 -->
+    <TMLInstallDir Condition="'$(TMLInstallDir)' == ''">D:\SteamLibrary\steamapps\common\tModLoader\</TMLInstallDir>
+
+    <!-- 本地编译验证默认关掉 .tmod 打包步骤（那一步需要 tML 服务端与 ModSources 布局）。
+         真正打包成 .tmod 时：dotnet build -p:BuildMod=true -->
+    <BuildMod Condition="'$(BuildMod)' == ''">false</BuildMod>
+  </PropertyGroup>
+
+  <!-- 官方 targets：自动引用 tModLoader.dll 与 Libraries/**/*.dll（排除 Native/runtime*/resources/CodeAssist），
+       并挂上 tModCodeAssist 分析器。路径由该文件自身位置推导，无需手工维护。 -->
+  <Import Project="$(TMLInstallDir)tMLMod.targets" Condition="Exists('$(TMLInstallDir)tMLMod.targets')" />
+
+  <Target Name="TritCheckTml" BeforeTargets="BeforeBuild" Condition="!Exists('$(TMLInstallDir)tModLoader.dll')">
+    <Error Text="找不到 tModLoader 安装目录：$(TMLInstallDir)。请用 -p:TMLInstallDir=&lt;tML 安装根目录&gt; 指定。" />
+  </Target>
+
+  <ItemGroup>
+    <!-- 三进制运行时兼容壳（同仓库工程）。CopyLocal 让 DLL 一起进 .tmod。 -->
+    <ProjectReference Include="..\..\dotnet\TritRuntime.Shim\TritRuntime.Shim.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 原生内核：本地调试时随输出拷贝。发布版建议把 trit_rt.dll 放到 tML 安装根目录，
+         或设置环境变量 TRIT_RT_LIBRARY，或在 TritRuntimeMod.settings.json 里写 LibraryPath。 -->
+    <None Include="..\..\target\release\trit_rt.dll"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\release\trit_rt.dll')"
+          Link="trit_rt.dll"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 模组元数据与本地化不参与编译 -->
+    <None Remove="build.txt;description.txt;icon.png" />
+    <None Remove="TritRuntimeMod.settings.json" />
+    <Compile Remove="obj\**;bin\**;lib\**" />
+  </ItemGroup>
+
+  <!-- tML 只从 .tmod 内的 lib/<名字>.dll 加载附加程序集（AssemblyManager.LoadAssemblies 读 dllReferences）。
+       所以打包前必须把兼容壳 DLL 落到 lib\，否则运行时就是 TypeLoadException。
+       这一步挂在 BuildMod 之前，保证 lib\ 里的 DLL 与本次编译引用的完全一致。 -->
+  <Target Name="TritStageShimAssembly" BeforeTargets="BuildMod" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <TritShimAssembly Include="@(ReferenceCopyLocalPaths)"
+                        Condition="'%(Filename)' == 'TritRuntime.Shim' and '%(Extension)' == '.dll'" />
+    </ItemGroup>
+    <MakeDir Directories="$(MSBuildProjectDirectory)\lib" />
+    <!-- 不跳过未变更：lib\ 里的副本必须与本次编译引用逐字节一致，
+         留着旧副本会在运行时表现为 MissingMethodException / TypeLoadException。 -->
+    <Copy SourceFiles="@(TritShimAssembly)" DestinationFolder="$(MSBuildProjectDirectory)\lib" />
+    <Error Condition="!Exists('$(MSBuildProjectDirectory)\lib\TritRuntime.Shim.dll')"
+           Text="未能把 TritRuntime.Shim.dll 放入 lib\；打出来的 .tmod 会在运行时缺依赖。" />
+  </Target>
+
+</Project>

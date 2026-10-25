@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>SignatureProbe</AssemblyName>
+    <RootNamespace>TritTml.Tools</RootNamespace>
+    <!-- 探针只读元数据，不参与模组构建；显式关掉文档生成以免 CS1591 噪音。 -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS0649</NoWarn>
+    <!-- tModLoader 安装根目录：-p:TmlSteamPath=... 覆盖；留空则由运行时参数/环境变量决定。 -->
+    <TmlSteamPath Condition="'$(TmlSteamPath)' != ''">$(TmlSteamPath)</TmlSteamPath>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(TmlSteamPath)' != ''">
+    <Reference Include="tModLoader">
+      <HintPath>$(TmlSteamPath)tModLoader.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

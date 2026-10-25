@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  # 三进制内核：格式、静态检查、测试、产出原生库
+  rust:
+    name: rust (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy -p trit-rt --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test -p trit-rt --release
+
+      - name: build cdylib
+        run: cargo build --release -p trit-rt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trit-rt-windows
+          path: target/release/trit_rt.dll
+          if-no-files-found: error
+
+  # C# 兼容壳：含原生 vs 托管逐字节对拍，所以必须在能编译出原生库的机器上跑。
+  # 注意：这三步（rust / dotnet / 对拍）是本仓库的核心门禁，必须全绿。
+  dotnet:
+    name: dotnet (windows)
+    runs-on: windows-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 工具链 + 原生库
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo build --release -p trit-rt
+
+      - name: 构建兼容壳
+        run: dotnet build dotnet/TritRuntime.Shim/TritRuntime.Shim.csproj -c Release --nologo
+
+      - name: 测试（含原生 vs 托管对拍）
+        run: dotnet test dotnet/TritRuntime.Shim.Tests/TritRuntime.Shim.Tests.csproj -c Release --nologo
+
+# 模组工程（mod/TritRuntimeMod）的编译与 .tmod 打包刻意不进 CI：
+# 它依赖本机安装的 tModLoader（tMLMod.targets、tModLoader.dll、Libraries/**），
+# 而 tML 走 Steam 分发，在 CI 上拉一份完整安装既不稳定也不符合许可。
+# 模组的验证方式：本地 `dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj`，
+# 打包 `-p:BuildMod=true`，详见 mod/TritRuntimeMod/README.md 与根 README 的「验证状态」。

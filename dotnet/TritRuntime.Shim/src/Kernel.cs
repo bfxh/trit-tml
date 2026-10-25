@@ -1,0 +1,146 @@
+using TritRuntime.Wire;
+
+namespace TritRuntime.Kernel;
+
+/// <summary>内核运行模式。</summary>
+public enum KernelMode
+{
+    /// <summary>原生 Rust 三进制运行时（trit_rt.dll）。</summary>
+    Native,
+
+    /// <summary>托管回退运行时（原生库不可用时的纯 C# 实现，语义一致）。</summary>
+    Managed,
+}
+
+/// <summary>能力报告（Mod.Call "TritRuntime.Capabilities" 的返回）。</summary>
+/// <param name="AbiVersion">C ABI 版本；托管回退恒为 0。</param>
+/// <param name="RuntimeVersion">运行时版本。</param>
+/// <param name="Capabilities">能力位图。</param>
+/// <param name="Mode">运行模式。</param>
+/// <param name="Arbitration">仲裁模式。</param>
+public sealed record CapabilityReport(
+    uint AbiVersion,
+    uint RuntimeVersion,
+    CapabilityBits Capabilities,
+    KernelMode Mode,
+    ArbitrationMode Arbitration)
+{
+    /// <summary>是否具备某能力。</summary>
+    public bool Has(CapabilityBits bit) => (Capabilities & bit) == bit;
+}
+
+/// <summary>一次 submit 的结果。</summary>
+/// <param name="Status">C ABI 状态码。</param>
+/// <param name="Payload">拆框后的响应载荷（错误时可能为空）。</param>
+public sealed record KernelResponse(int Status, byte[] Payload)
+{
+    /// <summary>是否成功。</summary>
+    public bool IsOk => Status == Wire.Status.Ok;
+}
+
+/// <summary>一条写入意图。</summary>
+/// <param name="TxnId">意图所属事务（0 = 自动提交）。</param>
+/// <param name="Key">世界键（车道）。</param>
+/// <param name="Delta">增量。</param>
+public readonly record struct WriteIntent(ulong TxnId, uint Key, TritDelta Delta);
+
+/// <summary>一条争议车道。</summary>
+/// <param name="Key">世界键。</param>
+/// <param name="Drivers">全部肇事方（事务号 + 增量）。</param>
+public sealed record LaneDispute(uint Key, IReadOnlyList<(ulong TxnId, TritDelta Delta)> Drivers);
+
+/// <summary>仲裁结果。</summary>
+/// <param name="HasDisputes">是否存在争议车道。</param>
+/// <param name="Resolved">收敛的车道增量（按键升序）。</param>
+/// <param name="Disputes">争议车道及全部肇事方。</param>
+public sealed record ArbitrateResult(
+    bool HasDisputes,
+    IReadOnlyList<(uint Key, TritDelta Delta)> Resolved,
+    IReadOnlyList<LaneDispute> Disputes);
+
+/// <summary>一次 step 的动作意图（由 C# 主线程执行）。</summary>
+/// <param name="SubId">订阅 ID。</param>
+/// <param name="EventId">事件 ID。</param>
+/// <param name="ModId">模组 ID。</param>
+public readonly record struct ActionIntent(ulong SubId, uint EventId, uint ModId);
+
+/// <summary>step 结果。</summary>
+public sealed record StepResult(IReadOnlyList<ActionIntent> Intents);
+
+/// <summary>事务提交结果。</summary>
+/// <param name="Applied">落地条数。</param>
+/// <param name="LogSeq">提交后日志序列号。</param>
+public sealed record TxnCommitResult(uint Applied, ulong LogSeq);
+
+/// <summary>一条差分项。</summary>
+public readonly record struct DiffEntry(uint Key, TritDelta Old, TritDelta New);
+
+/// <summary>差分结果。</summary>
+public sealed record DiffResult(IReadOnlyList<DiffEntry> Entries);
+
+/// <summary>内核契约：原生运行时与托管回退运行时实现同一语义。</summary>
+public interface ITritKernel : IDisposable
+{
+    /// <summary>运行模式。</summary>
+    KernelMode Mode { get; }
+
+    /// <summary>能力报告。</summary>
+    CapabilityReport Capabilities();
+
+    /// <summary>提交一个 opcode（载荷为拆框前的请求体）。</summary>
+    KernelResponse Submit(uint opcode, byte[] payload);
+
+    /// <summary>查询。</summary>
+    KernelResponse Query(byte[] query);
+
+    /// <summary>最近一次错误信息。</summary>
+    string LastError { get; }
+
+    /// <summary>便捷方法：订阅。</summary>
+    ulong Subscribe(uint modId, uint eventId, int priority, uint[] deps);
+
+    /// <summary>便捷方法：退订。</summary>
+    void Unsubscribe(ulong subId);
+
+    /// <summary>便捷方法：发布，返回新标脏数。</summary>
+    uint Publish(uint eventId, TritDelta[] payload);
+
+    /// <summary>便捷方法：step。</summary>
+    StepResult Step(ulong tick);
+
+    /// <summary>便捷方法：开事务。</summary>
+    ulong BeginTransaction();
+
+    /// <summary>便捷方法：提交意图（txnId == 0 自动提交）。</summary>
+    void SubmitIntent(ulong txnId, uint key, TritDelta delta);
+
+    /// <summary>便捷方法：提交事务。</summary>
+    TxnCommitResult Commit(ulong txnId);
+
+    /// <summary>便捷方法：回滚事务。</summary>
+    void RollbackTransaction(ulong txnId);
+
+    /// <summary>便捷方法：仲裁一批意图。</summary>
+    ArbitrateResult Arbitrate(IReadOnlyList<WriteIntent> intents);
+
+    /// <summary>便捷方法：打快照，返回快照 ID。</summary>
+    ulong Snapshot();
+
+    /// <summary>便捷方法：快照字节（含 ID 前缀）。</summary>
+    byte[] SnapshotBytes();
+
+    /// <summary>便捷方法：差分两个快照。</summary>
+    DiffResult Diff(ulong a, ulong b);
+
+    /// <summary>便捷方法：回滚到快照。</summary>
+    void RollbackTo(ulong snapshotId);
+
+    /// <summary>便捷方法：抽确定性随机数。</summary>
+    TritDelta[] NextRandom(int count);
+
+    /// <summary>便捷方法：记录影子差分（签名非空 = 发现不一致）。</summary>
+    ulong ShadowRecord(byte[] signature);
+
+    /// <summary>便捷方法：查询统计（10 个 u64）。</summary>
+    ulong[] Stats();
+}

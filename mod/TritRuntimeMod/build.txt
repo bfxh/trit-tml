@@ -1,0 +1,13 @@
+author = trit-tml contributors
+version = 0.1.0
+displayName = Trit Runtime (Ternary Bypass Runtime)
+displayName.zh-Hans = 三进制旁路运行时
+homepage = https://github.com/trit-tml/trit-tml
+description = Bypass runtime layer over tModLoader: deterministic event routing, ternary transaction log, snapshot/diff and shadow differ. Vanilla C# runtime stays authoritative; native Rust kernel is optional.
+description.zh-Hans = tModLoader 旁路运行时改善层：确定性事件路由、三进制事务日志、快照/差分与影子对拍。C# 原运行时仍是权威，Rust 原生内核可选。
+side = Both
+dllReferences = TritRuntime.Shim
+hideCode = false
+hideResources = false
+includeSource = true
+buildIgnore = *.csproj, *.user, obj\*, bin\*, .vs\*, .git\*, *.md

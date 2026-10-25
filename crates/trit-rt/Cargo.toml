@@ -1,0 +1,32 @@
+[package]
+name = "trit-rt"
+description = "tModLoader 旁路三进制运行时：事件路由 / 事务日志 / 冲突仲裁 / 快照差分 / 确定性回放（C ABI）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["ternary", "trit", "runtime", "tmodloader", "ffi"]
+categories = ["game-development", "no-std"]
+
+[lib]
+name = "trit_rt"
+crate-type = ["cdylib", "rlib", "staticlib"]
+
+[dependencies]
+trit-core.workspace = true
+trit-codec.workspace = true
+trit-schedule.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[features]
+default = ["ai-voting"]
+# 三值权重网络（{-1,0,+1}）做 AI 决策投票：确定/弃权两态输出。
+ai-voting = ["dep:trit-net"]
+
+[dependencies.trit-net]
+workspace = true
+optional = true
