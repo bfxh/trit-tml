@@ -1,5 +1,7 @@
 # trit-tml
 
+[![ci](https://github.com/bfxh/trit-tml/actions/workflows/ci.yml/badge.svg)](https://github.com/bfxh/trit-tml/actions/workflows/ci.yml)
+
 **tModLoader 的旁路三进制运行时改善层** — 不替换 C#/CLR/Unity 主循环，只把其中"可判定、可回退、可差分"的那层内核旁路接出来。
 
 > A bypass ternary runtime layer for tModLoader. The vanilla C#/Unity main loop stays authoritative;
