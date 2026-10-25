@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Terraria;
 using TritRuntime.Kernel;
 using TritRuntime.Wire;
@@ -41,6 +42,9 @@ internal sealed class WorldBridge
 
     private const uint ModIdSeed = 0x811C9DC5u; // FNV-1a 偏移基数
 
+    /// <summary>同类周期性日志的最小间隔（秒）。</summary>
+    private const double MinLogIntervalSeconds = 15.0;
+
     private readonly TritRuntimeMod mod;
     private readonly TritSettings settings;
     private readonly RuntimeShim shim;
@@ -62,6 +66,18 @@ internal sealed class WorldBridge
     private int prevActiveNpc = -1;
     private int prevActiveProjectile = -1;
     private int prevActivePlayer = -1;
+
+    // Main.Update 每帧调用一次，而菜单/加载界面没有固定步长（实测可达数千 FPS）。
+    // 用 Main.GameUpdateCount（游戏逻辑 tick，固定 60/s）做驱动节流，
+    // 否则会把「帧数」当成「游戏 tick」，快照与统计每秒刷几十次。
+    private uint lastGameTick;
+    private bool lastGameTickValid;
+
+    // 周期性日志按墙上时钟节流：游戏内 60 tick/s，按 tick 数打日志会在高频场景下刷爆日志
+    // （实测 4 分钟写出 13 MB / 8.9 万行）。
+    private readonly Stopwatch uptime = Stopwatch.StartNew();
+    private double lastSnapshotLogAt = double.NegativeInfinity;
+    private double lastStatsLogAt = double.NegativeInfinity;
 
     private bool disposed;
 
@@ -151,6 +167,16 @@ internal sealed class WorldBridge
 
         try
         {
+            uint gameTick = Main.GameUpdateCount;
+            if (lastGameTickValid && gameTick == lastGameTick)
+            {
+                // 同一游戏 tick 内的重复帧：菜单/加载界面常见，跳过不采样。
+                return;
+            }
+
+            lastGameTickValid = true;
+            lastGameTick = gameTick;
+
             tick++;
             changedKeys.Clear();
             changedTrits.Clear();
@@ -531,27 +557,88 @@ internal sealed class WorldBridge
             return;
         }
 
+        ulong id;
         try
         {
-            ulong id = shim.Snapshot();
-            SnapshotCount++;
-
-            // 影子记录：把本 tick 的提交指纹写进主内核的影子日志。
-            // 这是"切换前先影子差分"在模组侧的落点——只记录，不改变任何提交行为。
-            byte[] signature = new byte[24];
-            BitConverter.TryWriteBytes(signature.AsSpan(0, 8), (ulong)tick);
-            BitConverter.TryWriteBytes(signature.AsSpan(8, 8), LastLogSeq);
-            BitConverter.TryWriteBytes(signature.AsSpan(16, 4), LastApplied);
-            BitConverter.TryWriteBytes(signature.AsSpan(20, 4), (uint)changedTrits.Count);
-            shim.ShadowRecord(signature);
-
-            mod.Logger.Info(
-                $"[trit] 快照 #{SnapshotCount} id={id} tick={tick} log_seq={LastLogSeq} applied={LastApplied}");
+            id = shim.Snapshot();
         }
         catch (KernelException ex)
         {
-            mod.Logger.Warn($"[trit] 快照失败（tick={tick}）：{ex.Message}");
+            // 快照失败不影响游戏：只降级，不装钩子之外不做任何破坏性动作。
+            if (Throttle(ref lastSnapshotLogAt))
+            {
+                mod.Logger.Warn($"[trit] 快照失败（tick={tick}）：{ex.Message}");
+            }
+
+            return;
         }
+
+        SnapshotCount++;
+
+        // 影子差分：只有在真的存在第二个内核可对照时才跑。
+        // 默认关闭——没有影子内核时硬塞一个签名只会污染影子日志；
+        // 而且裸字节不是线格式载荷，会让内核解包失败（真机踩过：
+        // 「非法字节 246：5 个 trit 只能表示 0..=242」）。
+        if (settings.ShadowMode)
+        {
+            RecordShadowDivergence();
+        }
+
+        if (settings.VerboseLogging || Throttle(ref lastSnapshotLogAt))
+        {
+            mod.Logger.Info(
+                $"[trit] 快照 #{SnapshotCount} id={id} tick={tick} log_seq={LastLogSeq} applied={LastApplied}");
+        }
+    }
+
+    /// <summary>
+    /// 影子模式下把两个内核的世界投影逐字节对拍一次。
+    /// 不一致只记录、只告警，绝不提交——世界投影仍以主内核为准。
+    /// </summary>
+    private void RecordShadowDivergence()
+    {
+        ShadowDiffer? differ = shim.Differ;
+        if (differ is null)
+        {
+            return;
+        }
+
+        try
+        {
+            byte[] divergence = differ.CompareWorlds();
+            if (divergence.Length == 0)
+            {
+                return;
+            }
+
+            string summary = differ.Recent.Count > 0 ? differ.Recent[0].Summary : "（无摘要）";
+            if (Throttle(ref lastStatsLogAt))
+            {
+                mod.Logger.Warn($"[trit] 影子对拍发现不一致（tick={tick}）：{summary}");
+            }
+        }
+        catch (KernelException ex)
+        {
+            if (Throttle(ref lastStatsLogAt))
+            {
+                mod.Logger.Warn($"[trit] 影子对拍失败（tick={tick}）：{ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// 周期性日志节流：距上次同类日志不足 <see cref="MinLogIntervalSeconds"/> 秒则跳过。
+    /// </summary>
+    private bool Throttle(ref double last)
+    {
+        double now = uptime.Elapsed.TotalSeconds;
+        if (now - last < MinLogIntervalSeconds)
+        {
+            return false;
+        }
+
+        last = now;
+        return true;
     }
 
     private void MaybeReportStats()
@@ -571,14 +658,20 @@ internal sealed class WorldBridge
                 parts[i] = i + "=" + stats[i];
             }
 
-            mod.Logger.Info(
-                $"[trit] 统计 tick={tick} mode={shim.Mode} " +
-                "counters[" + string.Join(" ", parts) + "] " +
-                $"net_total={netTotal}");
+            if (settings.VerboseLogging || Throttle(ref lastStatsLogAt))
+            {
+                mod.Logger.Info(
+                    $"[trit] 统计 tick={tick} mode={shim.Mode} " +
+                    "counters[" + string.Join(" ", parts) + "] " +
+                    $"net_total={netTotal}");
+            }
         }
         catch (KernelException ex)
         {
-            mod.Logger.Warn($"[trit] 读取统计失败（tick={tick}）：{ex.Message}");
+            if (Throttle(ref lastStatsLogAt))
+            {
+                mod.Logger.Warn($"[trit] 读取统计失败（tick={tick}）：{ex.Message}");
+            }
         }
     }
 

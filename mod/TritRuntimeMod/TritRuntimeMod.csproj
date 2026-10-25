@@ -64,4 +64,24 @@
            Text="未能把 TritRuntime.Shim.dll 放入 lib\；打出来的 .tmod 会在运行时缺依赖。" />
   </Target>
 
+  <!-- 原生内核随包分发：dllReferences 只认托管程序集，原生 DLL 只能当资源打包，
+       运行时由 NativeLibraryStager 从包内取出落盘再加载。
+       放 lib\Native\ 子目录——AssemblyManager 只按 lib\<名字>.dll 精确加载，不会误当托管程序集。 -->
+  <Target Name="TritStageNativeLibrary" BeforeTargets="BuildMod">
+    <ItemGroup>
+      <TritNativeLibrary Include="$(MSBuildThisFileDirectory)..\..\target\release\trit_rt.dll"
+                         Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\release\trit_rt.dll')" />
+      <TritNativeLibrary Include="$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.so"
+                         Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.so')" />
+      <TritNativeLibrary Include="$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.dylib"
+                         Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.dylib')" />
+    </ItemGroup>
+    <MakeDir Directories="$(MSBuildProjectDirectory)\lib\Native" />
+    <Copy SourceFiles="@(TritNativeLibrary)"
+          DestinationFolder="$(MSBuildProjectDirectory)\lib\Native"
+          SkipUnchangedFiles="true" />
+    <Warning Condition="'@(TritNativeLibrary)' == ''"
+             Text="未找到原生内核（target\release\trit_rt*.dll|so|dylib）。打包出的模组将只跑托管回退内核：先 cargo build --release -p trit-rt。" />
+  </Target>
+
 </Project>

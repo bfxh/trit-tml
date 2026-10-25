@@ -169,8 +169,28 @@ public sealed class RuntimeShim : IDisposable
     /// <summary>抽确定性随机数。</summary>
     public TritDelta[] NextRandom(int count) => host.Kernel.NextRandom(count);
 
-    /// <summary>记录影子差分签名（非空 = 发现不一致，只记录不提交）。</summary>
+    /// <summary>
+    /// 记录影子差分签名（非空 = 发现不一致，只记录不提交）。
+    /// </summary>
+    /// <param name="signature">
+    /// <b>每个元素是一个 trit 值（0/1/2）</b>，不是已编码的线格式载荷——内核负责编码。
+    /// 把任意二进制数据（例如 tick 或 log_seq 的字节）塞进来会让内核解出越界 trit，
+    /// 表现为「非法字节 &gt; 242」的解码失败。
+    /// </param>
     public ulong ShadowRecord(byte[] signature) => host.Kernel.ShadowRecord(signature);
+
+    /// <summary>
+    /// 记录影子差分签名（非空 = 发现不一致，只记录不提交）。
+    /// 三值数组版本：内部转成 trit 值字节，避免调用方手工转换时写出越界值。
+    /// </summary>
+    public ulong ShadowRecord(TritDelta[] signature) =>
+        host.Kernel.ShadowRecord(Array.ConvertAll(signature, value => (byte)value));
+
+    /// <summary>
+    /// 影子差分器：把同一请求喂给主内核与影子内核逐字节对拍。
+    /// 仅 <see cref="RuntimeHostOptions.ShadowMode"/> 为真时非 <see langword="null"/>。
+    /// </summary>
+    public ShadowDiffer? Differ => host.Differ;
 
     /// <summary>统计计数器。</summary>
     public ulong[] Stats() => host.Kernel.Stats();

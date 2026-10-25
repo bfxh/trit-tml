@@ -144,8 +144,13 @@ public sealed class ShadowDiffer : IDisposable
 
     /// <summary>
     /// 差异指纹：取两侧载荷的按位异或，逐字节映射成 trit（0/1/2）。
-    /// 确定性、紧凑，且能直接喂给 <c>SHADOW_RECORD</c>。
     /// </summary>
+    /// <remarks>
+    /// 返回的 <c>byte[]</c> <b>每个元素就是一个 trit 值（0/1/2）</b>，不是已编码的线格式载荷。
+    /// <see cref="ITritKernel.ShadowRecord(byte[])"/> 正是这个语义：内核内部会把它逐元素转成
+    /// <see cref="TritDelta"/> 再编码。这里若先用 <c>Requests.ShadowRecord</c> 编码一次，
+    /// 内核会再编一次，解包时读到错位字节并抛「非法字节 &gt; 242」——已踩过一次，别再踩。
+    /// </remarks>
     private static byte[] Fingerprint(uint opcode, byte[] left, byte[] right)
     {
         var width = Math.Min(left.Length, right.Length);

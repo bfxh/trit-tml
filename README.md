@@ -87,16 +87,40 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 |---|---|---|
 | Rust 内核测试 | ✅ 42/42 | `cargo test -p trit-rt --release` |
 | Rust clippy / fmt | ✅ 0 警告 / 干净 | `cargo clippy --all-targets`、`cargo fmt --check` |
-| C# 兼容壳测试 | ✅ 107/107 | `dotnet test`，含原生 vs 托管 51 步逐字节对拍 |
+| C# 兼容壳测试 | ✅ 109/109 | `dotnet test`，含原生 vs 托管 51 步逐字节对拍 |
 | 原生 / 托管语义等价 | ✅ 快照字节、统计、PRNG 流、冲突诊断全部对拍 | `ParityTests` |
 | 已知能力差异 | 仅 `Capabilities` 一处：托管回退无 AI 投票（`caps` 少 `0x100` 位、`abi=0`） | 测试中逐字节钉死 |
 | 模组编译 | ✅ 0 警告 0 错误（Debug/Release） | `dotnet build` |
-| 模组 `.tmod` 打包 | ✅ 走 tML 官方管线，含 `lib/TritRuntime.Shim.dll` | `-p:BuildMod=true` |
-| 模组**进游戏实跑** | ❌ 未验证 | 需要 Steam 启动 tModLoader；装载期自检会把结果写日志 |
+| 模组 `.tmod` 打包 | ✅ 走 tML 官方管线，含 `lib/TritRuntime.Shim.dll` + `lib/Native/trit_rt.dll` | `-p:BuildMod=true`（需先关游戏） |
+| 模组**进游戏实跑** | ✅ 已跑通（本机 tML 1.4.4.9，客户端） | 见下 |
 
-最后一项是当前最大的缺口：`.tmod` 已产出并落到 `Mods/`，但还没有一次真实的游戏内运行记录。
-`RuntimeSelfCheck` 就是为这一步准备的——首次启动会在日志里打印
-`[trit] 自检 snapshot=... => PASS`，失败也只是降级不装钩子。
+### 真机实跑记录（2026-10-26）
+
+在真实 tModLoader 客户端里装载并运行，日志实证：
+
+```
+[.NET TP Worker/INFO] [tML]: 加载程序集: TritRuntimeMod v0.1.0
+[.NET TP Worker/INFO] [TritRuntimeMod]: [trit] 自检 snapshot=1 commit(applied=1,seq=1) step(intents=0)
+                                        snapshot2=2 diff(0xF0FF0FFF=Pos) rollback=ok
+                                        prng=[Pos,Neg,Pos,Pos] snapshot_bytes=33 stats=10 => PASS
+[.NET TP Worker/INFO] [TritRuntimeMod]: [trit] 钩子安装完成：4/4
+```
+
+已确认：模组加载、`lib/TritRuntime.Shim.dll` 随包加载、装载期自检 **PASS**、
+4 个钩子全部装上、原生内核缺失时**自动回退托管且游戏未崩**。
+
+**这次实跑揪出 3 个真 bug，均已修复并加回归测试：**
+
+| # | 问题 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 每快照周期抛 `非法字节 246：5 个 trit 只能表示 0..=242`，4 分钟刷出 3311 条异常栈 | 模组把 tick / log_seq 的**任意二进制字节**当影子签名传给 `ShadowRecord`。该 API 的 `byte[]` 语义是「每元素一个 trit 值 0/1/2」，内核逐元素转 `TritDelta` 后编码，246 越界 | 默认路径不再伪造签名；影子模式改用 `ShadowDiffer.CompareWorlds()` 做**真实对拍** |
+| 2 | 日志 4 分钟写 13 MB / 8.9 万行 | `On_Main.Update` 每帧触发，菜单无步长限制（实测约 3000 FPS），把**帧数**当成了游戏 tick | 改用 `Main.GameUpdateCount` 驱动；周期性日志按墙上时钟节流（≥15 s 一条） |
+| 3 | Rust 原生内核在真机上从未被用上 | `.tmod` 里只有托管 Shim，没打原生 `trit_rt.dll`；而 tML 的 `dllReferences` 只加载托管程序集 | 原生库打进 `lib/Native/`，运行时由 `NativeLibraryStager` 取出落盘再加载 |
+
+> 修复过程中我先误判了一次：以为 `ShadowRecord(byte[])` 要的是**已编码**载荷，
+> 于是给 `ShadowDiffer.Fingerprint` 加了预编码——结果原有 2 个测试立刻失败（双重编码）。
+> 读两个内核的实现才确认语义是「每元素一个 trit 值」，已回退并补测试钉死。
+> 这条现在写在 `ShadowDiffer.Fingerprint` 的注释里，免得再踩。
 
 ## 落地顺序对照
 

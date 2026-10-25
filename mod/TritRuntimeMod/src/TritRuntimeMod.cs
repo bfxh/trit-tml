@@ -53,9 +53,24 @@ public sealed class TritRuntimeMod : Mod
 
         try
         {
+            string? libraryPath = string.IsNullOrWhiteSpace(settings.LibraryPath)
+                ? null
+                : settings.LibraryPath;
+
+            // 设置里没显式指定时，用随 .tmod 分发的原生内核：
+            // tML 只把 lib/<名字>.dll 当托管程序集加载，原生库得自己从包里取出落盘。
+            if (libraryPath is null)
+            {
+                libraryPath = NativeLibraryStager.TryStage(this);
+                if (libraryPath is not null)
+                {
+                    Logger.Info("[trit] 已从模组包取出原生内核：" + libraryPath);
+                }
+            }
+
             shim = RuntimeShim.Attach(new RuntimeHostOptions
             {
-                LibraryPath = string.IsNullOrWhiteSpace(settings.LibraryPath) ? null : settings.LibraryPath,
+                LibraryPath = libraryPath,
                 ConfigJson = string.Empty,
                 ForceManaged = settings.ForceManaged,
                 ShadowMode = settings.ShadowMode,

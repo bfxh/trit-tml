@@ -113,6 +113,60 @@ public sealed class RuntimeHostTests
         Assert.Equal(1ul, reader.U64()); // divergences
     }
 
+    /// <summary>
+    /// 钉死影子签名的语义：<c>byte[]</c> 每个元素是一个 trit 值（0/1/2），内核负责编码。
+    /// </summary>
+    /// <remarks>
+    /// 真机踩过的坑：模组把 tick / log_seq 的任意二进制字节当签名传进去，
+    /// 内核把它逐元素转成 <see cref="TritDelta"/> 时得到 246 这样的越界值，
+    /// 打包阶段就抛「非法字节 246：5 个 trit 只能表示 0..=242」。
+    /// </remarks>
+    [Fact]
+    public void ShadowRecordAcceptsTritValueBytesOnly()
+    {
+        using var kernel = new ManagedKernel();
+
+        // 合法签名：每个元素都在 0..=2 内。
+        ulong divergences = kernel.ShadowRecord(new byte[] { 2, 0, 2, 1, 2 });
+        Assert.Equal(1ul, divergences);
+
+        var payload = kernel.Submit(Opcode.Query, Requests.Query(QueryId.Shadow)).Payload;
+        var reader = new WireReader(payload);
+        Assert.Equal(1ul, reader.U64()); // compared
+        Assert.Equal(1ul, reader.U64()); // divergences
+
+        // 反证：任意二进制数据必须被拒绝，而不是被静默接受成一个"分歧"。
+        // 用单元素 246 精确复现真机报错——多个 trit 混包时字节会溢出回合法区间，
+        // 反而测不出来（例如 {246,1,2,3,4} 打包后是 160，能合法解包）。
+        Assert.Throws<KernelException>(() => kernel.ShadowRecord(new byte[] { 246 }));
+    }
+
+    /// <summary>
+    /// 回归：差分器自动生成的指纹必须能被主内核解包。
+    /// 指纹是 trit 值字节数组；若误当成已编码载荷再编一次，这里就会解包失败。
+    /// </summary>
+    [Fact]
+    public void ShadowDifferFingerprintSurvivesKernelDecode()
+    {
+        using var primary = new ManagedKernel();
+        using var shadow = new ManagedKernel();
+        using var differ = new ShadowDiffer(primary, shadow);
+
+        // 让两侧世界投影真的不同：各改一条不同的车道。
+        primary.SubmitIntent(0, 7, TritDelta.Pos);
+        shadow.SubmitIntent(0, 8, TritDelta.Pos);
+
+        byte[] worldDivergence = differ.CompareWorlds();
+        Assert.NotEmpty(worldDivergence);
+        Assert.Equal(1ul, differ.Divergences);
+
+        // 指纹已经写进主内核的影子日志，必须能读出来（解包成功才算数）。
+        var payload = primary.Submit(Opcode.Query, Requests.Query(QueryId.Shadow)).Payload;
+        var reader = new WireReader(payload);
+        Assert.Equal(1ul, reader.U64()); // compared
+        Assert.Equal(1ul, reader.U64()); // divergences
+    }
+
     [Fact]
     public void LibraryFileNameIsPlatformSpecific()
     {
