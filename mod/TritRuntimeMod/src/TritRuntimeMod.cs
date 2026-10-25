@@ -134,6 +134,24 @@ public sealed class TritRuntimeMod : Mod
     }
 
     /// <summary>
+    /// 每游戏 tick 推进一次世界投影。由 <see cref="TritWorldSystem.PostUpdateEverything"/> 驱动。
+    /// </summary>
+    /// <remarks>
+    /// 放在这里而不是让 <see cref="TritHooks"/> 直接调用桥接层，是为了让 tick 驱动与
+    /// MonoMod 钩子解耦：专用服务器上 <c>Main.Update</c> 不触发（实测），
+    /// 而官方 <c>ModSystem</c> 回调两端都有。
+    /// </remarks>
+    internal void OnWorldTick()
+    {
+        if (!loaded)
+        {
+            return;
+        }
+
+        bridge?.OnTickEnd();
+    }
+
+    /// <summary>
     /// tML 原生调用面：其他模组用 <c>Mod.Call("TritRuntime.Xxx", ...)</c> 访问三进制内核。
     /// </summary>
     /// <exception cref="ArgumentException">命令缺失、参数个数或类型不符。</exception>

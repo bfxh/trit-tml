@@ -78,6 +78,8 @@ internal sealed class WorldBridge
     private readonly Stopwatch uptime = Stopwatch.StartNew();
     private double lastSnapshotLogAt = double.NegativeInfinity;
     private double lastStatsLogAt = double.NegativeInfinity;
+    private double lastStaticTickLogAt = double.NegativeInfinity;
+    private bool warnedStaticGameTick;
 
     private bool disposed;
 
@@ -168,9 +170,25 @@ internal sealed class WorldBridge
         try
         {
             uint gameTick = Main.GameUpdateCount;
-            if (lastGameTickValid && gameTick == lastGameTick)
+
+            if (!lastGameTickValid)
+            {
+                // 首次采样的可观测性：装载后若这条都不出现，说明钩子压根没被触发。
+                mod.Logger.Info($"[trit] 世界投影开始采样，game_tick={gameTick}");
+            }
+            else if (gameTick == lastGameTick)
             {
                 // 同一游戏 tick 内的重复帧：菜单/加载界面常见，跳过不采样。
+                // 但如果**永远**相等，说明 Main.GameUpdateCount 在本进程里根本不推进
+                // （专用服务器实测过这种情况），世界投影会静默停摆——必须说出来。
+                if (!warnedStaticGameTick && Throttle(ref lastStaticTickLogAt))
+                {
+                    mod.Logger.Warn(
+                        $"[trit] Main.GameUpdateCount 未推进（恒为 {gameTick}），世界投影暂停采样；" +
+                        "若持续出现说明当前运行环境下该计数器不走，桥接层不会有任何 tick 数据。");
+                    warnedStaticGameTick = true;
+                }
+
                 return;
             }
 

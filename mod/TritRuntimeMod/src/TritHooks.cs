@@ -13,11 +13,16 @@ namespace TritRuntimeMod;
 /// <c>On.Terraria.*</c> 写法。签名逐项来自反射：
 /// </para>
 /// <list type="bullet">
-/// <item><c>On_Main.Update(orig, Main self, GameTime gameTime)</c></item>
 /// <item><c>On_NPC.AI(orig, NPC self)</c></item>
 /// <item><c>On_Projectile.Update(orig, Projectile self, int i)</c></item>
 /// <item><c>On_NetMessage.SendData(orig, int msgType, int remoteClient, int ignoreClient, NetworkText text, int number, float n2, float n3, float n4, int n5, int n6, int n7)</c></item>
 /// </list>
+/// <para>
+/// <b>曾经挂的 <c>On_Main.Update</c> 已移除</b>：tick 驱动改由
+/// <see cref="TritWorldSystem.PostUpdateEverything"/> 承担。原因不是风格偏好——
+/// 专用服务器实测证明 <c>Main.Update(GameTime)</c> 在服务器端从不触发，
+/// 挂它会导致"报告装好了、实际全程空转"。
+/// </para>
 /// <para>
 /// 铁律：<c>orig</c> 每次都必须恰好调用一次。任何观测异常都被吞掉并计数，
 /// 连续失败达到阈值后本层停止工作——宁可失去观测，也不能拖垮游戏。
@@ -29,7 +34,6 @@ internal sealed class TritHooks
     private readonly TritSettings settings;
     private readonly WorldBridge bridge;
 
-    private On_Main.hook_Update? mainUpdate;
     private On_NPC.hook_AI? npcAi;
     private On_Projectile.hook_Update? projectileUpdate;
     private On_NetMessage.hook_SendData? netSendData;
@@ -53,16 +57,6 @@ internal sealed class TritHooks
     /// <summary>安装全部钩子。任一个装不上都不影响其余钩子与游戏本身。</summary>
     public void Install()
     {
-        TryInstall("On_Main.Update", () =>
-        {
-            mainUpdate = (orig, self, gameTime) =>
-            {
-                orig(self, gameTime);
-                Guarded("On_Main.Update", bridge.OnTickEnd);
-            };
-            On_Main.Update += mainUpdate;
-        });
-
         TryInstall("On_NPC.AI", () =>
         {
             npcAi = (orig, self) =>
@@ -105,26 +99,12 @@ internal sealed class TritHooks
             On_NetMessage.SendData += netSendData;
         });
 
-        mod.Logger.Info($"[trit] 钩子安装完成：{Installed}/4");
+        mod.Logger.Info($"[trit] 钩子安装完成：{Installed}/3（tick 驱动由 ModSystem 提供，不占钩子名额）");
     }
 
     /// <summary>卸载全部钩子。tML 对 On_* 钩子会自行清理，这里显式摘除是为了可重入（模组重载）。</summary>
     public void Uninstall()
     {
-        if (mainUpdate is not null)
-        {
-            try
-            {
-                On_Main.Update -= mainUpdate;
-            }
-            catch (Exception ex)
-            {
-                mod.Logger.Warn("[trit] 摘除 On_Main.Update 失败：" + ex.Message);
-            }
-
-            mainUpdate = null;
-        }
-
         if (npcAi is not null)
         {
             try
