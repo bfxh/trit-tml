@@ -68,12 +68,34 @@ public static class TritRuntimeCommands
     /// <summary>统计。</summary>
     public const string Stats = "TritRuntime.Stats";
 
+    /// <summary>提交扫描任务。</summary>
+    public const string Scan = "TritRuntime.Scan";
+
+    /// <summary>取出已完成任务。</summary>
+    public const string PollJobs = "TritRuntime.PollJobs";
+
+    /// <summary>取消单个任务。</summary>
+    public const string CancelJob = "TritRuntime.CancelJob";
+
+    /// <summary>取消指定 owner 的任务。</summary>
+    public const string CancelOwner = "TritRuntime.CancelOwner";
+
+    /// <summary>查询或切换 GPU 状态。</summary>
+    public const string GpuStatus = "TritRuntime.GpuStatus";
+
+    /// <summary>查询全局资源预算。</summary>
+    public const string Budget = "TritRuntime.Budget";
+
+    /// <summary>查询 Prometheus 指标。</summary>
+    public const string Metrics = "TritRuntime.Metrics";
+
     /// <summary>全部命令（错误信息里列出，方便调用方自查）。</summary>
     public static readonly string[] All =
     {
         Capabilities, Mode, FallbackReason, Submit, Query, Rollback, Snapshot, Diff, Step,
         Subscribe, Unsubscribe, Publish, BeginTransaction, SubmitIntent, Commit,
-        RollbackTransaction, Arbitrate, NextRandom, ShadowRecord, Stats,
+        RollbackTransaction, Arbitrate, NextRandom, ShadowRecord, Stats, Scan, PollJobs,
+        CancelJob, CancelOwner, GpuStatus, Budget, Metrics,
     };
 }
 
@@ -191,6 +213,34 @@ public sealed class RuntimeShim : IDisposable
     /// 仅 <see cref="RuntimeHostOptions.ShadowMode"/> 为真时非 <see langword="null"/>。
     /// </summary>
     public ShadowDiffer? Differ => host.Differ;
+
+    /// <summary>提交扫描任务；原生路径异步执行，托管回退同步完成后入队。</summary>
+    public ulong SubmitScan(ScanRequest request) => host.Kernel.SubmitScan(request);
+
+    /// <summary>取出已完成任务，取出即出队。</summary>
+    /// <param name="limit">最多取几条；<c>&lt;= 0</c> 表示全部。</param>
+    /// <param name="owner">
+    /// 归属过滤；<see langword="null"/> 表示不限归属。
+    /// <b>只有本次真正返回的任务会出队</b>，其他 owner 的结果仍留在队列里。
+    /// </param>
+    public IReadOnlyList<JobResult> PollJobs(int limit = 0, string? owner = null) =>
+        host.Kernel.PollJobs(limit, owner);
+
+    /// <summary>协作式取消单个任务。</summary>
+    public int CancelJob(ulong jobId) => host.Kernel.CancelJob(jobId);
+
+    /// <summary>协作式取消指定 owner 的任务。</summary>
+    public int CancelOwner(string owner) => host.Kernel.CancelOwner(owner);
+
+    /// <summary>查询或切换 GPU 后端状态。</summary>
+    public GpuStatusReport GpuStatus(GpuPolicy? policy = null, bool probe = false) =>
+        host.Kernel.GpuStatus(policy, probe);
+
+    /// <summary>查询全局资源预算。</summary>
+    public BudgetSnapshot Budget() => host.Kernel.Budget();
+
+    /// <summary>查询任务池 Prometheus 指标。</summary>
+    public string MetricsPrometheus() => host.Kernel.MetricsPrometheus();
 
     /// <summary>统计计数器。</summary>
     public ulong[] Stats() => host.Kernel.Stats();
@@ -315,6 +365,31 @@ public sealed class RuntimeShim : IDisposable
                 Expect(args, 1, normalized);
                 return ShadowRecord(Args.Bytes(args[0], "signature", normalized));
 
+            case "tritruntime.scan":
+                return SubmitScan(ScanArguments(args, normalized));
+
+            case "tritruntime.polljobs":
+                var (pollLimit, pollOwner) = PollArguments(args, normalized);
+                return PollJobs(pollLimit, pollOwner);
+
+            case "tritruntime.canceljob":
+                return CancelJob(CancelJobId(args, normalized));
+
+            case "tritruntime.cancelowner":
+                return CancelOwner(CancelOwnerName(args, normalized));
+
+            case "tritruntime.gpustatus":
+                var (policy, probe) = GpuStatusArguments(args, normalized);
+                return GpuStatus(policy, probe);
+
+            case "tritruntime.budget":
+                ExpectSignature(args, 0, normalized, "()");
+                return Budget();
+
+            case "tritruntime.metrics":
+                ExpectSignature(args, 0, normalized, "()");
+                return MetricsPrometheus();
+
             case "tritruntime.stats":
                 Expect(args, 0, normalized);
                 return Stats();
@@ -324,6 +399,150 @@ public sealed class RuntimeShim : IDisposable
                     $"未知命令 \"{command}\"。可用命令：{string.Join(", ", TritRuntimeCommands.All)}");
         }
     }
+
+    private static ScanRequest ScanArguments(object?[] args, string command)
+    {
+        const string signatures = "(ScanRequest)；(string owner, string kind, byte[] trits)；"
+                                  + "(string owner, string kind, byte[] trits, byte[] pattern, int threshold)";
+        if (args.Length == 1 && args[0] is ScanRequest request)
+        {
+            return request;
+        }
+
+        if ((args.Length == 3 || args.Length == 5)
+            && args[0] is string owner
+            && args[1] is string kind
+            && args[2] is byte[] trits
+            && (args.Length == 3 || (args[3] is byte[] && args[4] is int)))
+        {
+            return new ScanRequest
+            {
+                Owner = owner,
+                Kind = ParseScanKindArgument(kind, command),
+                Trits = trits,
+                Pattern = args.Length == 5 ? (byte[])args[3]! : null,
+                Threshold = args.Length == 5 ? (int)args[4]! : 0,
+            };
+        }
+
+        throw SignatureError(command, signatures, args);
+    }
+
+    /// <summary>解析 <c>PollJobs</c> 的参数：<c>(int limit)</c> / <c>(string owner)</c> / <c>(string owner, int limit)</c>。</summary>
+    /// <remarks>
+    /// 三种签名都留着：<c>(int limit)</c> 是老用法（不限归属），
+    /// 加 owner 的两个签名是为了让多个模组各取各的结果而互不吞掉。
+    /// </remarks>
+    private static (int Limit, string? Owner) PollArguments(object?[] args, string command)
+    {
+        const string signatures = "()；(int limit)；(string owner)；(string owner, int limit)";
+        if (args.Length == 0)
+        {
+            return (0, null);
+        }
+
+        if (args.Length == 1)
+        {
+            if (args[0] is int singleLimit)
+            {
+                return (singleLimit, null);
+            }
+
+            if (args[0] is string singleOwner)
+            {
+                return (0, singleOwner);
+            }
+        }
+
+        if (args.Length == 2 && args[0] is string pairOwner && args[1] is int pairLimit)
+        {
+            return (pairLimit, pairOwner);
+        }
+
+        throw SignatureError(command, signatures, args);
+    }
+
+    private static ulong CancelJobId(object?[] args, string command)
+    {
+        const string signatures = "(ulong jobId)；(int jobId)；(long jobId)";
+        try
+        {
+            return args.Length == 1 && args[0] is ulong or int or long
+                ? Args.UInt64(args[0], "jobId", command)
+                : throw SignatureError(command, signatures, args);
+        }
+        catch (OverflowException)
+        {
+            throw SignatureError(command, signatures, args);
+        }
+    }
+
+    private static string CancelOwnerName(object?[] args, string command)
+    {
+        const string signatures = "(string owner)";
+        return args.Length == 1 && args[0] is string owner
+            ? owner
+            : throw SignatureError(command, signatures, args);
+    }
+
+    private static (GpuPolicy? Policy, bool Probe) GpuStatusArguments(object?[] args, string command)
+    {
+        const string signatures = "()；(string policy)；(string policy, bool probe)";
+        if (args.Length == 0)
+        {
+            return (null, false);
+        }
+
+        if ((args.Length == 1 || args.Length == 2)
+            && args[0] is string policy
+            && (args.Length == 1 || args[1] is bool))
+        {
+            return (ParseGpuPolicyArgument(policy, command), args.Length == 2 && (bool)args[1]!);
+        }
+
+        throw SignatureError(command, signatures, args);
+    }
+
+    /// <summary>
+    /// 命令行层的种类解析。
+    /// </summary>
+    /// <remarks>
+    /// 与内核的宽容解码不同：这里**直接抛异常**——用户在命令行里写错了种类，
+    /// 应当立刻看到「你写错了」，而不是拿到一个失败任务再去轮询。
+    /// 但去首尾空白与内核保持一致（内核两侧都 trim）。
+    /// </remarks>
+    private static ScanKind ParseScanKindArgument(string value, string command) => value.Trim().ToLowerInvariant() switch
+    {
+        "histogram" => ScanKind.Histogram,
+        "pattern" => ScanKind.Pattern,
+        "density" => ScanKind.Density,
+        "dot" => ScanKind.Dot,
+        _ => throw new ArgumentException(
+            $"命令 {command} 的 kind \"{value}\" 未知；可选值：histogram, pattern, density, dot"),
+    };
+
+    private static GpuPolicy ParseGpuPolicyArgument(string value, string command) => value.ToLowerInvariant() switch
+    {
+        "auto" => GpuPolicy.Auto,
+        "off" => GpuPolicy.Off,
+        "on" => GpuPolicy.On,
+        _ => throw new ArgumentException(
+            $"命令 {command} 的 policy \"{value}\" 未知；可选值：auto, off, on"),
+    };
+
+    private static void ExpectSignature(object?[] args, int count, string command, string signatures)
+    {
+        if (args.Length != count)
+        {
+            throw SignatureError(command, signatures, args);
+        }
+    }
+
+    private static ArgumentException SignatureError(string command, string signatures, object?[] args) =>
+        new($"命令 {command} 期望签名：{signatures}；实际收到 {args.Length} 个参数"
+            + (args.Length == 0
+                ? string.Empty
+                : $"（{string.Join(", ", args.Select(value => value?.GetType().Name ?? "null"))}）"));
 
     /// <summary>销毁宿主。</summary>
     public void Dispose()

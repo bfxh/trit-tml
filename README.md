@@ -28,6 +28,50 @@
 Rust **从不持有** `Player`/`NPC`/`Tile` 这类 Unity/tModLoader 对象。跨边界只有 `uint` 车道键、三值增量、
 句柄和错误码；所有游戏状态读写都在 C# 主线程。
 
+## v2 能力：并行任务池 · 扫描算子 · GPU 可选 · 全局预算
+
+v2 在原有能力之上加了一层**旁路任务池**（Rust 侧多线程，游戏主线程只入队、只取结果）：
+
+| 能力 | 位置 | 说明 |
+|---|---|---|
+| 并行任务池 | `1<<9` `PARALLEL` | 扫描任务异步跑在 Rust 工作线程上；可抢占、协作式取消 |
+| 扫描算子 | `0x14 SCAN_SUBMIT` | `histogram` / `pattern` / `density` / `dot` 四种算子 |
+| GPU 可选 | `1<<10` `GPU` | 构建带 `gpu` feature 才可用；玩家可设 `auto/on/off`，自动探测 + 对拍不一致永久回退 CPU |
+| 全局预算 | `1<<11` `BUDGET` | 多 mod 共用时的全局资源账本：每 mod 在跑上限、排队数、计费 |
+
+**扫描算子**发挥三进制的优势：`pattern` 用位并行的双导轨点积（三值矩阵乘），
+规模够大且 GPU 可用时一次矩阵乘算完，否则 CPU 分块扫。
+
+**多 mod 隔离**是这一层的设计前提：任务池是全局的，但 `JOB_POLL` 支持按 `owner` 过滤，
+**只出队真正返回的那几条**，其他 mod 的结果留在队列里。计费也按 owner 分账
+（`BUDGET` 响应里的 `mods[]`）。
+
+**给其他 mod 的接口**（`Mod.Call` 契约，命令名以 `TritRuntime.` 开头且大小写不敏感）：
+
+```
+TritRuntime.Capabilities      能力报告（判断有没有 PARALLEL / GPU / BUDGET 位）
+TritRuntime.Scan              提交扫描任务，返回 job id
+TritRuntime.PollJobs          取回结果，可按 owner 过滤：(string owner, int limit)
+TritRuntime.CancelJob         取消单个任务
+TritRuntime.CancelOwner       取消该 owner 的全部排队任务
+TritRuntime.GpuStatus         查询 / 切换 GPU 策略
+TritRuntime.Budget            全局预算快照
+TritRuntime.Metrics           任务池 Prometheus 指标
+```
+
+引用了本程序集的 mod 也可以直接用 `TritApi` 静态方法（编译期就有类型检查）：
+
+```csharp
+ulong job = TritApi.Scan("MyMod", ScanKind.Histogram, trits);
+if (TritApi.TryPollJob(job, out JobResult? r))
+{
+    // r.ResultJson 例如 {"histogram":{"neg":1,"zero":2,"pos":3}}
+}
+```
+
+完整用法见 [mod/TritRuntimeMod/README.md](mod/TritRuntimeMod/README.md)，
+底层 ABI 见 [docs/ABI.md](docs/ABI.md)。
+
 ## 兼容性为什么能守住
 
 | 机制 | 落地位置 |
@@ -71,7 +115,7 @@ third_party/trit/        三进制库子模块 —— 只调用，不修改
 cargo test -p trit-rt --release
 cargo build --release -p trit-rt          # 产物 target/release/trit_rt.dll
 
-# 2. C# 兼容壳 + 测试（107 个）
+# 2. C# 兼容壳 + 测试（143 个）
 dotnet test dotnet/TritRuntime.Shim.Tests/TritRuntime.Shim.Tests.csproj
 
 # 3. tModLoader 模组
@@ -85,16 +129,22 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 
 | 项 | 状态 | 依据 |
 |---|---|---|
-| Rust 内核测试 | ✅ 42/42 | `cargo test -p trit-rt --release` |
+| Rust 内核测试 | ✅ 119/119 | `cargo test -p trit-rt --release` |
 | Rust clippy / fmt | ✅ 0 警告 / 干净 | `cargo clippy --all-targets`、`cargo fmt --check` |
-| C# 兼容壳测试 | ✅ 110/110 | `dotnet test`，含原生 vs 托管 51 步逐字节对拍 |
+| C# 兼容壳测试 | ✅ 143/143 | `dotnet test`，含原生 vs 托管逐字节对拍 |
 | 原生 / 托管语义等价 | ✅ 快照字节、统计、PRNG 流、冲突诊断全部对拍 | `ParityTests` |
+| 原生 / 托管**扫描结果逐字节等价** | ✅ 4 合法 + 5 非法 + 4 容错载荷，两侧 `JOB_POLL` 记录逐字节相同 | `ParallelApiTests.ManagedAndNativeScanResultsAgreeWhenV2NativeIsAvailable` |
+| 非法请求语义统一 | ✅ 非法 trit / 未知 kind / 缺 pattern / 超容量两侧都产生 `failed` 任务，`error` 文案逐字一致、无前缀 | `ParallelApiTests` + `crates/trit-rt` 测试 |
+| JSON 键序 / 浮点 / 编码一致 | ✅ 键序=书写序、`density` 定点 6 位、中文不转义 | ABI「JSON 键序、浮点格式与字符编码」节 + 字节级对拍 |
+| 多 mod 结果隔离 | ✅ 按 owner 过滤，只出队真正返回的那几条 | `ParallelApiTests` |
+| 原生库多实例隔离 | ✅ 每个实例只调用自己加载的模块 | `TwoNativeInstancesEachUseTheirOwnModule` |
 | 已知能力差异 | 仅 `Capabilities` 一处：托管回退无 AI 投票（`caps` 少 `0x100` 位、`abi=0`） | 测试中逐字节钉死 |
 | 模组编译 | ✅ 0 警告 0 错误（Debug/Release） | `dotnet build` |
 | 模组 `.tmod` 打包 | ✅ 走 tML 官方管线，含 `lib/TritRuntime.Shim.dll` + `lib/Native/trit_rt.dll` | `-p:BuildMod=true`（需先关游戏） |
 | 模组**进游戏实跑**（客户端） | ✅ 已跑通（本机 tML 1.4.4.9） | 见下 |
 | 模组**专用服务器实跑**（无头） | ✅ 装载 / 自检 / 原生库加载全通；`mode=Native` | 见下 |
 | 服务器侧 tick 数据 | ❌ 未取得 | 无玩家连接时服务器不跑世界更新循环（引擎行为），见 issue |
+
 
 ### 真机实跑记录（2026-10-26）
 
@@ -178,19 +228,32 @@ tick 驱动因此从 MonoMod 钩子改为官方 `ModSystem`（不依赖内部方
 在总线语义下：0 个驱动 → 高阻；1 个驱动 → 其值；≥2 个驱动 → 冲突（即使同向），
 一次性列出该车道全部驱动。这是跨模组写意图仲裁的基础。
 
-## 两个容易踩的坑（已固化到代码里）
+## 几个容易踩的坑（已固化到代码里）
 
 1. **钩子形态**：本机 tModLoader 1.4.4.9 生成的是 `Terraria.On_*` / `Terraria.IL_*`（各 1036 个），
    不是旧文档里的 `On.Terraria.*`。后者在本版本**编译不过**。签名全部由 `tools/SignatureProbe` 反射导出。
 2. **附加程序集**：tML 只从 `.tmod` 内的 `lib/<名字>.dll` 加载附加程序集（要配 `build.txt` 的
    `dllReferences`）。references 拷贝到输出目录并不够——漏了这步，运行时就是 `TypeLoadException`。
    原生 DLL 不能走这条路（`dllReferences` 只认托管程序集），只能当普通资源打包后运行时取出落盘。
-3. **原生库文件名不能改**：`SetDllImportResolver` 登记的名字必须等于 `DllImport` 声明里的常量。
+3. **原生库必须按实例绑定，不能靠静态 `DllImport`**：
+   `.NET` 会**缓存** DllImport 的首次解析结果，`SetDllImportResolver` 又只能装一次、
+   只存一个句柄。所以「先加载 trit_rt，再 `Load(别处的 dll)`」会**静默用回第一个模块**——
+   指定路径形同虚设，ABI 校验读的也是别的模块的版本。
+   现在所有带句柄的调用都走 `NativeApi`（每个实例持有自己那份模块的导出函数指针）。
+   详见 [Issue #3](https://github.com/bfxh/trit-tml/issues/3)。
+4. **原生库文件名不能改**：`SetDllImportResolver` 登记的名字必须等于 `DllImport` 声明里的常量。
    若把库落盘成 `<hash>_trit_rt.dll` 并从路径推导登记名，就与常量 `"trit_rt"` 对不上，
    解析器永不命中，表现为 `Unable to load DLL (0x8007007E)`。要版本隔离就改**目录**名，别改文件名。
-4. **服务器不调用 `Main.Update`**：专用服务器走 `Main.DedServ` 自己的循环，
+   （按实例绑定之后这条约束变松了：导出函数名与文件名无关，`NativeApi` 只认「这个模块有没有
+   `tt_rt_*` 导出」。但兼容壳里残留的进程级静态 `DllImport` 仍受这条约束。）
+5. **服务器不调用 `Main.Update`**：专用服务器走 `Main.DedServ` 自己的循环，
    `On_Main.Update` 挂上去不会触发；且无玩家连接时世界更新循环压根不跑（连 `ModSystem` 回调也不到）。
    需要每 tick 驱动就走官方 `ModSystem`，别 hook 内部方法。
+6. **多 mod 不能抢彼此的任务结果**：旁路任务池是全局的，多个 mod 共用。
+   `JOB_POLL` 支持按 `owner` 过滤，且**只出队真正返回的那几条**——
+   其他 owner 的结果留在队列里。过滤与截断的顺序是「先过滤再截断」，
+   否则队头被别人的任务占满时，该 owner 的结果会被挤掉。
+
 
 ## 不做什么
 

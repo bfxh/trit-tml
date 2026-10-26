@@ -18,14 +18,25 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 trit-core.workspace = true
 trit-codec.workspace = true
 trit-schedule.workspace = true
+trit-gpu.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `preserve_order`：JSON 对象的键按**书写顺序**输出，而不是按字母序。
+#   托管回退内核用 Utf8JsonWriter 按写入顺序输出；原生侧若按字母序排，
+#   同一份请求两边产出的响应字节就不同——影子差分（逐字节比对）会一直报分歧，
+#   而且分歧点只是键序，肉眼看两边「意思一样」，极难定位。
+#   对上游 trit 库零影响：它们序列化的是**结构体**（派生 Serialize → 字段声明序），
+#   不走 Map 的键序。
+# `raw_value`：允许把一段**原始 JSON 文本**原样嵌进响应（密度的定点小数用）。
+serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 thiserror.workspace = true
 
 [features]
 default = ["ai-voting"]
 # 三值权重网络（{-1,0,+1}）做 AI 决策投票：确定/弃权两态输出。
 ai-voting = ["dep:trit-net"]
+# GPU 后端：拉起 wgpu，编译变慢、产物变大，所以默认不开（发布构建带这个 feature）。
+# 关掉时 CPU 位并行镜像照常工作，GPU 状态恒为"不可用"并给出原因——玩家侧无感回退。
+gpu = ["trit-gpu/gpu"]
 
 [dependencies.trit-net]
 workspace = true

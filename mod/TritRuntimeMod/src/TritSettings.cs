@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using TritRuntime.Kernel;
 
 namespace TritRuntimeMod;
 
@@ -16,6 +17,27 @@ public sealed class TritSettings
 {
     /// <summary>设置文件名（放在 tML 存档根目录）。</summary>
     public const string FileName = "TritRuntimeMod.settings.json";
+
+    /// <summary>工作线程数上限（0 = 自动）。</summary>
+    public const int MaxWorkerCount = 32;
+
+    /// <summary>全局内存预算上限（MiB）。</summary>
+    public const int MaxMemoryCapacityMb = 8192;
+
+    /// <summary>单模组同时在跑任务数上限。</summary>
+    public const int MaxPerModInflight = 16;
+
+    /// <summary>扫描分步粒度下限。</summary>
+    public const int MinScanChunk = 256;
+
+    /// <summary>扫描分步粒度上限。</summary>
+    public const int MaxScanChunk = 1_048_576;
+
+    /// <summary>GPU 收益阈值上限（2^28 ≈ 2.68 亿元素）。</summary>
+    public const int MaxGpuMinTrits = 1 << 28;
+
+    /// <summary>每 tick 取回任务结果数上限。</summary>
+    public const int MaxPollJobsPerTick = 256;
 
     /// <summary>是否安装 Terraria.On_* 观测钩子。</summary>
     [JsonPropertyName("enableHooks")]
@@ -67,6 +89,55 @@ public sealed class TritSettings
     /// <summary>连续失败多少次后自动摘掉钩子（防止把游戏拖垮）。</summary>
     [JsonPropertyName("maxConsecutiveHookFailures")]
     public int MaxConsecutiveHookFailures { get; set; } = 5;
+
+    /// <summary>
+    /// 是否启用旁路并行任务池。关闭时强制单工作线程 + 单模组单任务（等价于串行），
+    /// 用于排查"任务池抢线程"这类只在多核环境出现的问题。
+    /// </summary>
+    [JsonPropertyName("enableParallel")]
+    public bool EnableParallel { get; set; } = true;
+
+    /// <summary>并行任务池工作线程数。0 = 自动（内核取 min(可用并行度, 4)）。</summary>
+    [JsonPropertyName("workerCount")]
+    public int WorkerCount { get; set; }
+
+    /// <summary>全局内存预算（MiB）。0 = 不限制。</summary>
+    [JsonPropertyName("memoryCapacityMb")]
+    public int MemoryCapacityMb { get; set; } = 512;
+
+    /// <summary>同一模组（owner）同时在跑的任务上限，防独占。</summary>
+    [JsonPropertyName("perModInflight")]
+    public int PerModInflight { get; set; } = 2;
+
+    /// <summary>扫描任务的分步粒度（每步处理的元素数），决定抢占边界。</summary>
+    [JsonPropertyName("scanChunk")]
+    public int ScanChunk { get; set; } = 4096;
+
+    /// <summary>
+    /// GPU 策略文本：<c>auto</c> / <c>off</c> / <c>on</c>（大小写不敏感，解析失败按 <c>auto</c>）。
+    /// 玩家可以用 <c>trit gpu on|off|auto</c> 在游戏里改，改完立即写回设置文件。
+    /// </summary>
+    [JsonPropertyName("gpuPolicy")]
+    public string GpuPolicyText { get; set; } = "auto";
+
+    /// <summary>小于该规模的任务走 CPU（GPU dispatch 延迟占主导，小规模反而更慢）。</summary>
+    [JsonPropertyName("gpuMinTrits")]
+    public int GpuMinTrits { get; set; } = 1_048_576;
+
+    /// <summary>每 tick 最多取回多少条已完成的任务结果。</summary>
+    [JsonPropertyName("pollJobsPerTick")]
+    public int PollJobsPerTick { get; set; } = 8;
+
+    /// <summary>是否在聊天/日志里输出每条扫描结果（默认关，避免刷屏）。</summary>
+    [JsonPropertyName("logJobResults")]
+    public bool LogJobResults { get; set; }
+
+    /// <summary>
+    /// 归一化后的 GPU 策略枚举。刻意不序列化——设置文件里存的是文本，
+    /// 枚举值由 <see cref="Sanitize"/> 保证合法，因此这里不会再退回默认。
+    /// </summary>
+    [JsonIgnore]
+    public GpuPolicy GpuPolicyKind => ParseGpuPolicy(GpuPolicyText);
 
     [JsonIgnore]
     public string LoadedFrom { get; private set; } = string.Empty;
@@ -182,6 +253,89 @@ public sealed class TritSettings
             MaxConsecutiveHookFailures = 0;
         }
 
+        // 0 是合法值（自动），非法值（负数 / 过大）一律退回自动，绝不猜。
+        if (WorkerCount < 0 || WorkerCount > MaxWorkerCount)
+        {
+            WorkerCount = 0;
+        }
+
+        MemoryCapacityMb = Clamp(MemoryCapacityMb, 0, MaxMemoryCapacityMb);
+        PerModInflight = Clamp(PerModInflight, 1, MaxPerModInflight);
+        ScanChunk = Clamp(ScanChunk, MinScanChunk, MaxScanChunk);
+        GpuMinTrits = Clamp(GpuMinTrits, 0, MaxGpuMinTrits);
+        PollJobsPerTick = Clamp(PollJobsPerTick, 1, MaxPollJobsPerTick);
+
+        // 归一化成小写三选一：这样内核侧的字符串比较才有确定的结果。
+        GpuPolicyText ??= "auto";
+        string policy = GpuPolicyText.Trim().ToLowerInvariant();
+        GpuPolicyText = policy is "on" or "off" ? policy : "auto";
+
         LibraryPath ??= string.Empty;
     }
+
+    /// <summary>
+    /// 把当前设置写回 <see cref="FileName"/>（tML 存档根目录）。
+    /// 写失败只回 <paramref name="warning"/>——设置保存失败绝不能影响游戏。
+    /// </summary>
+    /// <returns>是否写入成功。</returns>
+    public bool Save(out string warning)
+    {
+        warning = string.Empty;
+
+        string path;
+        try
+        {
+            path = Path.Combine(SettingsDirectory(), FileName);
+        }
+        catch (Exception ex)
+        {
+            warning = "拼装设置文件路径失败，本次修改只在本会话生效：" + ex.Message;
+            return false;
+        }
+
+        try
+        {
+            File.WriteAllText(path, JsonSerializer.Serialize(this, WriteOptions));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            warning = $"设置文件写出失败（{path}），本次修改只在本会话生效：{ex.Message}";
+            return false;
+        }
+    }
+
+    /// <summary>解析 GPU 策略文本；无法识别的一律按 <see cref="GpuPolicy.Auto"/>。</summary>
+    public static GpuPolicy ParseGpuPolicy(string? text)
+    {
+        switch (text?.Trim().ToLowerInvariant())
+        {
+            case "on":
+                return GpuPolicy.On;
+            case "off":
+                return GpuPolicy.Off;
+            default:
+                return GpuPolicy.Auto;
+        }
+    }
+
+    private static string SettingsDirectory()
+    {
+        try
+        {
+            string dir = Terraria.Main.SavePath;
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                return dir;
+            }
+        }
+        catch
+        {
+            // Main.SavePath 在游戏极早期可能抛异常，落到入口目录即可
+        }
+
+        return AppContext.BaseDirectory;
+    }
+
+    private static int Clamp(int value, int min, int max) => value < min ? min : value > max ? max : value;
 }

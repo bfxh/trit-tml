@@ -7,16 +7,21 @@
 //! - 所有真实状态修改由 C# 在游戏主线程提交。
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use trit_core::value::Ternary;
 
 use crate::arbiter::{
     ArbitrationMode, Intent, LaneDispute, ResolvedIntent, apply_delta, arbitrate,
 };
 use crate::error::RtError;
+use crate::gpu::{GpuConfig, GpuPolicy};
+use crate::pool::{JobPool, ParallelConfig};
 use crate::prng::DeterministicPrng;
 use crate::router::{EventRouter, ScheduleMetrics};
+use crate::scan::{ScanRequest, normalize_owner};
 use crate::snapshot::{DiffEntry, Snapshot, diff_worlds, encode_diff, encode_world};
 use crate::txn::{TxnLog, TxnTable};
 use crate::wire::{self, Reader, Writer, op, query};
@@ -26,6 +31,16 @@ pub const MAX_WORLD_LANES: usize = 1 << 20;
 
 /// 影子签名滚动窗口大小。
 const SHADOW_WINDOW: usize = 64;
+
+/// 解析 GPU 策略名（大小写不敏感）。
+fn parse_gpu_policy(text: &str) -> Option<GpuPolicy> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(GpuPolicy::Auto),
+        "off" => Some(GpuPolicy::Off),
+        "on" => Some(GpuPolicy::On),
+        _ => None,
+    }
+}
 
 /// 运行时配置（JSON 线格式，见 ABI 文档）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -45,6 +60,10 @@ pub struct RuntimeConfig {
     pub arbitration: ArbitrationModeSerde,
     /// 是否启用影子差分记录。
     pub shadow: bool,
+    /// 并行任务池配置（v2）。
+    pub parallel: ParallelConfig,
+    /// GPU 后端配置（v2）。
+    pub gpu: GpuConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -57,6 +76,8 @@ impl Default for RuntimeConfig {
             max_log_entries: 1 << 20,
             arbitration: ArbitrationModeSerde::Majority,
             shadow: true,
+            parallel: ParallelConfig::default(),
+            gpu: GpuConfig::default(),
         }
     }
 }
@@ -154,10 +175,13 @@ pub struct TritRuntime {
     event_payloads: BTreeMap<u32, Vec<Ternary>>,
     #[cfg(feature = "ai-voting")]
     ai_model: Option<trit_net::Model>,
+    /// 并行任务池（v2）：扫描任务在这里跑，游戏主线程只提交与回收。
+    pool: Arc<JobPool>,
 }
 
 impl TritRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
+        let pool = Arc::new(JobPool::new(config.parallel, config.gpu));
         Self {
             router: EventRouter::new(config.max_subscribers),
             txns: TxnTable::new(config.max_open_txns),
@@ -175,6 +199,7 @@ impl TritRuntime {
             event_payloads: BTreeMap::new(),
             #[cfg(feature = "ai-voting")]
             ai_model: None,
+            pool,
         }
     }
 
@@ -212,7 +237,18 @@ impl TritRuntime {
         {
             caps |= wire::caps::AI;
         }
+        // 任务池与预算是本 crate 自带能力，恒为真；GPU 只有在**探测成功**后才置位
+        // （探测要初始化 wgpu，不能藏在这种会被频繁调用的方法里）。
+        caps |= wire::caps::PARALLEL | wire::caps::BUDGET;
+        if self.pool.gpu_available() {
+            caps |= wire::caps::GPU;
+        }
         caps
+    }
+
+    /// 并行任务池（供上层直接观测）。
+    pub fn pool(&self) -> &Arc<JobPool> {
+        &self.pool
     }
 
     /// 分发一个 opcode。
@@ -239,6 +275,12 @@ impl TritRuntime {
             op::AI_VOTE => self.op_ai_vote(payload),
             #[cfg(feature = "ai-voting")]
             op::AI_SET_MODEL => self.op_ai_set_model(payload),
+            op::SCAN_SUBMIT => self.op_scan_submit(payload),
+            op::JOB_POLL => self.op_job_poll(payload),
+            op::JOB_CANCEL => self.op_job_cancel(payload),
+            op::GPU_STATUS => self.op_gpu_status(payload),
+            op::BUDGET => self.op_budget(payload),
+            op::METRICS => self.op_metrics(payload),
             _ => Err(RtError::InvalidInput(format!("未知 opcode {opcode:#x}"))),
         };
         if let Err(error) = &result {
@@ -633,6 +675,151 @@ impl TritRuntime {
             applied += 1;
         }
         Ok((applied, self.log.seq()))
+    }
+
+    // ---- v2：并行任务池 / GPU / 全局预算（opcode 0x14..0x19，载荷与响应都是 JSON）----
+
+    /// 解析 JSON 载荷；空载荷取该类型的默认值。
+    fn json_payload<T: Default + DeserializeOwned>(payload: &[u8]) -> Result<T, RtError> {
+        if payload.is_empty() {
+            return Ok(T::default());
+        }
+        serde_json::from_slice(payload)
+            .map_err(|error| RtError::Decode(format!("JSON 载荷非法：{error}")))
+    }
+
+    /// 把 JSON 值序列化成响应字节。
+    fn json_response(value: &serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(value).unwrap_or_default()
+    }
+
+    /// 提交一个扫描任务（`0x14`）。
+    fn op_scan_submit(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        let request: ScanRequest = Self::json_payload(payload)?;
+        let id = self.pool.submit(request)?;
+        Ok(Self::json_response(&serde_json::json!({"job": id})))
+    }
+
+    /// 取出已完成的任务（`0x15`）。
+    ///
+    /// 进程内直接 `dispatch` 时响应不存在「装不下」的问题，所以这里
+    /// **窥视后立即出队**，语义等价于「取出即出队」。
+    fn op_job_poll(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        let (response, ids) = self.poll_jobs_peek(payload)?;
+        self.commit_jobs(&ids);
+        Ok(response)
+    }
+
+    /// 两阶段取任务的第一阶段：**窥视**已完成的任务，**不出队**。
+    ///
+    /// 返回 `(响应字节, 被窥视到的任务 id)`。
+    ///
+    /// 为什么需要两阶段：C ABI 的缓冲区协议规定「响应装不下 → 回
+    /// `TT_ERR_BUFFER` → 调用方扩容后重试」。若这里就把结果出队，重试时
+    /// 队列已空，任务结果**永久丢失**。所以跨 FFI 的路径必须：
+    /// 先窥视 → 确认交付成功 → 再 [`Self::commit_jobs`] 出队。
+    ///
+    /// `owner` 过滤：`None`（字段缺省或 `null`）= 不限归属；
+    /// `Some(name)` = 只返回该 owner 的结果，**其他 owner 的结果原样留在队列里**。
+    pub fn poll_jobs_peek(&self, payload: &[u8]) -> Result<(Vec<u8>, Vec<u64>), RtError> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct PollRequest {
+            /// 取几条；`<= 0` 表示全部。
+            ///
+            /// 用 `i64` 而不是 `usize`：**负数必须被夹取而不是解码失败**，
+            /// 否则同一份载荷在原生路径上报解码错误、在托管路径上正常返回，
+            /// 两条路径对同一个请求给出不同答案（影子对拍会一直报不一致）。
+            limit: i64,
+            owner: Option<String>,
+        }
+        let request: PollRequest = Self::json_payload(payload)?;
+        let limit = if request.limit > 0 {
+            request.limit as usize
+        } else {
+            0
+        };
+        // owner 的归一化口径必须与提交侧一致（空串 → "unknown"），
+        // 否则「以空 owner 提交」的任务用 "unknown" 过滤就找不到。
+        let owner = request.owner.as_deref().map(normalize_owner);
+        let jobs = self.pool.peek_filtered(owner.as_deref(), limit);
+        let ids = jobs.iter().map(|job| job.id).collect();
+        // **不能走 `json!`**：它内部是 `to_value`，会把任务结果里的原始 JSON 文本
+        // （密度的定点小数）重新解析成浮点数，格式就丢了。
+        // 直接序列化结构体，字段顺序与原始文本都原样保留。
+        #[derive(serde::Serialize)]
+        struct JobPollResponse<'a> {
+            jobs: &'a [crate::scan::JobRecord],
+        }
+        let response = serde_json::to_vec(&JobPollResponse { jobs: &jobs })
+            .map_err(|error| RtError::Decode(error.to_string()))?;
+        Ok((response, ids))
+    }
+
+    /// 两阶段取任务的第二阶段：把**已交付**的任务结果真正出队。
+    ///
+    /// 返回实际出队的条数；未知的 id 会被忽略（可能已被别的路径取走）。
+    pub fn commit_jobs(&self, ids: &[u64]) -> usize {
+        self.pool.drain_ids(ids)
+    }
+
+    /// 取消任务（`0x16`）：按 id，或按 owner 全撤。
+    fn op_job_cancel(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct CancelRequest {
+            job: Option<u64>,
+            owner: Option<String>,
+        }
+        let request: CancelRequest = Self::json_payload(payload)?;
+        let cancelled = match (request.job, request.owner.as_deref()) {
+            (Some(id), _) => self.pool.cancel_job(id),
+            (None, Some(owner)) => self.pool.cancel_owner(owner),
+            (None, None) => 0,
+        };
+        Ok(Self::json_response(
+            &serde_json::json!({"cancelled": cancelled}),
+        ))
+    }
+
+    /// GPU 后端状态（`0x17`）；可同时切换策略与强制重新探测。
+    fn op_gpu_status(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct GpuRequest {
+            policy: Option<String>,
+            probe: bool,
+            trits: usize,
+        }
+        let request: GpuRequest = Self::json_payload(payload)?;
+        let mut status = match request.policy.as_deref() {
+            Some(text) => {
+                let policy = parse_gpu_policy(text).ok_or_else(|| {
+                    RtError::InvalidInput(format!(
+                        "未知 GPU 策略 \"{text}\"；可选：auto / off / on"
+                    ))
+                })?;
+                self.pool.set_gpu_policy(policy)
+            }
+            None => self.pool.gpu_status(),
+        };
+        if request.probe {
+            status = self.pool.gpu_probe(request.trits.max(1024));
+        }
+        Ok(Self::json_response(&serde_json::json!(status)))
+    }
+
+    /// 全局预算快照（`0x18`）。
+    fn op_budget(&mut self, _payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        Ok(Self::json_response(&self.pool.budget_json()))
+    }
+
+    /// 任务池指标（`0x19`，Prometheus/OpenMetrics 文本）。
+    fn op_metrics(&mut self, _payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        let prometheus = self.pool.metrics_prometheus();
+        Ok(Self::json_response(
+            &serde_json::json!({"prometheus": prometheus}),
+        ))
     }
 
     /// 从 `seq` 之后重放日志（确定性重放验证用）。

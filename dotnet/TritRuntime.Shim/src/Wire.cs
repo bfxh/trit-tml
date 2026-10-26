@@ -75,6 +75,24 @@ public static class Opcode
 
     /// <summary>装载三值权重网络模型。</summary>
     public const uint AiSetModel = 0x13;
+
+    /// <summary>提交并行扫描任务。</summary>
+    public const uint ScanSubmit = 0x14;
+
+    /// <summary>取出已完成任务。</summary>
+    public const uint JobPoll = 0x15;
+
+    /// <summary>协作式取消任务。</summary>
+    public const uint JobCancel = 0x16;
+
+    /// <summary>查询或切换 GPU 后端状态。</summary>
+    public const uint GpuStatus = 0x17;
+
+    /// <summary>查询全局资源预算。</summary>
+    public const uint Budget = 0x18;
+
+    /// <summary>查询任务池 Prometheus 指标。</summary>
+    public const uint Metrics = 0x19;
 }
 
 /// <summary>查询编号，与 Rust 侧 <c>trit_rt::wire::query</c> 对齐。</summary>
@@ -135,6 +153,15 @@ public enum CapabilityBits : ulong
 
     /// <summary>AI 决策投票。</summary>
     Ai = 1UL << 8,
+
+    /// <summary>并行任务池。</summary>
+    Parallel = 1UL << 9,
+
+    /// <summary>GPU 后端运行时可用。</summary>
+    Gpu = 1UL << 10,
+
+    /// <summary>全局资源预算。</summary>
+    Budget = 1UL << 11,
 }
 
 /// <summary>C ABI 状态码，与 Rust 侧 <c>trit_rt::ffi::TT_*</c> 对齐。</summary>

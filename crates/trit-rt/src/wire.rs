@@ -56,6 +56,21 @@ pub mod op {
     pub const AI_VOTE: u32 = 0x12;
     /// 装载三值权重网络模型：`json_len u32, json bytes` → 空
     pub const AI_SET_MODEL: u32 = 0x13;
+
+    // v2 新增：以下 6 个 opcode 的载荷与响应都是 **UTF-8 JSON**
+    //（既有 opcode 保持二进制不变，避免破坏兼容）。见 docs/ABI.md。
+    /// 提交一个扫描任务：`ScanRequest` JSON → `{"job": u64}`
+    pub const SCAN_SUBMIT: u32 = 0x14;
+    /// 取出已完成的任务（取出即出队）：`{"limit": usize}` → `{"jobs": [JobRecord]}`
+    pub const JOB_POLL: u32 = 0x15;
+    /// 取消任务：`{"job": u64}` 或 `{"owner": string}` → `{"cancelled": u64}`
+    pub const JOB_CANCEL: u32 = 0x16;
+    /// GPU 后端状态：`{"policy": "auto|off|on", "probe": bool, "trits": usize}` → `GpuStatus`
+    pub const GPU_STATUS: u32 = 0x17;
+    /// 全局预算快照：`{}` → `BudgetSnapshot`
+    pub const BUDGET: u32 = 0x18;
+    /// 任务池指标：`{}` → `{"prometheus": string}`
+    pub const METRICS: u32 = 0x19;
 }
 
 /// 查询编号。
@@ -85,6 +100,12 @@ pub mod caps {
     pub const CODEC: u64 = 1 << 6;
     pub const SHADOW: u64 = 1 << 7;
     pub const AI: u64 = 1 << 8;
+    /// 并行任务池（v2）。
+    pub const PARALLEL: u64 = 1 << 9;
+    /// GPU 后端**可用**（构建带了 `gpu` feature 且运行时探测通过；v2）。
+    pub const GPU: u64 = 1 << 10;
+    /// 全局资源预算（v2）。
+    pub const BUDGET: u64 = 1 << 11;
 }
 
 /// 读取器。

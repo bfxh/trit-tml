@@ -12,6 +12,10 @@
 //! - [`snapshot`]：世界三进制张量投影的快照 / 差分；
 //! - [`prng`]：确定性 PRNG（splitmix64，可逐位移植到 C#）；
 //! - [`runtime`]：装配体，`dispatch(opcode, payload)` 是唯一入口；
+//! - [`pool`]：并行任务池（扫描任务在 Rust 工作线程跑，游戏主线程只提交与回收）；
+//! - [`scan`]：扫描任务本体（直方图 / 模式匹配 / 密度热点 / 点积，可分步可抢占）；
+//! - [`gpu`]：GPU 后端（能力探测 + 自检对拍 + 自动回退 CPU）；
+//! - [`budget`]：全局资源预算（太多 mod 时不让任一 mod 独占旁路层）；
 //! - [`ffi`]：C ABI（`tt_rt_*`），panic 全拦，只回状态码。
 //!
 //! 三进制语义贯穿全 crate：`False = -1`（减少/移除）、`Unknown = 0`
@@ -21,15 +25,22 @@
 //! 路径依赖、只读调用），本 crate 不重新实现其任何算法。
 
 pub mod arbiter;
+pub mod budget;
 pub mod error;
 pub mod ffi;
+pub mod gpu;
+pub mod pool;
 pub mod prng;
 pub mod router;
 pub mod runtime;
+pub mod scan;
 pub mod snapshot;
 pub mod txn;
 pub mod wire;
 
 pub use error::RtError;
+pub use gpu::{GpuConfig, GpuPolicy, GpuStatus};
+pub use pool::{JobPool, ParallelConfig};
 pub use runtime::{RuntimeConfig, TritRuntime};
+pub use scan::{JobRecord, JobState, ScanKind, ScanRequest};
 pub use wire::{op, query};

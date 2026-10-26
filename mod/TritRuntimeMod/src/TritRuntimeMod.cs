@@ -1,4 +1,9 @@
 using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.Text;
+using System.Text.Json;
+using Terraria;
 using Terraria.ModLoader;
 using TritRuntime.Kernel;
 using TritRuntime.Wire;
@@ -17,16 +22,86 @@ namespace TritRuntimeMod;
 /// <para>
 /// 对外接口就是 tML 原生的 <c>Mod.Call</c>：其他模组通过
 /// <c>TritRuntimeMod.Call("TritRuntime.Capabilities")</c> 之类的调用使用本层，
-/// 完全不需要引用本模组的类型。
+/// 完全不需要引用本模组的类型。命令名一律以 <c>TritRuntime.</c> 开头且大小写不敏感，
+/// 分支全在兼容壳 <see cref="RuntimeShim.Call"/> 里，本类只做转发（不重复分发）。
+/// </para>
+/// </remarks>
+/// <remarks>
+/// <para>
+/// <b>其他模组怎么接入（两条路，任选其一）。</b>
+/// </para>
+/// <para>
+/// 一、弱引用（推荐，不需要引用本程序集，本模组不存在也不会编译失败）：
+/// <code>
+/// Mod trit = ModLoader.GetMod("TritRuntimeMod");
+/// if (trit is not null)
+/// {
+///     // 提交扫描，拿到 job id（0 = 提交失败）。
+///     // kind 是字符串且大小写不敏感：histogram | pattern | density | dot
+///     ulong job = (ulong)trit.Call(
+///         "TritRuntime.Scan", "MyMod", "pattern", trits, pattern, 3);
+///
+///     // 取回已完成的结果（取出即出队）
+///     var jobs = (IReadOnlyList&lt;JobResult&gt;)trit.Call("TritRuntime.PollJobs", 16);
+///     trit.Call("TritRuntime.CancelJob", job);
+///     var caps = (CapabilityReport)trit.Call("TritRuntime.Capabilities");
+/// }
+/// </code>
+/// 全部命令清单见兼容壳的 <c>TritRuntimeCommands.All</c>。
+/// </para>
+/// <para>
+/// 二、强引用（引用本程序集后直接调 <see cref="TritApi"/> 的静态方法）：
+/// <code>
+/// if (TritApi.Available)
+/// {
+///     ulong job = TritApi.Scan("MyMod", ScanKind.Histogram, trits);
+///     if (TritApi.TryPollJob(job, out JobResult r)) { /* 用 r.ResultJson */ }
+/// }
+/// </code>
+/// <see cref="TritApi"/> 是"永不抛"的门面：运行时不可用时返回 0 / null / 空列表，
+/// 其他模组不需要写 try/catch。
 /// </para>
 /// </remarks>
 public sealed class TritRuntimeMod : Mod
 {
+    /// <summary>任务结果环形缓冲容量（只留最近这么多条，供 <c>trit jobs</c> 与 <see cref="TritApi"/> 回看）。</summary>
+    private const int RecentJobCapacity = 64;
+
+    /// <summary>任务失败日志最多记多少条（之后只轮询不刷屏）。</summary>
+    private const int MaxLoggedJobFailures = 10;
+
+    /// <summary>单个 owner 的结果邮箱容量上限（防止某个模组不取结果时无限堆积）。</summary>
+    private const int OwnerMailboxCapacity = 64;
+
     private TritSettings settings = new();
     private RuntimeShim? shim;
     private WorldBridge? bridge;
     private TritHooks? hooks;
     private bool loaded;
+
+    // 轮询开关：一旦轮询本身抛异常就永久关闭，避免每 tick 刷一条错误日志。
+    private bool jobPollingEnabled;
+
+    private readonly List<JobResult> recentJobs = new(RecentJobCapacity);
+
+    /// <summary>
+    /// 按 owner 分桶的结果邮箱：<c>owner → 待取走的结果</c>。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 为什么需要它：内核的 <c>JOB_POLL</c> 是<b>全局队列 + 取出即出队</b>。
+    /// 若模组层每 tick 把队列里的结果全取走再塞进一个公共环形缓冲，
+    /// 就会出现「A 模组提交的任务被 B 模组的轮询取走」——结果串台，
+    /// 而且谁都拿不到自己那份（环形缓冲只有最近 64 条，早期的直接丢了）。
+    /// </para>
+    /// <para>
+    /// 分桶之后：每个模组只从<b>自己那桶</b>取结果，互不影响；
+    /// 公共环形缓冲仍保留一份，供 <c>trit jobs</c> 命令与诊断回看。
+    /// </para>
+    /// </remarks>
+    private readonly Dictionary<string, List<JobResult>> ownerMailboxes = new(StringComparer.Ordinal);
+
+    private int loggedJobFailures;
 
     /// <summary>当前装载中的模组实例（未装载时为 <c>null</c>）。</summary>
     public static TritRuntimeMod? Instance { get; private set; }
@@ -36,6 +111,113 @@ public sealed class TritRuntimeMod : Mod
 
     /// <summary>装载期端到端自检是否通过（决定是否安装钩子）。</summary>
     public bool SelfCheckPassed { get; private set; }
+
+    /// <summary>当前生效的设置（命令层与 API 层共用同一份实例，改了立即生效）。</summary>
+    internal TritSettings Settings => settings;
+
+    /// <summary>世界投影桥（未装配时为 <c>null</c>）。</summary>
+    internal WorldBridge? Bridge => bridge;
+
+    /// <summary>最近完成的任务结果（最多 <see cref="RecentJobCapacity"/> 条，最新的在末尾）。</summary>
+    internal IReadOnlyList<JobResult> RecentJobs => recentJobs;
+
+    /// <summary>任务结果轮询是否仍在工作（异常后会被永久关闭）。</summary>
+    internal bool JobPollingEnabled => jobPollingEnabled;
+
+    /// <summary>内部运行时门面（未装配时为 <c>null</c>）。</summary>
+    internal RuntimeShim? Runtime => shim;
+
+    /// <summary>按设置拼装内核配置 JSON（字段严格按 <c>docs/ABI.md</c> 的"配置 JSON"小节）。</summary>
+    /// <remarks>
+    /// 拼装失败一律回退空串（空串 = 内核默认配置）——配置是可选的，
+    /// 绝不能因为一个设置值算错就让整个内核起不来。
+    /// </remarks>
+    private string BuildRuntimeConfigJson()
+    {
+        try
+        {
+            var buffer = new ArrayBufferWriter<byte>(128);
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                writer.WriteStartObject();
+
+                writer.WriteStartObject("parallel");
+                // 关掉并行时收敛到"一个工作线程 + 单模组单任务"，等价于串行执行。
+                writer.WriteNumber("workers", settings.EnableParallel ? settings.WorkerCount : 1);
+                writer.WriteNumber("cpu_capacity", 0); // 0 = 自动（等于 workers）
+                writer.WriteNumber("memory_capacity", settings.MemoryCapacityMb);
+                writer.WriteNumber("per_mod_inflight", settings.EnableParallel ? settings.PerModInflight : 1);
+                writer.WriteNumber("scan_chunk", settings.ScanChunk);
+                writer.WriteEndObject();
+
+                writer.WriteStartObject("gpu");
+                writer.WriteString("policy", settings.GpuPolicyText);
+                writer.WriteNumber("min_trits", settings.GpuMinTrits);
+                writer.WriteEndObject();
+
+                writer.WriteEndObject();
+            }
+
+            return Encoding.UTF8.GetString(buffer.WrittenSpan);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("[trit] 拼装内核配置 JSON 失败，本次使用内核默认配置：" + ex.Message);
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// 装配完成后，把"并行 / GPU 到底能不能用、为什么"讲清楚。
+    /// 这一段只做观测，任何异常都不允许影响装载。
+    /// </summary>
+    private void ReportParallelAndGpu()
+    {
+        try
+        {
+            if (shim is null)
+            {
+                return;
+            }
+
+            if (!shim.Supports(CapabilityBits.Parallel))
+            {
+                Logger.Info("[trit] 当前内核没有并行任务池（Parallel 能力位未置位），扫描任务将同步执行。");
+            }
+
+            // 给策略本身就是"应用设置"：内核侧首次调用会自动探测一次，
+            // 所以这里不需要（也不应该）开强制探测——那会拖慢启动。
+            GpuStatusReport gpu = shim.GpuStatus(settings.GpuPolicyKind);
+            if (gpu.Available)
+            {
+                Logger.Info(
+                    $"[trit] GPU 可用：adapter={gpu.Adapter} backend={gpu.Backend} " +
+                    $"policy={settings.GpuPolicyText} min_trits={gpu.MinTrits}");
+                return;
+            }
+
+            // 不可用必须说清是哪一种不可用：构建没带 feature / 没有 adapter / 对拍不一致。
+            // 否则玩家只会看到"关着"，却不知道为什么开不了。
+            string why = gpu.Reason.Length > 0
+                ? gpu.Reason
+                : !gpu.BuiltWithGpu
+                    ? "当前内核构建未带 gpu feature"
+                    : "未探测到可用 adapter";
+
+            if (settings.GpuPolicyKind == GpuPolicy.On)
+            {
+                Logger.Warn($"[trit] 设置要求开启 GPU（gpuPolicy=on），但本环境不可用（{why}），已按 CPU 运行。");
+            }
+            else
+            {
+                Logger.Info($"[trit] GPU 不可用：{why}（当前 policy={settings.GpuPolicyText}，全部扫描走 CPU）。");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("[trit] 读取 GPU 状态失败，本次会话按 CPU 运行：" + ex.Message);
+        }
+    }
 
     public override void Load()
     {
@@ -71,13 +253,14 @@ public sealed class TritRuntimeMod : Mod
             shim = RuntimeShim.Attach(new RuntimeHostOptions
             {
                 LibraryPath = libraryPath,
-                ConfigJson = string.Empty,
+                ConfigJson = BuildRuntimeConfigJson(),
                 ForceManaged = settings.ForceManaged,
                 ShadowMode = settings.ShadowMode,
                 AllowDefaultProbing = settings.AllowDefaultProbing,
             });
 
             loaded = true;
+            jobPollingEnabled = true;
 
             CapabilityReport caps = shim.Capabilities();
             Logger.Info(
@@ -93,6 +276,8 @@ public sealed class TritRuntimeMod : Mod
             {
                 Logger.Warn("[trit] 内核缺少事务日志或事件路由能力，世界投影降级为只读观测。");
             }
+
+            ReportParallelAndGpu();
 
             // 真机自检：证明本进程里"事务 → 快照 → 差分 → 回滚"闭环可用。
             // 失败只降级（不装钩子），不影响游戏。
@@ -149,6 +334,156 @@ public sealed class TritRuntimeMod : Mod
         }
 
         bridge?.OnTickEnd();
+        OnPollJobs();
+    }
+
+    /// <summary>
+    /// 每 tick 取回一批已完成的任务结果（取出即出队）。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 与 <see cref="WorldBridge"/> 共用一条驱动链（<see cref="TritWorldSystem.PostUpdateEverything"/>
+    /// → <see cref="OnWorldTick"/>），因为专用服务器上只有 <c>ModSystem</c> 回调是两端都到位的。
+    /// </para>
+    /// <para>
+    /// 节流策略：没有结果时直接返回（绝大多数 tick 都会走这条路，一条日志都不打）；
+    /// 失败任务无论是否开启明细日志都记 Warn——失败是异常信号，但只记前
+    /// <see cref="MaxLoggedJobFailures"/> 条，之后闭嘴。
+    /// </para>
+    /// <para>
+    /// 轮询本身抛异常就永久关闭本次会话的轮询：宁可没有结果回看，也不能每 tick 刷一条错误。
+    /// </para>
+    /// </remarks>
+    internal void OnPollJobs()
+    {
+        if (!loaded || !jobPollingEnabled || shim is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // 菜单里没有世界，也不该为空转的倒计时去打内核。
+            if (Main.gameMenu)
+            {
+                return;
+            }
+
+            IReadOnlyList<JobResult> jobs = shim.PollJobs(settings.PollJobsPerTick);
+            if (jobs is null || jobs.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < jobs.Count; i++)
+            {
+                JobResult job = jobs[i];
+                if (job.State == JobState.Failed)
+                {
+                    if (loggedJobFailures < MaxLoggedJobFailures)
+                    {
+                        loggedJobFailures++;
+                        Logger.Warn(
+                            $"[trit] 扫描任务 #{job.Id} 失败（owner={job.Owner} kind={job.Kind}）：{job.Error}");
+                    }
+                }
+                else if (settings.LogJobResults)
+                {
+                    Logger.Info(
+                        $"[trit] 扫描任务 #{job.Id} {job.State} owner={job.Owner} kind={job.Kind} " +
+                        $"steps={job.Steps} backend={job.Backend} result={job.ResultJson}");
+                }
+            }
+
+            DispatchToOwners(jobs);
+        }
+        catch (Exception ex)
+        {
+            jobPollingEnabled = false;
+            Logger.Warn("[trit] 任务结果轮询异常，本次会话已停止轮询：" + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 把一批结果按 owner 派发到各自的结果邮箱，并同步进公共环形缓冲。
+    /// </summary>
+    /// <remarks>
+    /// 环形缓冲是<b>只读视图</b>（给 <c>trit jobs</c> 与诊断用），
+    /// 邮箱才是<b>取走通道</b>（给各模组取自己那份用）——
+    /// 两者分开，环形缓冲满了也不会导致某个模组的结果被提前丢弃。
+    /// </remarks>
+    private void DispatchToOwners(IReadOnlyList<JobResult> jobs)
+    {
+        for (int i = 0; i < jobs.Count; i++)
+        {
+            JobResult job = jobs[i];
+            if (!ownerMailboxes.TryGetValue(job.Owner, out List<JobResult>? mailbox))
+            {
+                mailbox = new List<JobResult>();
+                ownerMailboxes[job.Owner] = mailbox;
+            }
+
+            mailbox.Add(job);
+            if (mailbox.Count > OwnerMailboxCapacity)
+            {
+                mailbox.RemoveAt(0);
+            }
+        }
+
+        PushRecentJobs(jobs);
+    }
+
+    /// <summary>
+    /// 取走某个 owner 的结果（<b>从该 owner 的邮箱里取</b>，不动别人的）。
+    /// </summary>
+    /// <param name="owner">归属名；空或空白按 <c>unknown</c> 处理。</param>
+    /// <param name="limit">最多取几条；<c>&lt;= 0</c> 表示全部。</param>
+    internal IReadOnlyList<JobResult> TakeOwnerJobs(string? owner, int limit)
+    {
+        string key = NormalizeOwnerName(owner);
+        if (!ownerMailboxes.TryGetValue(key, out List<JobResult>? mailbox) || mailbox.Count == 0)
+        {
+            return Array.Empty<JobResult>();
+        }
+
+        int count = limit <= 0 ? mailbox.Count : Math.Min(limit, mailbox.Count);
+        var taken = new List<JobResult>(count);
+        for (int i = 0; i < count; i++)
+        {
+            taken.Add(mailbox[i]);
+        }
+
+        mailbox.RemoveRange(0, count);
+        return taken;
+    }
+
+    /// <summary>归属名归一化（与内核的 <c>normalize_owner</c> 同口径：去空白 → 空则 unknown）。</summary>
+    private static string NormalizeOwnerName(string? owner)
+    {
+        string trimmed = owner?.Trim() ?? string.Empty;
+        return trimmed.Length == 0 ? "unknown" : trimmed;
+    }
+
+    /// <summary>
+    /// 把一批结果塞进环形缓冲（供 <c>trit jobs</c> 与 <see cref="TritApi"/> 回看）。
+    /// 结果一旦被 <c>PollJobs</c> 取出就出队了，不缓冲就永久丢失。
+    /// </summary>
+    internal void PushRecentJobs(IReadOnlyList<JobResult> jobs)
+    {
+        if (jobs is null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < jobs.Count; i++)
+        {
+            if (recentJobs.Count >= RecentJobCapacity)
+            {
+                recentJobs.RemoveAt(0);
+            }
+
+            recentJobs.Add(jobs[i]);
+        }
     }
 
     /// <summary>
@@ -190,6 +525,9 @@ public sealed class TritRuntimeMod : Mod
     private void Teardown()
     {
         loaded = false;
+        jobPollingEnabled = false;
+        recentJobs.Clear();
+        ownerMailboxes.Clear();
 
         try
         {

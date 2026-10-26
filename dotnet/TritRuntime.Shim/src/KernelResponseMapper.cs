@@ -1,3 +1,4 @@
+using System.Text.Json;
 using TritRuntime.Wire;
 
 namespace TritRuntime.Kernel;
@@ -171,6 +172,253 @@ public static class KernelResponseMapper
             return Array.Empty<LaneDispute>();
         }
     }
+
+    /// <summary>解码扫描任务号；错误或非法 JSON 返回 0。</summary>
+    public static ulong ToJobId(KernelResponse response) =>
+        FromJson(response, 0UL, root => UInt64(root, "job"));
+
+    /// <summary>解码已完成任务；错误或非法 JSON 返回空列表。</summary>
+    public static IReadOnlyList<JobResult> ToJobResults(KernelResponse response) =>
+        FromJson<IReadOnlyList<JobResult>>(response, Array.Empty<JobResult>(), root =>
+        {
+            if (!root.TryGetProperty("jobs", out var jobs) || jobs.ValueKind != JsonValueKind.Array)
+            {
+                return Array.Empty<JobResult>();
+            }
+
+            var result = new List<JobResult>();
+            foreach (var job in jobs.EnumerateArray())
+            {
+                var resultJson = job.TryGetProperty("result", out var value)
+                    ? value.GetRawText()
+                    : "{}";
+                result.Add(new JobResult(
+                    UInt64(job, "id"),
+                    String(job, "owner"),
+                    ParseScanKind(String(job, "kind")),
+                    ParseJobState(String(job, "state")),
+                    resultJson,
+                    String(job, "error"),
+                    UInt64(job, "steps"),
+                    String(job, "backend")));
+            }
+
+            return result;
+        });
+
+    /// <summary>解码取消数量；错误或非法 JSON 返回 0。</summary>
+    public static int ToCancelled(KernelResponse response) =>
+        FromJson(response, 0, root =>
+        {
+            var cancelled = UInt64(root, "cancelled");
+            return cancelled > int.MaxValue ? int.MaxValue : (int)cancelled;
+        });
+
+    /// <summary>解码 GPU 状态；错误或非法 JSON 返回安全的不可用报告。</summary>
+    public static GpuStatusReport ToGpuStatus(KernelResponse response) =>
+        FromJson(response, EmptyGpuStatus(), root => new GpuStatusReport(
+            Boolean(root, "available"),
+            Boolean(root, "enabled"),
+            ParseGpuPolicy(String(root, "policy")),
+            String(root, "adapter"),
+            String(root, "backend"),
+            Boolean(root, "built_with_gpu"),
+            String(root, "reason"),
+            Int64(root, "cpu_dot"),
+            Int64(root, "gpu_dot"),
+            Boolean(root, "matches"),
+            Int64(root, "min_trits"),
+            Double(root, "ns_per_trit"),
+            UInt64(root, "jobs"),
+            UInt64(root, "gpu_jobs"),
+            UInt64(root, "fallbacks")));
+
+    /// <summary>解码全局预算；错误或非法 JSON 返回空快照。</summary>
+    public static BudgetSnapshot ToBudget(KernelResponse response) =>
+        FromJson(response, EmptyBudget(), root =>
+        {
+            var mods = new List<ModBudget>();
+            if (root.TryGetProperty("mods", out var modList) && modList.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var mod in modList.EnumerateArray())
+                {
+                    mods.Add(new ModBudget(
+                        String(mod, "owner"),
+                        Int32(mod, "inflight"),
+                        Int32(mod, "queued"),
+                        UInt64(mod, "submitted"),
+                        UInt64(mod, "completed"),
+                        UInt64(mod, "cancelled"),
+                        UInt64(mod, "rejected"),
+                        UInt64(mod, "steps")));
+                }
+            }
+
+            var totals = root.TryGetProperty("totals", out var totalsElement)
+                ? new BudgetTotals(
+                    UInt64(totalsElement, "submitted"),
+                    UInt64(totalsElement, "completed"),
+                    UInt64(totalsElement, "cancelled"),
+                    UInt64(totalsElement, "rejected"),
+                    UInt64(totalsElement, "steps"))
+                : new BudgetTotals(0, 0, 0, 0, 0);
+
+            PoolMetrics? metrics = null;
+            if (root.TryGetProperty("last_metrics", out var metricsElement)
+                && metricsElement.ValueKind == JsonValueKind.Object)
+            {
+                metrics = new PoolMetrics(
+                    UInt64(metricsElement, "started"),
+                    UInt64(metricsElement, "completed"),
+                    UInt64(metricsElement, "failed"),
+                    UInt64(metricsElement, "cancelled"),
+                    UInt64(metricsElement, "deferred"),
+                    UInt64(metricsElement, "preemptions"),
+                    UInt64(metricsElement, "steps"),
+                    Int32(metricsElement, "peak_cpu"),
+                    Int32(metricsElement, "peak_memory"));
+            }
+
+            return new BudgetSnapshot(
+                Int32(root, "workers"),
+                Int32(root, "cpu_capacity"),
+                Int64(root, "memory_capacity"),
+                Int32(root, "per_mod_inflight"),
+                Int32(root, "inflight"),
+                Int32(root, "queued"),
+                mods,
+                totals,
+                metrics);
+        });
+
+    /// <summary>解码 Prometheus 文本；错误或非法 JSON 返回空字符串。</summary>
+    public static string ToPrometheus(KernelResponse response) =>
+        FromJson(response, string.Empty, root => String(root, "prometheus"));
+
+    private static T FromJson<T>(KernelResponse response, T fallback, Func<JsonElement, T> mapper)
+    {
+        if (response.Status != Status.Ok)
+        {
+            return fallback;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(response.Payload);
+            return document.RootElement.ValueKind == JsonValueKind.Object
+                ? mapper(document.RootElement)
+                : fallback;
+        }
+        catch (Exception)
+        {
+            return fallback;
+        }
+    }
+
+    /// <summary>
+    /// 解析内核返回的种类名。
+    /// </summary>
+    /// <remarks>
+    /// 无法识别时给 <see cref="ScanKind.Unknown"/>，**不兜底成 Histogram**：
+    /// 兜底会把「种类未知」这条失败信息悄悄改写成「直方图成功」，
+    /// 调用方再也分不清自己是跑了个直方图还是踩了个未知种类。
+    /// </remarks>
+    private static ScanKind ParseScanKind(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "histogram" => ScanKind.Histogram,
+        "pattern" => ScanKind.Pattern,
+        "density" => ScanKind.Density,
+        "dot" => ScanKind.Dot,
+        _ => ScanKind.Unknown,
+    };
+
+    private static JobState ParseJobState(string value) => value.ToLowerInvariant() switch
+    {
+        "done" => JobState.Done,
+        "cancelled" => JobState.Cancelled,
+        "failed" => JobState.Failed,
+        _ => JobState.Failed,
+    };
+
+    private static GpuPolicy ParseGpuPolicy(string value) => value.ToLowerInvariant() switch
+    {
+        "off" => GpuPolicy.Off,
+        "on" => GpuPolicy.On,
+        _ => GpuPolicy.Auto,
+    };
+
+    private static string String(JsonElement parent, string name) =>
+        parent.ValueKind == JsonValueKind.Object
+        && parent.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? string.Empty
+            : string.Empty;
+
+    private static bool Boolean(JsonElement parent, string name) =>
+        parent.ValueKind == JsonValueKind.Object
+        && parent.TryGetProperty(name, out var value)
+        && (value.ValueKind == JsonValueKind.True || value.ValueKind == JsonValueKind.False)
+        && value.GetBoolean();
+
+    private static int Int32(JsonElement parent, string name) =>
+        parent.ValueKind == JsonValueKind.Object
+        && parent.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.Number
+        && value.TryGetInt32(out var result)
+            ? result
+            : 0;
+
+    private static long Int64(JsonElement parent, string name) =>
+        parent.ValueKind == JsonValueKind.Object
+        && parent.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.Number
+        && value.TryGetInt64(out var result)
+            ? result
+            : 0;
+
+    private static ulong UInt64(JsonElement parent, string name) =>
+        parent.ValueKind == JsonValueKind.Object
+        && parent.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.Number
+        && value.TryGetUInt64(out var result)
+            ? result
+            : 0;
+
+    private static double Double(JsonElement parent, string name) =>
+        parent.ValueKind == JsonValueKind.Object
+        && parent.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.Number
+        && value.TryGetDouble(out var result)
+            ? result
+            : 0;
+
+    private static GpuStatusReport EmptyGpuStatus() => new(
+        false,
+        false,
+        GpuPolicy.Auto,
+        string.Empty,
+        string.Empty,
+        false,
+        string.Empty,
+        0,
+        0,
+        false,
+        0,
+        0,
+        0,
+        0,
+        0);
+
+    private static BudgetSnapshot EmptyBudget() => new(
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Array.Empty<ModBudget>(),
+        new BudgetTotals(0, 0, 0, 0, 0),
+        null);
 
     private static WireReader Reader(KernelResponse response, out WireReader reader) =>
         Reader(response, null, out reader);

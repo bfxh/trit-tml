@@ -141,6 +141,35 @@ public interface ITritKernel : IDisposable
     /// <summary>便捷方法：记录影子差分（签名非空 = 发现不一致）。</summary>
     ulong ShadowRecord(byte[] signature);
 
+    /// <summary>
+    /// 异步提交扫描任务并立即返回任务号；原生内核在工作线程执行，托管回退同步完成后入结果队列。
+    /// 返回 0 表示提交失败。
+    /// </summary>
+    ulong SubmitScan(ScanRequest request);
+
+    /// <summary>取出已完成任务，取出即出队；<paramref name="limit"/> 非正数表示全部。</summary>
+    /// <param name="limit">最多取几条；<c>&lt;= 0</c> 表示全部。</param>
+    /// <param name="owner">
+    /// 归属过滤；<see langword="null"/> 表示不限归属。
+    /// <b>只有本次真正返回的任务会出队</b>，其他 owner 的结果仍留在队列里。
+    /// </param>
+    IReadOnlyList<JobResult> PollJobs(int limit = 0, string? owner = null);
+
+    /// <summary>协作式取消单个任务；已运行任务在步骤边界退出，不强杀线程。</summary>
+    int CancelJob(ulong jobId);
+
+    /// <summary>协作式取消指定 owner 的全部排队或运行任务。</summary>
+    int CancelOwner(string owner);
+
+    /// <summary>查询 GPU 后端状态；给出策略时切换策略，探测失败会安全回退 CPU。</summary>
+    GpuStatusReport GpuStatus(GpuPolicy? policy = null, bool probe = false);
+
+    /// <summary>查询全局资源预算与各 owner 累计账本。</summary>
+    BudgetSnapshot Budget();
+
+    /// <summary>查询最近一轮任务池的 Prometheus/OpenMetrics 文本。</summary>
+    string MetricsPrometheus();
+
     /// <summary>便捷方法：查询统计（10 个 u64）。</summary>
     ulong[] Stats();
 }

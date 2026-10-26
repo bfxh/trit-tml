@@ -45,6 +45,9 @@ internal sealed class WorldBridge
     /// <summary>同类周期性日志的最小间隔（秒）。</summary>
     private const double MinLogIntervalSeconds = 15.0;
 
+    /// <summary><c>SnapshotBytes</c> 返回值里的快照 ID 前缀长度。</summary>
+    private const int SnapshotIdPrefix = 8;
+
     private readonly TritRuntimeMod mod;
     private readonly TritSettings settings;
     private readonly RuntimeShim shim;
@@ -79,6 +82,7 @@ internal sealed class WorldBridge
     private double lastSnapshotLogAt = double.NegativeInfinity;
     private double lastStatsLogAt = double.NegativeInfinity;
     private double lastStaticTickLogAt = double.NegativeInfinity;
+    private double lastCaptureLogAt = double.NegativeInfinity;
     private bool warnedStaticGameTick;
 
     private bool disposed;
@@ -150,6 +154,74 @@ internal sealed class WorldBridge
         uint index = (uint)msgType;
         return index < (uint)netCounts.Length ? netCounts[index] : 0;
     }
+
+    /// <summary>
+    /// 取当前世界投影的三值序列（每元素一个 trit：0=Neg、1=Zero、2=Pos）。
+    /// 这是 <c>trit scan</c> 与 <see cref="TritApi"/> 扫描命令的数据入口。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 取的是<b>整条世界投影</b>（所有曾经被写过的车道，按键升序），而不是本 tick 的增量——
+    /// 增量恒为 Neg/Pos（Zero 在 <see cref="Emit"/> 里就被丢弃了），拿去做密度扫描会
+    /// 得到"处处 100% 非零"这种没有信息量的结果。
+    /// </para>
+    /// <para>
+    /// 代价：<see cref="RuntimeShim.SnapshotBytes"/> 内部会打一次快照（内核快照数 +1）。
+    /// 这是手动诊断命令用的，不是热路径。
+    /// 解码失败返回空数组——扫描命令会据此给玩家明确提示而不是崩溃。
+    /// </para>
+    /// </remarks>
+    public byte[] CaptureWorldTrits()
+    {
+        if (disposed)
+        {
+            return Array.Empty<byte>();
+        }
+
+        try
+        {
+            byte[] raw = shim.SnapshotBytes();
+            if (raw.Length == 0)
+            {
+                return Array.Empty<byte>();
+            }
+
+            // SnapshotBytes 的前 8 字节是快照 ID 前缀，之后才是 WorldCodec 载荷。
+            // 老格式万一没有前缀，去掉前缀会解出垃圾——那就退回整体解码。
+            SortedDictionary<uint, TritDelta> world;
+            try
+            {
+                world = WorldCodec.Decode(raw.AsSpan(SnapshotIdPrefix)).World;
+            }
+            catch (WireException)
+            {
+                world = WorldCodec.Decode(raw).World;
+            }
+
+            var trits = new byte[world.Count];
+            int index = 0;
+            foreach (TritDelta value in world.Values)
+            {
+                trits[index++] = (byte)value;
+            }
+
+            LastCaptureTritCount = trits.Length;
+            return trits;
+        }
+        catch (Exception ex)
+        {
+            // 拿不到数据不是错误：返回空数组，调用方负责告诉玩家"当前没有可扫描的数据"。
+            if (Throttle(ref lastCaptureLogAt))
+            {
+                mod.Logger.Warn($"[trit] 采集世界投影三值序列失败（tick={tick}）：{ex.Message}");
+            }
+
+            return Array.Empty<byte>();
+        }
+    }
+
+    /// <summary>最近一次 <see cref="CaptureWorldTrits"/> 拿到的 trit 数（0 = 还没采集过）。</summary>
+    public int LastCaptureTritCount { get; private set; }
 
     /// <summary>钩子观测到的"本 tick 跑过 AI"计数（由 <see cref="TritHooks"/> 调用）。</summary>
     public void NoteNpcAi() => npcTickedCount++;

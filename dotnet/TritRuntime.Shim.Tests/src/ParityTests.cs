@@ -42,17 +42,28 @@ public sealed class ParityTests
 
             Assert.True(differ.Compared > 40, $"对拍次数太少：{differ.Compared}");
 
-            // 唯一允许的分歧：能力报告。托管回退没有 C ABI（abi=0），也不声明
-            // AI 位——它做不了三值权重网络推理。除此之外必须逐字节一致。
+            // 唯一允许的分歧：能力报告。托管回退没有 C ABI、AI、并行线程池或 GPU，
+            // 但仍暴露同步扫描兼容语义与预算账本。除此之外必须逐字节一致。
             var divergence = Assert.Single(differ.Recent);
             Assert.Equal(Opcode.Capabilities, divergence.Opcode);
             Assert.Equal(1ul, differ.Divergences);
-            Assert.Equal(
-                new byte[] { 1, 0, 0, 0, 0, 0, 1, 0, 0xFF, 1, 0, 0, 0, 0, 0, 0, 1 },
-                divergence.Primary.Payload);
-            Assert.Equal(
-                new byte[] { 0, 0, 0, 0, 0, 0, 1, 0, 0xFF, 0, 0, 0, 0, 0, 0, 0, 1 },
-                divergence.Shadow.Payload);
+
+            var nativeCaps = new WireReader(divergence.Primary.Payload);
+            Assert.Equal(NativeKernel.ExpectedAbiVersion, nativeCaps.U32());
+            Assert.Equal(NativeKernel.MinimumRuntimeVersion, nativeCaps.U32());
+            var nativeBits = (CapabilityBits)nativeCaps.U64();
+            Assert.True((nativeBits & CapabilityBits.Ai) != 0);
+            Assert.True((nativeBits & CapabilityBits.Parallel) != 0);
+            Assert.True((nativeBits & CapabilityBits.Budget) != 0);
+
+            var managedCaps = new WireReader(divergence.Shadow.Payload);
+            Assert.Equal(0u, managedCaps.U32());
+            Assert.Equal(NativeKernel.MinimumRuntimeVersion, managedCaps.U32());
+            var managedBits = (CapabilityBits)managedCaps.U64();
+            Assert.False((managedBits & CapabilityBits.Ai) != 0);
+            Assert.False((managedBits & CapabilityBits.Parallel) != 0);
+            Assert.False((managedBits & CapabilityBits.Gpu) != 0);
+            Assert.True((managedBits & CapabilityBits.Budget) != 0);
 
             // 主内核的影子日志（Rust 侧 SHADOW_RECORD）：脚本里两次显式记录，
             // 加上差分器为那一处能力报告分歧注入的一次签名 ⇒ compared = 3；

@@ -7,20 +7,31 @@ using WireFormat = TritRuntime.Wire.Wire;
 namespace TritRuntime.Kernel;
 
 /// <summary>原生内核：把请求交给 trit_rt.dll，按缓冲区协议自动扩容重试。</summary>
+/// <remarks>
+/// <para>
+/// 所有<b>带句柄</b>的调用都走本实例的 <see cref="NativeApi"/>（按实例绑定导出函数指针），
+/// 而不是全局静态 <c>DllImport</c>。原因见 <see cref="NativeApi"/> 的说明：
+/// 进程内同时加载多份 trit_rt 时，静态 DllImport 会把调用路由到「最后登记」的那份，
+/// 导致先前创建的实例读到别的模块的数据。
+/// </para>
+/// </remarks>
 public sealed class NativeKernel : ITritKernel
 {
-    /// <summary>本机期望的 ABI 版本。</summary>
-    public const uint ExpectedAbiVersion = 1;
+    /// <summary>本机期望的 ABI 版本；v2 新增并行任务池、GPU 与全局预算 opcode。</summary>
+    public const uint ExpectedAbiVersion = 2;
 
     /// <summary>本机期望的最低运行时版本（0.1.0）。</summary>
     public const uint MinimumRuntimeVersion = 0x00_01_00_00;
 
+    private readonly NativeApi api;
     private readonly ulong handle;
     private readonly ArbitrationMode arbitration;
     private string lastError = string.Empty;
+    private bool disposed;
 
-    private NativeKernel(ulong handle, ArbitrationMode arbitration)
+    private NativeKernel(NativeApi api, ulong handle, ArbitrationMode arbitration)
     {
+        this.api = api;
         this.handle = handle;
         this.arbitration = arbitration;
     }
@@ -31,66 +42,91 @@ public sealed class NativeKernel : ITritKernel
     /// <summary>最近一次错误信息。</summary>
     public string LastError => lastError;
 
+    /// <summary>本实例实际加载的原生库路径（诊断用）。</summary>
+    public string LibraryPath => api.LibraryPath;
+
     /// <summary>按显式 DLL 路径加载原生库并创建运行时。</summary>
     /// <param name="libraryPath">trit_rt.dll 的完整路径。</param>
     /// <param name="configJson">配置 JSON（空 = 默认）。</param>
+    /// <remarks>
+    /// <b>文件名不必叫 trit_rt.dll</b>：原生库按内容摘要分目录落盘时，
+    /// 文件名可能带前缀；导出函数名与文件名无关，按实例绑定照样认得出来。
+    /// </remarks>
     public static NativeKernel Load(string libraryPath, string configJson = "")
     {
-        var handle = NativeLibrary.Load(libraryPath);
+        ArgumentException.ThrowIfNullOrEmpty(libraryPath);
 
-        // 登记名必须是 DllImport 声明用的名字，绝不能从落盘文件名推导：
-        // 真机上原生库按「内容摘要 + 文件名」落盘（避免覆盖仍在占用中的旧版本），
-        // 从路径推导会得到 "<hash>_trit_rt"，与 DllImport 的 "trit_rt" 不等，
-        // 解析器永不命中，于是退回默认探测并抛 DllNotFoundException（0x8007007E）。
-        NativeImportResolver.RegisterExplicitLibrary(NativeBindings.LibraryName, handle);
-
-        var abi = NativeBindings.AbiVersion();
-        if (abi != ExpectedAbiVersion)
+        var api = NativeApi.Load(libraryPath);
+        try
         {
-            throw new InvalidOperationException(
-                $"trit_rt ABI 版本不符：期望 {ExpectedAbiVersion}，实际 {abi}（{libraryPath}）");
-        }
+            var abi = api.AbiVersion();
+            if (abi != ExpectedAbiVersion)
+            {
+                throw new InvalidOperationException(
+                    $"trit_rt ABI 版本不符：期望 {ExpectedAbiVersion}，实际 {abi}（{libraryPath}）");
+            }
 
-        var version = NativeBindings.Version();
-        if (version < MinimumRuntimeVersion)
+            var version = api.Version();
+            if (version < MinimumRuntimeVersion)
+            {
+                throw new InvalidOperationException(
+                    $"trit_rt 版本过低：{version:x8} < {MinimumRuntimeVersion:x8}");
+            }
+
+            var configBytes = string.IsNullOrEmpty(configJson) ? null : Encoding.UTF8.GetBytes(configJson);
+            var runtimeHandle = api.Create(configBytes, configBytes?.Length ?? 0);
+            if (runtimeHandle == 0)
+            {
+                throw new InvalidOperationException("tt_rt_create 失败：返回空句柄");
+            }
+
+            var caps = api.Capabilities(runtimeHandle);
+            if (caps == 0)
+            {
+                throw new InvalidOperationException("tt_rt_capabilities 返回 0：运行时不可用");
+            }
+
+            // 登记给静态 DllImport 用：兼容壳里残留的进程级查询（ABI/版本）
+            // 需要能在「库不在默认搜索路径」的真机场景下工作。
+            // 注意这只影响 legacy 静态路径，**不影响本实例的任何调用**。
+            NativeImportResolver.RegisterExplicitLibrary(NativeBindings.LibraryName, api.ModuleHandle);
+
+            return new NativeKernel(api, runtimeHandle, ReadArbitration(api, runtimeHandle));
+        }
+        catch
         {
-            throw new InvalidOperationException(
-                $"trit_rt 版本过低：{version:x8} < {MinimumRuntimeVersion:x8}");
+            api.Dispose();
+            throw;
         }
-
-        var configBytes = string.IsNullOrEmpty(configJson) ? null : Encoding.UTF8.GetBytes(configJson);
-        var runtimeHandle = NativeBindings.Create(configBytes, configBytes?.Length ?? 0);
-        if (runtimeHandle == 0)
-        {
-            throw new InvalidOperationException("tt_rt_create 失败：返回空句柄");
-        }
-
-        var caps = NativeBindings.Capabilities(runtimeHandle);
-        if (caps == 0)
-        {
-            throw new InvalidOperationException("tt_rt_capabilities 返回 0：运行时不可用");
-        }
-
-        return new NativeKernel(runtimeHandle, ReadArbitration(runtimeHandle));
     }
 
     /// <summary>按库名（依赖系统搜索路径 / apphost 探测规则）加载。</summary>
     public static NativeKernel LoadByLibraryName(string configJson = "")
     {
-        var abi = NativeBindings.AbiVersion();
-        if (abi != ExpectedAbiVersion)
+        var api = NativeApi.LoadByLibraryName();
+        try
         {
-            throw new InvalidOperationException($"trit_rt ABI 版本不符：期望 {ExpectedAbiVersion}，实际 {abi}");
-        }
+            var abi = api.AbiVersion();
+            if (abi != ExpectedAbiVersion)
+            {
+                throw new InvalidOperationException($"trit_rt ABI 版本不符：期望 {ExpectedAbiVersion}，实际 {abi}");
+            }
 
-        var configBytes = string.IsNullOrEmpty(configJson) ? null : Encoding.UTF8.GetBytes(configJson);
-        var handle = NativeBindings.Create(configBytes, configBytes?.Length ?? 0);
-        if (handle == 0)
+            var configBytes = string.IsNullOrEmpty(configJson) ? null : Encoding.UTF8.GetBytes(configJson);
+            var handle = api.Create(configBytes, configBytes?.Length ?? 0);
+            if (handle == 0)
+            {
+                throw new InvalidOperationException("tt_rt_create 失败：返回空句柄");
+            }
+
+            NativeImportResolver.RegisterExplicitLibrary(NativeBindings.LibraryName, api.ModuleHandle);
+            return new NativeKernel(api, handle, ReadArbitration(api, handle));
+        }
+        catch
         {
-            throw new InvalidOperationException("tt_rt_create 失败：返回空句柄");
+            api.Dispose();
+            throw;
         }
-
-        return new NativeKernel(handle, ReadArbitration(handle));
     }
 
     /// <summary>能力报告。</summary>
@@ -107,7 +143,7 @@ public sealed class NativeKernel : ITritKernel
         while (true)
         {
             var output = new byte[capacity];
-            var status = NativeBindings.Submit(handle, opcode, payload, payload.Length, output, capacity);
+            var status = api.Submit(handle, opcode, payload, payload.Length, output, capacity);
             if (status == Status.Buffer && capacity >= 8)
             {
                 // 协议：所需长度已写进 output 前 8 字节。
@@ -208,7 +244,7 @@ public sealed class NativeKernel : ITritKernel
         while (true)
         {
             var output = new byte[capacity];
-            var status = NativeBindings.Snapshot(handle, output, capacity);
+            var status = api.Snapshot(handle, output, capacity);
             if (status == Status.Buffer && capacity >= 8)
             {
                 capacity = (int)BinaryPrimitives.ReadUInt64LittleEndian(output) + 16;
@@ -253,6 +289,57 @@ public sealed class NativeKernel : ITritKernel
         return KernelResponseMapper.ToU64(response);
     }
 
+    /// <summary>异步提交扫描任务；返回 0 表示提交失败。</summary>
+    public ulong SubmitScan(ScanRequest request)
+    {
+        var response = Submit(Opcode.ScanSubmit, Requests.ScanSubmit(request));
+        return KernelResponseMapper.ToJobId(response);
+    }
+
+    /// <summary>取出已完成任务，取出即出队。</summary>
+    /// <param name="limit">最多取几条；<c>&lt;= 0</c> 表示全部。</param>
+    /// <param name="owner">归属过滤；<see langword="null"/> 表示不限归属。</param>
+    public IReadOnlyList<JobResult> PollJobs(int limit = 0, string? owner = null)
+    {
+        var response = Submit(Opcode.JobPoll, Requests.JobPoll(limit, owner));
+        return KernelResponseMapper.ToJobResults(response);
+    }
+
+    /// <summary>协作式取消单个任务。</summary>
+    public int CancelJob(ulong jobId)
+    {
+        var response = Submit(Opcode.JobCancel, Requests.JobCancelJob(jobId));
+        return KernelResponseMapper.ToCancelled(response);
+    }
+
+    /// <summary>协作式取消指定 owner 的全部任务。</summary>
+    public int CancelOwner(string owner)
+    {
+        var response = Submit(Opcode.JobCancel, Requests.JobCancelOwner(owner));
+        return KernelResponseMapper.ToCancelled(response);
+    }
+
+    /// <summary>查询或切换 GPU 后端状态。</summary>
+    public GpuStatusReport GpuStatus(GpuPolicy? policy = null, bool probe = false)
+    {
+        var response = Submit(Opcode.GpuStatus, Requests.GpuStatus(policy, probe, 1_048_576));
+        return KernelResponseMapper.ToGpuStatus(response);
+    }
+
+    /// <summary>查询全局资源预算。</summary>
+    public BudgetSnapshot Budget()
+    {
+        var response = Submit(Opcode.Budget, Requests.Budget());
+        return KernelResponseMapper.ToBudget(response);
+    }
+
+    /// <summary>查询任务池 Prometheus 指标。</summary>
+    public string MetricsPrometheus()
+    {
+        var response = Submit(Opcode.Metrics, Requests.Metrics());
+        return KernelResponseMapper.ToPrometheus(response);
+    }
+
     /// <summary>统计。</summary>
     public ulong[] Stats()
     {
@@ -263,17 +350,25 @@ public sealed class NativeKernel : ITritKernel
     /// <summary>销毁运行时。</summary>
     public void Dispose()
     {
+        if (disposed)
+        {
+            return;
+        }
+
+        disposed = true;
         if (handle != 0)
         {
-            _ = NativeBindings.Destroy(handle);
+            _ = api.Destroy(handle);
         }
+
+        api.Dispose();
     }
 
-    private static ArbitrationMode ReadArbitration(ulong runtimeHandle)
+    private static ArbitrationMode ReadArbitration(NativeApi api, ulong runtimeHandle)
     {
         var capacity = 256;
         var output = new byte[capacity];
-        var status = NativeBindings.Submit(
+        var status = api.Submit(
             runtimeHandle,
             Opcode.Capabilities,
             null,
@@ -297,7 +392,7 @@ public sealed class NativeKernel : ITritKernel
     private string ReadLastError()
     {
         var buffer = new byte[512];
-        var length = NativeBindings.LastError(handle, buffer, buffer.Length);
+        var length = api.LastError(handle, buffer, buffer.Length);
         if (length <= 0)
         {
             return string.Empty;
@@ -307,7 +402,30 @@ public sealed class NativeKernel : ITritKernel
     }
 }
 
-/// <summary>显式路径加载的原生库登记：把 DllImport("trit_rt") 解析到指定路径的句柄。</summary>
+/// <summary>
+/// 显式路径加载的原生库登记：把静态 <c>DllImport("trit_rt")</c> 解析到指定路径的句柄。
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>只服务于进程级静态查询</b>（ABI 版本、运行时版本，以及残留的 legacy 静态入口）。
+/// 带句柄的调用一律走 <see cref="NativeApi"/> 的按实例绑定，<b>不受本登记影响</b>。
+/// </para>
+/// <para>
+/// 为什么还需要它：真机上原生库按「内容摘要 + 目录」落盘，
+/// 不在默认搜索路径里；没有登记的话静态 <c>DllImport</c> 会抛
+/// <c>DllNotFoundException (0x8007007E)</c>。
+/// </para>
+/// <para>
+/// 登记名必须是 DllImport 声明用的名字（<c>trit_rt</c>），绝不能从落盘文件名推导：
+/// 推导会得到 "<c>&lt;hash&gt;_trit_rt</c>"，与声明名不等，解析器永不命中。
+/// </para>
+/// <para>
+/// <b>先到先得</b>：第一次登记之后不再更换目标。早先的实现是「后登记顶掉先登记」，
+/// 那正是跨实例串台的来源——先创建的实例的静态调用会被路由到后加载的模块。
+/// 现在静态路径恒定指向首个模块，而<b>所有</b>带句柄的调用都走按实例绑定，
+/// 不受此影响。
+/// </para>
+/// </remarks>
 internal static class NativeImportResolver
 {
     private static readonly object Gate = new();
@@ -316,10 +434,18 @@ internal static class NativeImportResolver
     private static IntPtr explicitHandle;
 
     /// <summary>登记显式加载的库；首次调用时安装程序集级解析器。</summary>
+    /// <param name="libraryName">DllImport 声明名（固定为 <c>trit_rt</c>）。</param>
+    /// <param name="handle">已加载模块的句柄。</param>
     public static void RegisterExplicitLibrary(string libraryName, IntPtr handle)
     {
         lock (Gate)
         {
+            if (explicitHandle != IntPtr.Zero)
+            {
+                // 已有目标：保持不变（先到先得），避免把既有实例的静态调用改道。
+                return;
+            }
+
             explicitName = libraryName;
             explicitHandle = handle;
             if (!installed)

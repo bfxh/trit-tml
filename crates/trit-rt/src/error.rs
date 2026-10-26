@@ -64,4 +64,19 @@ impl RtError {
             Self::InvalidInput(_) => crate::ffi::TT_ERR_ARG,
         }
     }
+
+    /// **去掉类型前缀后的原始原因**。
+    ///
+    /// `Display` 会带「输入非法：」这类前缀，但任务记录里的 `error` 字段
+    /// 必须与托管回退内核**逐字相同**——托管侧的文案没有前缀。
+    /// 影子差分是逐字节比对响应体的，前缀差一个字符就等于一直报假分歧。
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Capacity(reason)
+            | Self::Decode(reason)
+            | Self::TxnState(reason)
+            | Self::InvalidInput(reason) => reason.clone(),
+            _ => self.to_string(),
+        }
+    }
 }

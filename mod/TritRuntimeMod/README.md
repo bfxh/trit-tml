@@ -21,7 +21,9 @@ tModLoader 的 C# / CLR / Unity 主循环**原样保留**。这个模组只做�
 ```
 
 原生库不可用时自动回退到**语义逐字节等价**的托管内核（同一套 `Requests` / `KernelResponseMapper`，
-有 107 个测试钉住，含原生 vs 托管 51 步逐字节对拍）。回退不抛异常、不改变 API 表面。
+有 143 个测试钉住，含原生 vs 托管逐字节对拍：事务/快照/PRNG 流/冲突诊断 51 步，
+以及扫描结果对 13 份载荷（4 合法 + 5 非法 + 4 容错）做到 `JOB_POLL` 记录逐字节相同）。
+回退不抛异常、不改变 API 表面。
 
 ## 编译
 
@@ -106,6 +108,48 @@ mod.Call("TritRuntime.Step", tick);
 命令名大小写不敏感，`TritRuntime.` 前缀可省略。参数个数与类型不符会抛 `ArgumentException`；
 运行时未装配时抛 `InvalidOperationException`。**调用方要按 tML 惯例 try/catch**——
 本层保证"要么返回结果，要么抛可预期异常"，绝不静默返回错值。
+
+## v2：并行扫描 · 多 mod 隔离
+
+旁路任务池是**全局**的，多个 mod 共用。任务结果按 `owner` 分账，取回时也按 `owner` 过滤——
+**只取走自己的，别人的一律留在队列里**。
+
+```csharp
+// 能力协商：没有 PARALLEL 位就别提交扫描
+var caps = (CapabilityReport)mod.Call("TritRuntime.Capabilities");
+if (!caps.Has(CapabilityBits.Parallel)) return;
+
+// 提交扫描任务（异步，立即返回 job id）
+// kind: "histogram" | "pattern" | "density" | "dot"
+ulong job = (ulong)mod.Call("TritRuntime.Scan", "MyMod", "histogram", trits);
+
+// 取回结果（按 owner 过滤，避免抢走别的 mod 的）
+//   PollJobs 的签名：() | (int limit) | (string owner) | (string owner, int limit)
+var jobs = (IReadOnlyList<JobResult>)mod.Call("TritRuntime.PollJobs", "MyMod", 16);
+
+// 取消
+mod.Call("TritRuntime.CancelJob", job);        // 取消单个
+mod.Call("TritRuntime.CancelOwner", "MyMod");   // 取消该 owner 全部排队任务
+
+// 资源与状态
+var gpu    = (GpuStatusReport)mod.Call("TritRuntime.GpuStatus");   // 也可传 ("auto", false) 切策略
+var budget = (BudgetSnapshot)mod.Call("TritRuntime.Budget");
+var metric = (string)mod.Call("TritRuntime.Metrics");             // Prometheus 文本
+```
+
+**用本程序集的话直接调静态方法**（编译期有类型检查，推荐）：
+
+```csharp
+ulong job = TritApi.Scan("MyMod", ScanKind.Histogram, trits);
+if (TritApi.TryPollJob(job, out JobResult? r))
+{
+    // r.ResultJson 例如 {"histogram":{"neg":1,"zero":2,"pos":3}}
+}
+```
+
+> **注意**：`TritApi.PollJobs()` **不带 owner 过滤**时会把队列里所有人的结果都取走。
+> 别的 mod 也在用同一个池——请用带 owner 的路径（`PollJobs(owner, limit)`），
+> 或者干脆用 `TryPollJob(id)` 按任务号取。
 
 ## 车道键编码（ABI）
 

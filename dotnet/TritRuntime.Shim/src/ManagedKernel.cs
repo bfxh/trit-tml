@@ -1,4 +1,7 @@
+using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -729,6 +732,25 @@ internal sealed class Stats
     public ulong PrngDraws { get; set; }
 }
 
+/// <summary>托管扫描路径的单 owner 累计账本。</summary>
+internal sealed class ModBudgetAccumulator
+{
+    /// <summary>已提交任务数。</summary>
+    public ulong Submitted { get; set; }
+
+    /// <summary>成功完成任务数。</summary>
+    public ulong Completed { get; set; }
+
+    /// <summary>已取消任务数。</summary>
+    public ulong Cancelled { get; set; }
+
+    /// <summary>因预算拒绝的任务数。</summary>
+    public ulong Rejected { get; set; }
+
+    /// <summary>累计执行步数。</summary>
+    public ulong Steps { get; set; }
+}
+
 /// <summary>
 /// 托管回退内核：原生 Rust 运行时（<c>trit_rt.dll</c>）不可用时的纯 C# 实现，
 /// 与 <see cref="NativeKernel"/> 实现同一 <see cref="ITritKernel"/> 契约、同一条
@@ -766,6 +788,22 @@ public sealed class ManagedKernel : ITritKernel
     private readonly DeterministicPrng prng;
     private readonly ShadowLog shadow = new();
     private readonly Stats stats = new();
+    /// <summary>已完成任务队列；由 <see cref="scanGate"/> 保护。</summary>
+    /// <remarks>
+    /// 刻意用 <see cref="List{T}"/> 而不是 <c>ConcurrentQueue</c>：
+    /// 按 owner 过滤时必须做到「**只移除本次返回的那几条**」，
+    /// 队列的 <c>TryDequeue</c> 只能取出队头，无法把中间某几条挑出来。
+    /// </remarks>
+    private readonly List<JobResult> completedJobs = new();
+    private readonly Dictionary<string, ModBudgetAccumulator> modBudgets = new(StringComparer.Ordinal);
+    private readonly object scanGate = new();
+    private ulong nextJobId;
+    private ulong poolStarted;
+    private ulong poolCompleted;
+    private ulong poolFailed;
+    private ulong poolCancelled;
+    private ulong poolSteps;
+    private GpuPolicy gpuPolicy = GpuPolicy.Auto;
     private ulong tick;
     private ulong nextSnapshotId;
     private string lastError = string.Empty;
@@ -830,6 +868,11 @@ public sealed class ManagedKernel : ITritKernel
         catch (WireException error)
         {
             lastError = error.Message;
+            return new KernelResponse(Status.Decode, Array.Empty<byte>());
+        }
+        catch (JsonException error)
+        {
+            lastError = $"JSON 载荷非法：{error.Message}";
             return new KernelResponse(Status.Decode, Array.Empty<byte>());
         }
     }
@@ -963,6 +1006,63 @@ public sealed class ManagedKernel : ITritKernel
         return KernelResponseMapper.ToU64(response, lastError);
     }
 
+    /// <summary>同步执行扫描并把终态放入已完成队列；返回 0 表示本地编码失败。</summary>
+    public ulong SubmitScan(ScanRequest request)
+    {
+        if (request is null)
+        {
+            lastError = "扫描请求不能为 null";
+            return 0;
+        }
+
+        var response = Submit(Opcode.ScanSubmit, Requests.ScanSubmit(request));
+        return KernelResponseMapper.ToJobId(response);
+    }
+
+    /// <summary>取出已完成任务，取出即出队。</summary>
+    /// <param name="limit">最多取几条；<c>&lt;= 0</c> 表示全部。</param>
+    /// <param name="owner">归属过滤；<see langword="null"/> 表示不限归属。</param>
+    public IReadOnlyList<JobResult> PollJobs(int limit = 0, string? owner = null)
+    {
+        var response = Submit(Opcode.JobPoll, Requests.JobPoll(limit, owner));
+        return KernelResponseMapper.ToJobResults(response);
+    }
+
+    /// <summary>托管任务提交时已同步完成，因此不可取消。</summary>
+    public int CancelJob(ulong jobId)
+    {
+        var response = Submit(Opcode.JobCancel, Requests.JobCancelJob(jobId));
+        return KernelResponseMapper.ToCancelled(response);
+    }
+
+    /// <summary>托管任务提交时已同步完成，因此不可取消。</summary>
+    public int CancelOwner(string owner)
+    {
+        var response = Submit(Opcode.JobCancel, Requests.JobCancelOwner(owner));
+        return KernelResponseMapper.ToCancelled(response);
+    }
+
+    /// <summary>查询或切换托管 GPU 策略；托管路径始终不可用。</summary>
+    public GpuStatusReport GpuStatus(GpuPolicy? policy = null, bool probe = false)
+    {
+        var response = Submit(Opcode.GpuStatus, Requests.GpuStatus(policy, probe, 1_048_576));
+        return KernelResponseMapper.ToGpuStatus(response);
+    }
+
+    /// <summary>查询托管路径的单工作者预算快照。</summary>
+    public BudgetSnapshot Budget()
+    {
+        var response = Submit(Opcode.Budget, Requests.Budget());
+        return KernelResponseMapper.ToBudget(response);
+    }
+
+    /// <summary>查询托管任务池同构的 Prometheus 指标。</summary>
+    public string MetricsPrometheus()
+    {
+        var response = Submit(Opcode.Metrics, Requests.Metrics());
+        return KernelResponseMapper.ToPrometheus(response);
+    }
+
     /// <summary>统计。</summary>
     public ulong[] Stats()
     {
@@ -1023,9 +1123,656 @@ public sealed class ManagedKernel : ITritKernel
             Opcode.AiSetModel => throw new RtException(
                 Status.Arg,
                 "输入非法：托管回退内核不支持装载 AI 模型"),
+            Opcode.ScanSubmit => OpScanSubmit(payload),
+            Opcode.JobPoll => OpJobPoll(payload),
+            Opcode.JobCancel => OpJobCancel(payload),
+            Opcode.GpuStatus => OpGpuStatus(payload),
+            Opcode.Budget => OpBudget(),
+            Opcode.Metrics => OpMetrics(),
             _ => throw new RtException(Status.Arg, $"输入非法：未知 opcode {opcode:#x}"),
         };
     }
+
+    private byte[] OpScanSubmit(byte[] payload)
+    {
+        using var document = ParseJsonObject(payload);
+        var root = document.RootElement;
+        var owner = JsonString(root, "owner");
+        owner = NormalizeOwner(owner);
+        var request = new ScanRequest
+        {
+            Owner = owner,
+            Kind = ParseScanKind(JsonString(root, "kind")),
+            // 种类原文：失败文案要回显用户到底写了什么（枚举装不下）。
+            KindText = JsonString(root, "kind"),
+            Trits = JsonByteArray(root, "trits") ?? Array.Empty<byte>(),
+            Pattern = JsonByteArray(root, "pattern"),
+            Threshold = JsonInt32(root, "threshold"),
+            Chunk = JsonInt32(root, "chunk"),
+            Oneshot = JsonBoolean(root, "oneshot"),
+            Priority = JsonInt32(root, "priority"),
+            Top = root.TryGetProperty("top", out _) ? JsonInt32(root, "top") : 16,
+        };
+
+        ulong id;
+        JobResult result;
+        lock (scanGate)
+        {
+            nextJobId += 1;
+            id = nextJobId;
+            if (!modBudgets.TryGetValue(owner, out var budget))
+            {
+                budget = new ModBudgetAccumulator();
+                modBudgets[owner] = budget;
+            }
+
+            budget.Submitted += 1;
+            poolStarted += 1;
+            result = ExecuteScan(id, request);
+            budget.Steps += result.Steps;
+            poolSteps += result.Steps;
+            if (result.State == JobState.Done)
+            {
+                budget.Completed += 1;
+                poolCompleted += 1;
+            }
+            else if (result.State == JobState.Cancelled)
+            {
+                budget.Cancelled += 1;
+                poolCancelled += 1;
+            }
+            else
+            {
+                poolFailed += 1;
+            }
+
+            completedJobs.Add(result);
+        }
+
+        return JsonBytes(writer => writer.WriteNumber("job", id));
+    }
+
+    private byte[] OpJobPoll(byte[] payload)
+    {
+        using var document = ParseJsonObject(payload);
+        var limit = JsonInt32(document.RootElement, "limit");
+        // owner 过滤：字段缺省或 null = 不限归属；给了就只取该 owner 的。
+        // 归一化口径必须与提交侧一致（空串 → "unknown"），否则两条路径对不上。
+        var owner = JsonOptionalString(document.RootElement, "owner");
+        string? wanted = owner is null ? null : NormalizeOwner(owner);
+
+        var jobs = new List<JobResult>();
+        lock (scanGate)
+        {
+            // **只移除本次真正返回的任务**：其他 owner 的结果仍留在队列里，
+            // 否则一次按 owner 的轮询会把别人的结果一起吃掉。
+            if (wanted is null)
+            {
+                var count = limit <= 0 ? completedJobs.Count : Math.Min(limit, completedJobs.Count);
+                jobs.AddRange(completedJobs.Take(count));
+                completedJobs.RemoveRange(0, count);
+            }
+            else
+            {
+                foreach (var job in completedJobs)
+                {
+                    if (limit > 0 && jobs.Count >= limit)
+                    {
+                        break;
+                    }
+
+                    if (job.Owner == wanted)
+                    {
+                        jobs.Add(job);
+                    }
+                }
+
+                foreach (var job in jobs)
+                {
+                    completedJobs.Remove(job);
+                }
+            }
+        }
+
+        return JsonBytes(writer =>
+        {
+            writer.WritePropertyName("jobs");
+            writer.WriteStartArray();
+            foreach (var job in jobs)
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("id", job.Id);
+                writer.WriteString("owner", job.Owner);
+                writer.WriteString("kind", ScanKindName(job.Kind));
+                writer.WriteString("state", JobStateName(job.State));
+                writer.WritePropertyName("result");
+                writer.WriteRawValue(job.ResultJson, skipInputValidation: false);
+                writer.WriteString("error", job.Error);
+                writer.WriteNumber("steps", job.Steps);
+                writer.WriteString("backend", job.Backend);
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
+        });
+    }
+
+    private static byte[] OpJobCancel(byte[] payload)
+    {
+        using var _ = ParseJsonObject(payload);
+        // 托管路径在 SubmitScan 返回前已同步完成；完成结果不可取消。
+        return JsonBytes(writer => writer.WriteNumber("cancelled", 0));
+    }
+
+    private byte[] OpGpuStatus(byte[] payload)
+    {
+        using var document = ParseJsonObject(payload);
+        if (document.RootElement.TryGetProperty("policy", out var policyElement)
+            && policyElement.ValueKind != JsonValueKind.Null)
+        {
+            if (policyElement.ValueKind != JsonValueKind.String)
+            {
+                throw new RtException(Status.Arg, "输入非法：GPU policy 必须是 auto、off 或 on");
+            }
+
+            gpuPolicy = policyElement.GetString()?.ToLowerInvariant() switch
+            {
+                "auto" => GpuPolicy.Auto,
+                "off" => GpuPolicy.Off,
+                "on" => GpuPolicy.On,
+                _ => throw new RtException(Status.Arg, "输入非法：GPU policy 必须是 auto、off 或 on"),
+            };
+        }
+
+        return JsonBytes(writer =>
+        {
+            writer.WriteBoolean("available", false);
+            writer.WriteBoolean("enabled", false);
+            writer.WriteString("policy", GpuPolicyName(gpuPolicy));
+            writer.WriteString("adapter", string.Empty);
+            writer.WriteString("backend", string.Empty);
+            writer.WriteBoolean("built_with_gpu", false);
+            writer.WriteString("reason", "托管回退内核不含 GPU 路径");
+            writer.WriteNumber("cpu_dot", 0);
+            writer.WriteNumber("gpu_dot", 0);
+            writer.WriteBoolean("matches", false);
+            writer.WriteNumber("min_trits", 1_048_576);
+            writer.WriteNumber("ns_per_trit", 0);
+            writer.WriteNumber("jobs", poolStarted);
+            writer.WriteNumber("gpu_jobs", 0);
+            writer.WriteNumber("fallbacks", 0);
+        });
+    }
+
+    private byte[] OpBudget()
+    {
+        lock (scanGate)
+        {
+            var submitted = 0UL;
+            var completed = 0UL;
+            var cancelled = 0UL;
+            var rejected = 0UL;
+            var steps = 0UL;
+            return JsonBytes(writer =>
+            {
+                writer.WriteNumber("workers", 1);
+                writer.WriteNumber("cpu_capacity", 1);
+                writer.WriteNumber("memory_capacity", 0);
+                writer.WriteNumber("per_mod_inflight", 1);
+                writer.WriteNumber("inflight", 0);
+                writer.WriteNumber("queued", 0);
+                writer.WritePropertyName("mods");
+                writer.WriteStartArray();
+                foreach (var (owner, budget) in modBudgets.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("owner", owner);
+                    writer.WriteNumber("inflight", 0);
+                    writer.WriteNumber("queued", 0);
+                    writer.WriteNumber("submitted", budget.Submitted);
+                    writer.WriteNumber("completed", budget.Completed);
+                    writer.WriteNumber("cancelled", budget.Cancelled);
+                    writer.WriteNumber("rejected", budget.Rejected);
+                    writer.WriteNumber("steps", budget.Steps);
+                    writer.WriteEndObject();
+                    submitted += budget.Submitted;
+                    completed += budget.Completed;
+                    cancelled += budget.Cancelled;
+                    rejected += budget.Rejected;
+                    steps += budget.Steps;
+                }
+
+                writer.WriteEndArray();
+                writer.WritePropertyName("totals");
+                writer.WriteStartObject();
+                writer.WriteNumber("submitted", submitted);
+                writer.WriteNumber("completed", completed);
+                writer.WriteNumber("cancelled", cancelled);
+                writer.WriteNumber("rejected", rejected);
+                writer.WriteNumber("steps", steps);
+                writer.WriteEndObject();
+                writer.WriteNull("last_metrics");
+            });
+        }
+    }
+
+    private byte[] OpMetrics()
+    {
+        string prometheus;
+        lock (scanGate)
+        {
+            prometheus = poolStarted == 0
+                ? string.Empty
+                : $"trit_schedule_started {poolStarted}\n"
+                  + $"trit_schedule_completed {poolCompleted}\n"
+                  + $"trit_schedule_failed {poolFailed}\n"
+                  + $"trit_schedule_cancelled {poolCancelled}\n"
+                  + $"trit_schedule_steps {poolSteps}\n";
+        }
+
+        return JsonBytes(writer => writer.WriteString("prometheus", prometheus));
+    }
+
+    /// <summary>
+    /// 执行一次扫描；请求非法时**产出失败记录**而不是抛异常。
+    /// </summary>
+    /// <remarks>
+    /// **校验顺序与错误文案必须与 Rust 侧 <c>ScanRequest::validate</c> 逐字一致**：
+    /// ①种类未知 → ②trit 值非法 → ③缺 pattern。
+    /// 顺序不同、文案不同，同一份坏请求在两条路径上就会报出不同的原因，
+    /// 影子差分（逐字节比对响应体）立刻炸。
+    /// </remarks>
+    private static JobResult ExecuteScan(ulong id, ScanRequest request)
+    {
+        var trits = request.Trits ?? Array.Empty<byte>();
+        var pattern = request.Pattern ?? Array.Empty<byte>();
+
+        // ① 种类未知：回显用户传入的原文（去首尾空白）。
+        if (request.Kind == ScanKind.Unknown)
+        {
+            return FailedJob(id, request, $"未知扫描 kind：{request.KindText.Trim()}");
+        }
+
+        // ② trit 值非法：先看 trits，再看 pattern（与原生侧同序）。
+        var badTrit = trits
+            .Concat(pattern)
+            .Select(value => (int?)value)
+            .FirstOrDefault(value => value > 2);
+        if (badTrit is not null)
+        {
+            return FailedJob(id, request, $"非法 trit 值：{badTrit}，每个元素只能是 0、1 或 2");
+        }
+
+        // ③ pattern / dot 必须有第二个向量。
+        if (request.Kind is ScanKind.Pattern or ScanKind.Dot && pattern.Length == 0)
+        {
+            return FailedJob(id, request, $"{ScanKindName(request.Kind)} 扫描需要非空 pattern");
+        }
+
+        try
+        {
+            var (resultJson, work) = request.Kind switch
+            {
+                ScanKind.Histogram => HistogramJson(trits),
+                ScanKind.Pattern => PatternJson(trits, pattern, request.Threshold),
+                ScanKind.Density => DensityJson(trits, request.Chunk, request.Top),
+                ScanKind.Dot => DotJson(trits, pattern),
+                _ => ("{}", 0L),
+            };
+            var chunk = ClampChunk(request.Chunk);
+            // 步数口径必须与原生侧一致：**成功的任务至少 1 步**。
+            // 原生侧即使输入为空也会执行一次 step（把空结果算出来），
+            // 而按 work 算出来的托管侧步数会是 0——两条路径对同一份请求
+            // 报出不同的步数，影子差分立刻炸。
+            var steps = request.Oneshot
+                ? 1UL
+                : (ulong)Math.Max(1L, (work + chunk - 1) / chunk);
+            return new JobResult(id, request.Owner, request.Kind, JobState.Done, resultJson, string.Empty, steps, "cpu");
+        }
+        catch (Exception error)
+        {
+            return FailedJob(id, request, $"扫描失败：{error.Message}");
+        }
+    }
+
+    private static JobResult FailedJob(ulong id, ScanRequest request, string error) =>
+        new(id, request.Owner, request.Kind, JobState.Failed, "{}", error, 0, string.Empty);
+
+    private static (string Json, long Work) HistogramJson(byte[] trits)
+    {
+        var neg = 0L;
+        var zero = 0L;
+        var pos = 0L;
+        foreach (var trit in trits)
+        {
+            switch (trit)
+            {
+                case 0:
+                    neg += 1;
+                    break;
+                case 1:
+                    zero += 1;
+                    break;
+                case 2:
+                    pos += 1;
+                    break;
+            }
+        }
+
+        return (JsonText(writer =>
+        {
+            writer.WritePropertyName("histogram");
+            writer.WriteStartObject();
+            writer.WriteNumber("neg", neg);
+            writer.WriteNumber("zero", zero);
+            writer.WriteNumber("pos", pos);
+            writer.WriteEndObject();
+        }), trits.LongLength);
+    }
+
+    private static (string Json, long Work) PatternJson(byte[] trits, byte[] pattern, int threshold)
+    {
+        var matches = new List<(long Index, long Score)>();
+        var scanned = pattern.Length == 0 || pattern.Length > trits.Length
+            ? 0
+            : trits.Length - pattern.Length + 1;
+
+        // 满分 = 图案里**非零位置**的个数：三值点积里 Zero 贡献 0 分，
+        // 所以「逐元素全等」的实际得分就是非零位置的个数。
+        //
+        // 必须与 Rust 侧 `ScanJob::new` 的 `full_score` 逐字对齐，
+        // 否则含 Zero 的 pattern 在两条路径上的满分不同：
+        // 托管侧按 pattern.Length 算就会**永远命中不了**（要求 3 分，满分只有 2）。
+        var fullScore = 0;
+        foreach (var value in pattern)
+        {
+            if (TritValue(value) != 0)
+            {
+                fullScore++;
+            }
+        }
+
+        var required = threshold <= 0 ? fullScore : threshold;
+        for (var index = 0; index < scanned; index++)
+        {
+            var score = 0L;
+            for (var offset = 0; offset < pattern.Length; offset++)
+            {
+                score += TritValue(trits[index + offset]) * TritValue(pattern[offset]);
+            }
+
+            if (score >= required)
+            {
+                matches.Add((index, score));
+            }
+        }
+
+        return (JsonText(writer =>
+        {
+            writer.WritePropertyName("matches");
+            writer.WriteStartArray();
+            foreach (var (index, score) in matches)
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("index", index);
+                writer.WriteNumber("score", score);
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
+            writer.WriteNumber("scanned", scanned);
+            writer.WriteString("backend", "cpu");
+        }), scanned);
+    }
+
+    private static (string Json, long Work) DensityJson(byte[] trits, int requestedChunk, int requestedTop)
+    {
+        var chunk = ClampChunk(requestedChunk);
+        var top = requestedTop > 0 ? requestedTop : 16;
+        var blocks = new List<(long Block, long Index, long NonZero, double Density)>();
+        for (var index = 0; index < trits.Length; index += chunk)
+        {
+            var length = Math.Min(chunk, trits.Length - index);
+            var nonZero = 0L;
+            for (var offset = 0; offset < length; offset++)
+            {
+                if (trits[index + offset] != 1)
+                {
+                    nonZero += 1;
+                }
+            }
+
+            var block = index / chunk;
+            // 密度口径必须与 Rust 侧**逐位一致**：
+            // 先放大 1e6 → 远离零四舍五入 → 再除回 1e6。
+            // 不能用 Math.Round(x, 6)：那是「按十进制位四舍五入」，
+            // 与「先放大再四舍五入」在二进制边界上会差 1 个 ULP，
+            // 写出来的定点文本就差最后一位。
+            var scaled = Math.Round(nonZero / (double)length * 1e6, MidpointRounding.AwayFromZero);
+            var density = scaled / 1e6;
+            blocks.Add((block, index, nonZero, density));
+        }
+
+        var selected = blocks
+            .OrderByDescending(block => block.Density)
+            .ThenBy(block => block.Block)
+            .Take(top)
+            .ToArray();
+        return (JsonText(writer =>
+        {
+            writer.WritePropertyName("blocks");
+            writer.WriteStartArray();
+            foreach (var block in selected)
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("block", block.Block);
+                writer.WriteNumber("index", block.Index);
+                writer.WriteNumber("nonzero", block.NonZero);
+                writer.WritePropertyName("density");
+                writer.WriteRawValue(
+                    Math.Round(block.Density, 6).ToString("0.000000", CultureInfo.InvariantCulture),
+                    skipInputValidation: true);
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
+            writer.WriteNumber("blocks_total", blocks.Count);
+        }), trits.LongLength);
+    }
+
+    private static (string Json, long Work) DotJson(byte[] trits, byte[] pattern)
+    {
+        var length = Math.Min(trits.Length, pattern.Length);
+        var dot = 0L;
+        for (var index = 0; index < length; index++)
+        {
+            dot += TritValue(trits[index]) * TritValue(pattern[index]);
+        }
+
+        return (JsonText(writer =>
+        {
+            writer.WriteNumber("dot", dot);
+            writer.WriteNumber("length", length);
+        }), length);
+    }
+
+    private static int TritValue(byte trit) => trit - 1;
+
+    private static JsonDocument ParseJsonObject(byte[] payload)
+    {
+        var document = JsonDocument.Parse(payload.Length == 0 ? "{}" : Encoding.UTF8.GetString(payload));
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            document.Dispose();
+            throw new WireException("JSON 载荷必须是对象");
+        }
+
+        return document;
+    }
+
+    private static byte[]? JsonByteArray(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out var array) || array.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+
+        if (array.ValueKind != JsonValueKind.Array)
+        {
+            throw new WireException($"JSON 字段 {name} 必须是数组");
+        }
+
+        var values = new byte[array.GetArrayLength()];
+        var index = 0;
+        foreach (var element in array.EnumerateArray())
+        {
+            values[index++] = element.ValueKind == JsonValueKind.Number
+                              && element.TryGetInt32(out var value)
+                              && value is >= byte.MinValue and <= byte.MaxValue
+                ? (byte)value
+                : byte.MaxValue;
+        }
+
+        return values;
+    }
+
+    private static string JsonString(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? string.Empty
+            : string.Empty;
+
+    /// <summary>
+    /// 读取可选字符串：<b>区分「缺省 / null」与「空串」</b>。
+    /// </summary>
+    /// <remarks>
+    /// <see cref="JsonString"/> 把三者（字段不存在、值为 null、值为 ""）都压成空串，
+    /// 而 owner 过滤必须区分：<b>缺省 = 不限归属</b>，<b>空串 = 过滤 unknown</b>。
+    /// 这两件事语义相反，压平了就会把「取全部」变成「只取 unknown」。
+    /// </remarks>
+    private static string? JsonOptionalString(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value)
+            ? value.ValueKind == JsonValueKind.String
+                ? value.GetString() ?? string.Empty
+                : value.ValueKind == JsonValueKind.Null
+                    ? null
+                    : string.Empty
+            : null;
+
+    /// <summary>
+    /// 归属名归一化：**去首尾空白 → 空则归为 <c>unknown</c>**。
+    /// </summary>
+    /// <remarks>
+    /// 复用 <see cref="Requests.NormalizeOwner"/>（与 Rust 侧 <c>normalize_owner</c> 逐字对齐）：
+    /// 提交侧记账、轮询侧过滤、托管回退内核三处必须共用同一规则，
+    /// 否则同一批任务在两条路径上会落到两个不同的 owner 上，影子对拍一直报不一致。
+    /// </remarks>
+    private static string NormalizeOwner(string owner) => Requests.NormalizeOwner(owner);
+
+    /// <summary>
+    /// 单块扫描粒度的上限（与 Rust 侧 <c>MAX_SCAN_CHUNK</c> 同值）。
+    /// </summary>
+    /// <remarks>
+    /// 超大 chunk 会让「步数」的计算与原生侧对不上（原生夹到上限，托管不夹），
+    /// 影子差分会一直报假分歧。
+    /// </remarks>
+    private const int MaxScanChunk = 1 << 20;
+
+    /// <summary>
+    /// 把请求里的 <c>chunk</c> 夹到合法范围：<c>&lt;= 0</c> 用默认粒度，超限夹到上限。
+    /// </summary>
+    /// <remarks>
+    /// 必须与 Rust 侧 <c>ScanJob::new</c> 的夹取规则<b>逐项对齐</b>。
+    /// </remarks>
+    private static int ClampChunk(int requestedChunk) =>
+        requestedChunk <= 0
+            ? 4096
+            : Math.Min(requestedChunk, MaxScanChunk);
+
+    private static int JsonInt32(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.Number
+        && value.TryGetInt32(out var result)
+            ? result
+            : 0;
+
+    private static bool JsonBoolean(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.True;
+
+    /// <summary>
+    /// 解析种类名；无法识别时给 <see cref="ScanKind.Unknown"/>。
+    /// </summary>
+    /// <remarks>
+    /// 必须与 Rust 侧 <c>ScanKind::parse</c> 逐字对齐：
+    /// <b>先去首尾空白</b>再比小写（否则 <c>" histogram "</c> 在托管侧解析失败、
+    /// 在原生侧解析成功），未知种类一律收敛到 <see cref="ScanKind.Unknown"/>
+    /// （不再用 <c>(ScanKind)(-1)</c> 这种没有名字的魔数）。
+    /// </remarks>
+    private static ScanKind ParseScanKind(string name) => name.Trim().ToLowerInvariant() switch
+    {
+        "histogram" => ScanKind.Histogram,
+        "pattern" => ScanKind.Pattern,
+        "density" => ScanKind.Density,
+        "dot" => ScanKind.Dot,
+        _ => ScanKind.Unknown,
+    };
+
+    /// <summary>
+    /// 种类 → JSON 契约里的规范名（未知种类给 <c>"unknown"</c>）。
+    /// </summary>
+    /// <remarks>
+    /// 复用 <see cref="Requests.ScanKindName"/>：这份映射以前在两个文件里各写一遍，
+    /// 改一处漏一处就会让托管侧的 <c>kind</c> 字段与原生侧分叉。
+    /// </remarks>
+    private static string ScanKindName(ScanKind kind) => Requests.ScanKindName(kind);
+
+    private static string JobStateName(JobState state) => state switch
+    {
+        JobState.Done => "done",
+        JobState.Cancelled => "cancelled",
+        _ => "failed",
+    };
+
+    private static string GpuPolicyName(GpuPolicy policy) => policy switch
+    {
+        GpuPolicy.Off => "off",
+        GpuPolicy.On => "on",
+        _ => "auto",
+    };
+
+    /// <summary>
+    /// JSON 响应的编码器：**不转义非 ASCII 字符**。
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Utf8JsonWriter"/> 默认用 <c>JavaScriptEncoder.Default</c>，
+    /// 会把中文写成 <c>é</c> 这样的转义序列；而 Rust 侧的 serde_json
+    /// 输出的是**原始 UTF-8**。两者对同一份中文错误文案产出的字节完全不同，
+    /// 影子差分（逐字节比对）会永远报分歧——而且分歧点全在转义上，
+    /// 肉眼看两边「意思一样」，极难定位。
+    /// <para>
+    /// 这里用 <c>UnsafeRelaxedJsonEscaping</c>：只转义 JSON 规范要求转义的
+    /// 字符（引号、反斜杠、控制字符），非 ASCII 原样输出，与 serde_json 对齐。
+    /// 载荷只在本进程与原生库之间流转，不进 HTML， relaxed 转义没有注入面。
+    /// </para>
+    /// </remarks>
+    private static readonly System.Text.Encodings.Web.JavaScriptEncoder JsonEncoder =
+        System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping;
+
+    private static byte[] JsonBytes(Action<Utf8JsonWriter> writeProperties)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Encoder = JsonEncoder }))
+        {
+            writer.WriteStartObject();
+            writeProperties(writer);
+            writer.WriteEndObject();
+        }
+
+        return buffer.WrittenSpan.ToArray();
+    }
+
+    private static string JsonText(Action<Utf8JsonWriter> writeProperties) =>
+        Encoding.UTF8.GetString(JsonBytes(writeProperties));
 
     private byte[] OpSubscribe(byte[] payload)
     {
@@ -1348,7 +2095,8 @@ public sealed class ManagedKernel : ITritKernel
                 | TritRuntime.Wire.CapabilityBits.Arbitrate
                 | TritRuntime.Wire.CapabilityBits.Prng
                 | TritRuntime.Wire.CapabilityBits.Codec
-                | TritRuntime.Wire.CapabilityBits.Shadow);
+                | TritRuntime.Wire.CapabilityBits.Shadow
+                | TritRuntime.Wire.CapabilityBits.Budget);
 
     /// <summary>
     /// 仲裁一批意图。Ok = 全部车道收敛（按键升序）；失败 = 争议车道 + 全部肇事方。
