@@ -485,6 +485,17 @@ impl TritRuntime {
     fn op_snapshot(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
         let mut reader = Reader::new(payload);
         let _flags = reader.u32()?;
+        let id = self.take_snapshot();
+        let mut writer = Writer::new();
+        writer.u64(id);
+        Ok(writer.into_vec())
+    }
+
+    /// 落一张快照并压缩日志，返回快照 id。
+    ///
+    /// `max_snapshots` 为 0 时仍保留**至少 1 张**：日志压缩依赖快照锚点，
+    /// 一张都不留会让 `compact_log` 永远无从截断（见 `commit_intents` 的兜底）。
+    fn take_snapshot(&mut self) -> u64 {
         self.next_snapshot_id += 1;
         let id = self.next_snapshot_id;
         let bytes = encode_world(&self.world, self.tick, self.log.seq());
@@ -495,7 +506,7 @@ impl TritRuntime {
             world: self.world.clone(),
             bytes,
         };
-        if self.snapshots.len() >= self.config.max_snapshots {
+        if self.snapshots.len() >= self.config.max_snapshots.max(1) {
             // 淘汰最旧的一个。
             if let Some(oldest) = self.snapshots.keys().next().copied() {
                 self.snapshots.remove(&oldest);
@@ -505,9 +516,7 @@ impl TritRuntime {
         self.stats.snapshots_taken += 1;
         // 落盘快照后压缩事务日志，避免只追加导致的无界增长（根因修复）。
         self.compact_log();
-        let mut writer = Writer::new();
-        writer.u64(id);
-        Ok(writer.into_vec())
+        id
     }
 
     /// 压缩事务日志，使其有界：
@@ -516,6 +525,9 @@ impl TritRuntime {
     ///    完整世界，`replay_from` 也只需要快照之后的记录，故可安全丢弃。
     /// 2. 安全阀：若压缩后日志仍达到硬上限（保留窗口异常偏大），逐出最旧快照
     ///    （至少保留 1 个）并重压，保证日志永不无界增长。
+    /// 3. 兜底：只剩一个锚点（或**根本没有锚点**）时仍达上限 ⇒ 把锚点换成
+    ///    「当前世界」并清空日志。回滚是还原快照里的完整世界投影、不读日志，
+    ///    所以换锚点不破坏回滚；代价是更早的回滚点被淘汰——这是有界性的安全阀。
     fn compact_log(&mut self) {
         if let Some(min_seq) = self.snapshots.values().map(|snapshot| snapshot.log_seq).min() {
             self.log.truncate_before(min_seq);
@@ -529,6 +541,24 @@ impl TritRuntime {
             } else {
                 break;
             }
+        }
+        if self.log.len() >= self.config.max_log_entries {
+            if let Some(oldest) = self.snapshots.keys().next().copied() {
+                self.snapshots.remove(&oldest);
+            }
+            self.next_snapshot_id += 1;
+            let id = self.next_snapshot_id;
+            let bytes = encode_world(&self.world, self.tick, self.log.seq());
+            let snapshot = Snapshot {
+                id,
+                tick: self.tick,
+                log_seq: self.log.seq(),
+                world: self.world.clone(),
+                bytes,
+            };
+            self.snapshots.insert(id, snapshot);
+            self.stats.snapshots_taken += 1;
+            self.log.truncate_before(self.log.seq());
         }
     }
 
@@ -1072,5 +1102,32 @@ mod tests {
             autocommit(&mut rt, 5000 + k, 2);
         }
         assert!(rt.log_len() < (1 << 14));
+    }
+
+    /// 回归：调用方**从不落快照**时，提交也必须能持续（自保快照兜底）。
+    ///
+    /// 旧行为：`compact_log` 没有快照锚点 ⇒ 不截断 ⇒ 日志写满后 commit 返回 -4。
+    #[test]
+    fn commits_survive_without_caller_snapshots() {
+        let config = RuntimeConfig {
+            max_snapshots: 0,
+            max_log_entries: 512,
+            ..RuntimeConfig::default()
+        };
+        let mut rt = TritRuntime::new(config);
+        let autocommit = |rt: &mut TritRuntime, key: u32, delta: u8| {
+            let mut w = Writer::new();
+            w.u64(0).u32(key).u8(delta);
+            rt.dispatch(op::TXN_SUBMIT, &w.into_vec()).unwrap();
+        };
+        // 5000 次提交、0 次显式快照：远超 512 条硬上限。
+        for k in 0..5000u32 {
+            autocommit(&mut rt, k % 4096, 2);
+        }
+        assert!(
+            rt.log_len() < 512,
+            "无快照时日志未保持有界：len={}",
+            rt.log_len()
+        );
     }
 }
