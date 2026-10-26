@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using Terraria;
 using Terraria.ModLoader;
+using Terraria.ModLoader.Config;
 using TritRuntime.Kernel;
 using TritRuntime.Wire;
 
@@ -168,6 +169,80 @@ public sealed class TritRuntimeMod : Mod
     }
 
     /// <summary>
+    /// 把 <see cref="TritSettings"/> 的当前值同步进游戏内"配置"面板，保证面板显示真实设置。
+    /// 任何异常都不允许影响装载（面板只是展示层）。
+    /// </summary>
+    private void SyncConfigFromSettings()
+    {
+        try
+        {
+            TritRuntimeConfig cfg = ModContent.GetInstance<TritRuntimeConfig>();
+            cfg.ComputeBackend = settings.GpuPolicyKind switch
+            {
+                GpuPolicy.Off => ComputeBackendOption.Cpu,
+                GpuPolicy.On => ComputeBackendOption.Gpu,
+                _ => ComputeBackendOption.Auto,
+            };
+            cfg.ForceManagedFallback = settings.ForceManaged;
+            cfg.VerboseLogging = settings.VerboseLogging;
+            cfg.LogJobResults = settings.LogJobResults;
+            cfg.EnableWorldHooks = settings.EnableHooks;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("[trit] 同步游戏内设置面板失败（不影响运行）：" + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 由游戏内"配置"面板改动触发（<see cref="TritRuntimeConfig.OnChanged"/>）：
+    /// 把玩家选择写回 <see cref="TritSettings"/> 并尽量即时生效。
+    /// </summary>
+    /// <remarks>
+    /// GPU 策略可热切换（直接推给原生内核，与控制台命令 <c>trit gpu</c> 同一条路径）；
+    /// ForceManaged / EnableWorldHooks 是装载期选项，热改只落盘，下次启动生效。
+    /// </remarks>
+    internal void ApplyPlayerConfig(TritRuntimeConfig cfg)
+    {
+        try
+        {
+            settings.GpuPolicyText = cfg.ComputeBackend switch
+            {
+                ComputeBackendOption.Cpu => "off",
+                ComputeBackendOption.Gpu => "on",
+                _ => "auto",
+            };
+            settings.ForceManaged = cfg.ForceManagedFallback;
+            settings.VerboseLogging = cfg.VerboseLogging;
+            settings.LogJobResults = cfg.LogJobResults;
+            settings.EnableHooks = cfg.EnableWorldHooks;
+            settings.Save(out _);
+
+            // GPU 策略热切换：直接推给原生内核（Auto 时内核按规模自动选，但不强制重探测）。
+            if (shim is not null)
+            {
+                shim.GpuStatus(settings.GpuPolicyKind); // 推策略
+                var gpu = shim.GpuStatus(); // 只读当前实际状态做确认
+                if (gpu.Enabled)
+                {
+                    Logger.Info($"[trit] 计算后端策略已更新为 {settings.GpuPolicyText}，GPU 已启用：adapter={gpu.Adapter} backend={gpu.Backend}");
+                }
+                else
+                {
+                    string why = gpu.Reason.Length > 0
+                        ? gpu.Reason
+                        : !gpu.BuiltWithGpu ? "构建未带gpu feature" : "无可用adapter";
+                    Logger.Info($"[trit] 计算后端策略已更新为 {settings.GpuPolicyText}，GPU 未启用（{why}），扫描走 CPU");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("[trit] 应用游戏内设置失败：" + ex.Message);
+        }
+    }
+
+    /// <summary>
     /// 装配完成后，把"并行 / GPU 到底能不能用、为什么"讲清楚。
     /// 这一段只做观测，任何异常都不允许影响装载。
     /// </summary>
@@ -232,6 +307,9 @@ public sealed class TritRuntimeMod : Mod
         {
             Logger.Info("[trit] 设置来源：" + settings.LoadedFrom);
         }
+
+        // 让游戏内"配置"面板反映当前真实设置（TritSettings 为主，ModConfig 为展示层）。
+        SyncConfigFromSettings();
 
         try
         {

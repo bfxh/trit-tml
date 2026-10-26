@@ -79,7 +79,7 @@
   "max_subscribers": 65536,
   "max_open_txns": 4096,
   "max_snapshots": 64,
-  "max_log_entries": 1048576,
+  "max_log_entries": 4194304,   // 事务日志硬上限（安全阀）。日志随快照截断保持在保留窗口内（远小于此值），仅窗口异常偏大时逐出最旧快照兜底
   "arbitration": "majority",
   "shadow": true,
   "parallel": {

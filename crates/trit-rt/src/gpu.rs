@@ -310,7 +310,7 @@ impl GpuBackend {
                 return None;
             }
             self.status.gpu_jobs += 1;
-            return Some(gpu.into_iter().map(i64::from).collect());
+            Some(gpu.into_iter().map(i64::from).collect())
         }
 
         #[cfg(not(feature = "gpu"))]

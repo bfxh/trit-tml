@@ -83,6 +83,7 @@ internal sealed class WorldBridge
     private double lastStatsLogAt = double.NegativeInfinity;
     private double lastStaticTickLogAt = double.NegativeInfinity;
     private double lastCaptureLogAt = double.NegativeInfinity;
+    private double lastStatusLogAt = double.NegativeInfinity;
     private bool warnedStaticGameTick;
 
     private bool disposed;
@@ -280,6 +281,7 @@ internal sealed class WorldBridge
 
             MaybeSnapshot();
             MaybeReportStats();
+            MaybeReportStatus();
 
             if (settings.VerboseLogging && tick % 60 == 0)
             {
@@ -551,15 +553,18 @@ internal sealed class WorldBridge
             return;
         }
 
-        ulong txn = shim.BeginTransaction();
+        ulong txn = 0;
+        bool committed = false;
         try
         {
+            txn = shim.BeginTransaction();
             for (int i = 0; i < changedKeys.Count; i++)
             {
                 shim.SubmitIntent(txn, changedKeys[i], changedTrits[i]);
             }
 
             TxnCommitResult result = shim.Commit(txn);
+            committed = true;
             LastApplied = result.Applied;
             LastLogSeq = result.LogSeq;
         }
@@ -567,15 +572,32 @@ internal sealed class WorldBridge
         {
             ConflictCount++;
             LastApplied = 0;
-            TryRollback(txn, ex);
             if (ConflictCount <= 3 || settings.VerboseLogging)
             {
                 mod.Logger.Warn($"[trit] 事务提交被拒绝（第 {ConflictCount} 次）：{ex.Message}");
             }
         }
+        catch (Exception ex)
+        {
+            // 其它内核/传输异常：不泄漏悬挂事务，并节流告警，避免每 tick 刷屏。
+            ConflictCount++;
+            LastApplied = 0;
+            if (ConflictCount <= 3 || settings.VerboseLogging)
+            {
+                mod.Logger.Warn($"[trit] 事务提交异常（第 {ConflictCount} 次）：{ex.Message}");
+            }
+        }
+        finally
+        {
+            // 只要没提交成功就回滚，杜绝事务泄漏累积到并发上限（-4）的二级故障。
+            if (!committed && txn != 0)
+            {
+                TryRollback(txn, null);
+            }
+        }
     }
 
-    private void TryRollback(ulong txn, Exception cause)
+    private void TryRollback(ulong txn, Exception? cause)
     {
         try
         {
@@ -583,7 +605,8 @@ internal sealed class WorldBridge
         }
         catch (Exception rollbackError)
         {
-            mod.Logger.Warn($"[trit] 事务 {txn} 回滚失败（原错误：{cause.Message}）：{rollbackError.Message}");
+            string causeText = cause is null ? "无" : cause.Message;
+            mod.Logger.Warn($"[trit] 事务 {txn} 回滚失败（原错误：{causeText}）：{rollbackError.Message}");
         }
     }
 
@@ -761,6 +784,59 @@ internal sealed class WorldBridge
             if (Throttle(ref lastStatsLogAt))
             {
                 mod.Logger.Warn($"[trit] 读取统计失败（tick={tick}）：{ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// 周期性状态日志：把"当前跑在哪个后端 / GPU 到底启用没 / 事务速率"讲清楚。
+    /// 这是常驻的人读摘要，默认就打（不受 <see cref="TritSettings.VerboseLogging"/> 限制）；
+    /// 非 verbose 下仍用墙钟节流兜底，避免极端高频场景刷爆日志。
+    /// </summary>
+    private void MaybeReportStatus()
+    {
+        int interval = settings.StatsIntervalTicks;
+        if (interval <= 0 || tick % interval != 0)
+        {
+            return;
+        }
+
+        // 非 verbose 下受墙钟节流兜底；verbose 下每次到点都打，方便排查。
+        if (!settings.VerboseLogging && !Throttle(ref lastStatusLogAt))
+        {
+            return;
+        }
+
+        try
+        {
+            string backend = shim.IsNative ? "Native" : "Managed(回退)";
+            var caps = new List<string>(3);
+            if (shim.Supports(CapabilityBits.Parallel)) caps.Add("Parallel");
+            if (shim.Supports(CapabilityBits.Gpu)) caps.Add("Gpu");
+            if (shim.Supports(CapabilityBits.Budget)) caps.Add("Budget");
+            string capText = caps.Count > 0 ? string.Join(",", caps) : "无";
+
+            // 无参 GpuStatus：只读当前状态、不重设策略、不重探测，零额外开销。
+            var gpu = shim.GpuStatus();
+            string gpuText = gpu.Enabled
+                ? $"启用 adapter={gpu.Adapter} backend={gpu.Backend}"
+                : $"未启用 原因={(gpu.Reason.Length > 0 ? gpu.Reason : (!gpu.BuiltWithGpu ? "构建未带gpu feature" : "无可用adapter"))}";
+
+            ulong[] stats = shim.Stats();
+            ulong committed = stats.Length > 2 ? stats[2] : 0;
+            double secs = uptime.Elapsed.TotalSeconds;
+            double rate = secs > 0 ? committed / secs : 0;
+
+            mod.Logger.Info(
+                $"[trit] 状态 tick={tick} 后端={backend} 能力=[{capText}] " +
+                $"GPU={gpuText} policy={gpu.Policy.ToString().ToLowerInvariant()} " +
+                $"事务={committed}(约{rate:F0}/s) 网络={netTotal}");
+        }
+        catch (KernelException ex)
+        {
+            if (Throttle(ref lastStatusLogAt))
+            {
+                mod.Logger.Warn($"[trit] 读取状态失败（tick={tick}）：{ex.Message}");
             }
         }
     }

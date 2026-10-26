@@ -1,1 +1,49 @@
+Configs: {
+	TritRuntimeConfig: {
+		DisplayName: TritRuntime 设置
 
+		ComputeBackend: {
+			Label: 计算后端
+			Tooltip: Auto = 模组按任务规模自动选 CPU/GPU；Cpu = 强制只用 CPU；Gpu = 尽量用 GPU，不可用时自动回退 CPU。
+		}
+
+		ForceManagedFallback: {
+			Label: 强制托管回退内核
+			Tooltip: 诊断用：勾选后不使用原生 Rust 内核，改用纯托管实现。修改后需重启游戏生效。
+		}
+
+		VerboseLogging: {
+			Label: 详细日志
+			Tooltip: 输出每次提交 / 派发的明细日志，很吵，仅排查用。
+		}
+
+		LogJobResults: {
+			Label: 记录扫描结果
+			Tooltip: 在聊天 / 日志里输出每条扫描结果，默认关闭避免刷屏。
+		}
+
+		EnableWorldHooks: {
+			Label: 安装世界观测钩子
+			Tooltip: 是否挂 Terraria 钩子做世界投影。修改后需重启游戏生效。
+		}
+	}
+
+	ComputeBackendOption: {
+		Tooltip: ""
+
+		Auto: {
+			Label: Auto
+			Tooltip: ""
+		}
+
+		Cpu: {
+			Label: Cpu
+			Tooltip: ""
+		}
+
+		Gpu: {
+			Label: Gpu
+			Tooltip: ""
+		}
+	}
+}

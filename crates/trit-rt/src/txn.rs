@@ -1,6 +1,10 @@
 //! 三进制事务日志：每次状态修改编码成一条 trit 事务，支持提交、回滚、
-//! 重放与冲突消解。日志**只追加**：回滚到快照 = 还原世界投影，日志保留
-//! 以便从快照序列号向前重放（redo）。容量有上限，写满即报错（上层回退）。
+//! 重放与冲突消解。
+//!
+//! 日志**追加为主**，但通过「快照截断」保持有界：每次落盘快照后，序号
+//! 不高于「最旧保留快照的 log_seq」的记录会被丢弃——因为回滚到该快照
+//! 是直接还原其完整世界投影，而 `replay_from(seq)` 只需要某快照 *之后*
+//! 的记录。这样既保留重放/回滚语义，又杜绝了只追加导致的无界增长。
 
 use trit_core::value::Ternary;
 
@@ -105,6 +109,18 @@ impl TxnLog {
     /// 从 `seq` 之后开始的重放迭代器（确定性重放用）。
     pub fn replay_from(&self, seq: u64) -> impl Iterator<Item = &LogEntry> {
         self.entries.iter().filter(move |entry| entry.seq > seq)
+    }
+
+    /// 丢弃序号 `<= seq` 的记录（保留更晚的记录）。
+    ///
+    /// 记录按 seq 升序存储，因此做一次前缀切除即可。`next_seq` 保持单调，
+    /// 不影响后续 `seq()`（= 全局序号）与 `replay_from`（只依赖 `> seq`）。
+    /// 调用方须保证 `seq` 不高于任一仍需回滚/重放的快照锚点。
+    pub fn truncate_before(&mut self, seq: u64) {
+        let cut = self.entries.partition_point(|entry| entry.seq <= seq);
+        if cut > 0 {
+            self.entries.drain(0..cut);
+        }
     }
 
     /// 全部记录（统计/导出用）。

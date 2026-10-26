@@ -54,7 +54,9 @@ pub struct RuntimeConfig {
     pub max_open_txns: usize,
     /// 快照保留数。
     pub max_snapshots: usize,
-    /// 事务日志条数上限（只追加，写满即报错，上层回退到 C# 路径）。
+    /// 事务日志条数硬上限（安全阀）：正常情况下日志由「快照截断」维持在
+    /// 保留窗口内（远小于此值）；仅当保留窗口异常偏大时，超出部分会触发
+    /// 淘汰最旧快照直至日志落回此上限。写满即报错（上层回退到 C# 路径）。
     pub max_log_entries: usize,
     /// 仲裁模式：`"strict"` 或 `"majority"`。
     pub arbitration: ArbitrationModeSerde,
@@ -73,7 +75,7 @@ impl Default for RuntimeConfig {
             max_subscribers: 65_536,
             max_open_txns: 4_096,
             max_snapshots: 64,
-            max_log_entries: 1 << 20,
+            max_log_entries: 1 << 22,
             arbitration: ArbitrationModeSerde::Majority,
             shadow: true,
             parallel: ParallelConfig::default(),
@@ -501,9 +503,33 @@ impl TritRuntime {
         }
         self.snapshots.insert(id, snapshot);
         self.stats.snapshots_taken += 1;
+        // 落盘快照后压缩事务日志，避免只追加导致的无界增长（根因修复）。
+        self.compact_log();
         let mut writer = Writer::new();
         writer.u64(id);
         Ok(writer.into_vec())
+    }
+
+    /// 压缩事务日志，使其有界：
+    ///
+    /// 1. 丢弃不高于「最旧保留快照 log_seq」的记录——回滚到该快照是直接还原
+    ///    完整世界，`replay_from` 也只需要快照之后的记录，故可安全丢弃。
+    /// 2. 安全阀：若压缩后日志仍达到硬上限（保留窗口异常偏大），逐出最旧快照
+    ///    （至少保留 1 个）并重压，保证日志永不无界增长。
+    fn compact_log(&mut self) {
+        if let Some(min_seq) = self.snapshots.values().map(|snapshot| snapshot.log_seq).min() {
+            self.log.truncate_before(min_seq);
+        }
+        while self.log.len() >= self.config.max_log_entries && self.snapshots.len() > 1 {
+            if let Some(oldest) = self.snapshots.keys().next().copied() {
+                self.snapshots.remove(&oldest);
+            }
+            if let Some(min_seq) = self.snapshots.values().map(|snapshot| snapshot.log_seq).min() {
+                self.log.truncate_before(min_seq);
+            } else {
+                break;
+            }
+        }
     }
 
     fn op_diff(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
@@ -633,6 +659,11 @@ impl TritRuntime {
     fn commit_intents(&mut self, intents: &[Intent], txn_id: u64) -> Result<(u32, u64), RtError> {
         if intents.is_empty() && self.txns.pending_intents(txn_id).is_empty() {
             return Ok((0, self.log.seq()));
+        }
+        // 提交前若日志已逼近硬上限，先压缩（依赖保留的快照锚点驱逐旧记录），
+        // 避免只追加日志在无快照或快照稀疏时写满触发容量错误。
+        if self.log.len() >= self.config.max_log_entries {
+            self.compact_log();
         }
         let mut batch: Vec<Intent> = intents.to_vec();
         batch.extend(self.txns.pending_intents(txn_id));
@@ -850,6 +881,11 @@ impl TritRuntime {
         self.snapshots.get(&id).map(|snapshot| snapshot.log_seq)
     }
 
+    /// 当前事务日志条数（观测/诊断用）。
+    pub fn log_len(&self) -> usize {
+        self.log.len()
+    }
+
     /// 世界编码字节（导出用）。
     pub fn world_bytes(&self) -> Vec<u8> {
         encode_world(&self.world, self.tick, self.log.seq())
@@ -990,5 +1026,51 @@ mod tests {
         let mut rt = default_runtime();
         let error = rt.dispatch(0xFF, b"").unwrap_err();
         assert!(matches!(error, RtError::InvalidInput(_)));
+    }
+
+    /// 回归：事务日志在「持续提交 + 周期快照」下必须保持有界，不能只追加
+    /// 直至写满触发容量错误（此前在密集游戏约 2~3 分钟即触顶的 bug）。
+    #[test]
+    fn log_stays_bounded_under_sustained_commits() {
+        let config = RuntimeConfig {
+            max_snapshots: 8,
+            max_log_entries: 1 << 14,
+            ..RuntimeConfig::default()
+        };
+        let mut rt = TritRuntime::new(config);
+        let autocommit = |rt: &mut TritRuntime, key: u32, delta: u8| {
+            let mut w = Writer::new();
+            w.u64(0).u32(key).u8(delta);
+            rt.dispatch(op::TXN_SUBMIT, &w.into_vec()).unwrap();
+        };
+        let snapshot = |rt: &mut TritRuntime| {
+            let mut w = Writer::new();
+            w.u32(0);
+            rt.dispatch(op::SNAPSHOT, &w.into_vec()).unwrap();
+        };
+
+        // 远超 max_log_entries 的总提交量：每 tick 提交 50 条，跑 4000 tick，
+        // 每 200 tick 落一次快照。无截断时日志会到 200_000 条并写满报错。
+        for tick in 0..4000u32 {
+            for k in 0..50u32 {
+                // key 轮换以避免世界车道上限，delta=2 表示 +1。
+                autocommit(&mut rt, (k + tick % 50) % 4096, 2);
+            }
+            if tick % 200 == 0 {
+                snapshot(&mut rt);
+            }
+        }
+
+        // 日志必须远小于硬上限（被快照截断维持在保留窗口内），且仍能继续提交。
+        assert!(
+            rt.log_len() < (1 << 14),
+            "日志未保持有界：len={}",
+            rt.log_len()
+        );
+        // 再提交一批仍应成功（不再返回容量错误）。
+        for k in 0..50u32 {
+            autocommit(&mut rt, 5000 + k, 2);
+        }
+        assert!(rt.log_len() < (1 << 14));
     }
 }
