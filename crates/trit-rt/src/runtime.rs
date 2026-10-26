@@ -529,14 +529,24 @@ impl TritRuntime {
     ///    「当前世界」并清空日志。回滚是还原快照里的完整世界投影、不读日志，
     ///    所以换锚点不破坏回滚；代价是更早的回滚点被淘汰——这是有界性的安全阀。
     fn compact_log(&mut self) {
-        if let Some(min_seq) = self.snapshots.values().map(|snapshot| snapshot.log_seq).min() {
+        if let Some(min_seq) = self
+            .snapshots
+            .values()
+            .map(|snapshot| snapshot.log_seq)
+            .min()
+        {
             self.log.truncate_before(min_seq);
         }
         while self.log.len() >= self.config.max_log_entries && self.snapshots.len() > 1 {
             if let Some(oldest) = self.snapshots.keys().next().copied() {
                 self.snapshots.remove(&oldest);
             }
-            if let Some(min_seq) = self.snapshots.values().map(|snapshot| snapshot.log_seq).min() {
+            if let Some(min_seq) = self
+                .snapshots
+                .values()
+                .map(|snapshot| snapshot.log_seq)
+                .min()
+            {
                 self.log.truncate_before(min_seq);
             } else {
                 break;
