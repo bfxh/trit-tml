@@ -1,3 +1,4 @@
+using Terraria;
 using Terraria.ModLoader;
 
 namespace TritRuntimeMod;
@@ -31,9 +32,19 @@ public sealed class TritWorldSystem : ModSystem
         TritRuntimeMod.Instance?.Logger.Info("[trit] 世界投影 tick 驱动已装载（ModSystem）");
     }
 
-    /// <summary>每 tick 推进一次世界投影；模组未装配或无桥接时静默跳过。</summary>
+    /// <summary>每 tick 推进一次世界投影；模组未装配、无桥接或不在世界中时静默跳过。</summary>
+    /// <remarks>
+    /// <c>Main.gameMenu</c> 时必须跳过：主菜单同样会走 <c>PostUpdateEverything</c>，
+    /// 但那里没有世界可采样——继续跑只会每 tick 白采 256 个 NPC/弹幕槽位、
+    /// 白提一次批量事务、白写日志。实测主菜单停留一分钟就能把日志推到 600 tick。
+    /// </remarks>
     public override void PostUpdateEverything()
     {
+        if (Main.gameMenu)
+        {
+            return;
+        }
+
         if (!announced)
         {
             announced = true;

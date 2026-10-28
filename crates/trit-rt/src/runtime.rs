@@ -856,14 +856,18 @@ impl TritRuntime {
                 }
             })?;
         // 先做容量预检，保证「要么全落地，要么全不落地」。
-        let new_lanes = resolved
-            .iter()
-            .filter(|intent| !self.world.contains_key(&intent.key))
-            .count();
-        if self.world.len() + new_lanes > MAX_WORLD_LANES {
-            return Err(RtError::Capacity(format!(
-                "世界车道数将达到上限 {MAX_WORLD_LANES}"
-            )));
+        // 上界（把每条都当新车道）都放得下时直接跳过逐条查表——稳态下世界早就建好，
+        // 这一层 8000 条就省掉 8000 次树查找。
+        if self.world.len() + resolved.len() > MAX_WORLD_LANES {
+            let new_lanes = resolved
+                .iter()
+                .filter(|intent| !self.world.contains_key(&intent.key))
+                .count();
+            if self.world.len() + new_lanes > MAX_WORLD_LANES {
+                return Err(RtError::Capacity(format!(
+                    "世界车道数将达到上限 {MAX_WORLD_LANES}"
+                )));
+            }
         }
         if self.log.is_full(self.config.max_log_entries) {
             return Err(RtError::Capacity(format!(
@@ -876,13 +880,10 @@ impl TritRuntime {
             if intent.delta == Ternary::Unknown {
                 continue;
             }
-            let current = self
-                .world
-                .get(&intent.key)
-                .copied()
-                .unwrap_or(Ternary::Unknown);
-            let next = apply_delta(current, intent.delta);
-            self.world.insert(intent.key, next);
+            // `entry` 一次查找同时覆盖「已存在」和「新车道」两种情况：
+            // 原来的 `get` + `insert` 是两次树遍历，每条车道白跑一遍。
+            let slot = self.world.entry(intent.key).or_insert(Ternary::Unknown);
+            *slot = apply_delta(*slot, intent.delta);
             self.log.append(&intent);
             applied += 1;
         }
@@ -1047,8 +1048,8 @@ impl TritRuntime {
             // 分字段借用：日志只读、世界只写，Rust 允许同时持有。
             let key = self.log.key_at(index);
             let delta = self.log.delta_at(index);
-            let current = self.world.get(&key).copied().unwrap_or(Ternary::Unknown);
-            self.world.insert(key, apply_delta(current, delta));
+            let slot = self.world.entry(key).or_insert(Ternary::Unknown);
+            *slot = apply_delta(*slot, delta);
             applied += 1;
         }
         applied

@@ -98,11 +98,42 @@ pub fn arbitrate(
     intents: &[Intent],
     mode: ArbitrationMode,
 ) -> Result<Vec<ResolvedIntent>, Vec<LaneDispute>> {
+    if let Some(resolved) = resolve_sorted_unique(intents) {
+        return Ok(resolved);
+    }
     let lanes = group_by_key(intents);
     match mode {
         ArbitrationMode::Strict => arbitrate_strict(&lanes),
         ArbitrationMode::Majority => arbitrate_majority(&lanes),
     }
+}
+
+/// 键已升序且唯一时的直通解析；不满足条件返回 `None`，交回分组路径。
+///
+/// 为什么要这条快路：`group_by_key` 对每条车道都要建一个 `Vec`，并对每个键做一次
+/// `BTreeMap` 插入。每 tick 8000 条变化就是 8000 次堆分配 + 8000 次树查找，
+/// 实测占掉整批提交 1.07ms 里的绝大部分（见 `examples/stress_bench.rs`）。
+///
+/// 为什么不破坏语义：单驱动车道在两种模式下都没有争议可言——
+/// - `Strict` 只会把弃权（`Unknown`）滤掉；
+/// - `Majority` 对弃权会按「平局」判争议，所以这里一遇到弃权就退回慢路，交给原逻辑。
+fn resolve_sorted_unique(intents: &[Intent]) -> Option<Vec<ResolvedIntent>> {
+    let mut resolved: Vec<ResolvedIntent> = Vec::with_capacity(intents.len());
+    let mut previous: Option<u32> = None;
+    for intent in intents {
+        if intent.delta == Ternary::Unknown {
+            return None;
+        }
+        if previous.is_some_and(|prev| intent.key <= prev) {
+            return None;
+        }
+        previous = Some(intent.key);
+        resolved.push(ResolvedIntent {
+            key: intent.key,
+            delta: intent.delta,
+        });
+    }
+    Some(resolved)
 }
 
 /// 严格模式：走 trit-core 的多驱动总线解析。
@@ -213,6 +244,27 @@ mod tests {
 
     fn intent(txn_id: u64, key: u32, delta: Ternary) -> Intent {
         Intent { txn_id, key, delta }
+    }
+
+    #[test]
+    fn sorted_unique_lanes_match_the_grouping_path() {
+        // 升序唯一键走快路；同样的车道乱序提交会走分组路径。两者结果必须一致。
+        let sorted = [
+            intent(1, 10, Ternary::True),
+            intent(1, 20, Ternary::False),
+            intent(1, 30, Ternary::True),
+        ];
+        let shuffled = [
+            intent(1, 30, Ternary::True),
+            intent(1, 10, Ternary::True),
+            intent(1, 20, Ternary::False),
+        ];
+        for mode in [ArbitrationMode::Strict, ArbitrationMode::Majority] {
+            assert_eq!(
+                arbitrate(&sorted, mode).unwrap(),
+                arbitrate(&shuffled, mode).unwrap()
+            );
+        }
     }
 
     #[test]
