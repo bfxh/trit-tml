@@ -89,10 +89,12 @@ public static class TritApi
     /// <summary>短轮询超时上限（毫秒）：同步阻塞主线程，必须封顶。</summary>
     public const int MaxPollTimeoutMilliseconds = 2_000;
 
-    /// <summary>同类失败日志的最小间隔（毫秒）：避免每次调用都刷日志。</summary>
-    private const long WarnThrottleMilliseconds = 60_000L;
+    /// <summary>同类失败日志的最小间隔（秒）：别的模组可能每 tick 调一次，逐条打会瞬间刷爆日志。</summary>
+    private const double WarnThrottleSeconds = 60.0;
 
-    private static long lastWarnAt = long.MinValue;
+    // 与 WorldBridge / TritHooks 同一套约定：静默丢弃会让人误以为"只发生过一次"，
+    // 所以被吞掉的条数要一起报出来。
+    private static readonly ErrorThrottle apiWarnLog = new(WarnThrottleSeconds);
 
     /// <summary>运行时是否可用（模组已装载且内核已装配）。</summary>
     public static bool Available => TritRuntimeMod.Instance is { RuntimeAvailable: true };
@@ -528,15 +530,12 @@ public static class TritApi
 
     private static void WarnThrottled(string message)
     {
-        // 按时间节流：别的模组可能每 tick 调一次，逐条打日志会瞬间刷爆日志。
-        long now = Environment.TickCount64;
-        if (now - lastWarnAt < WarnThrottleMilliseconds)
+        if (apiWarnLog.ShouldLog(out int dropped))
         {
-            return;
+            TritRuntimeMod.Instance?.Logger.Warn(
+                "[trit] TritApi." + message +
+                (dropped > 0 ? $"（自上次报告以来又吞掉 {dropped} 条）" : string.Empty));
         }
-
-        lastWarnAt = now;
-        TritRuntimeMod.Instance?.Logger.Warn("[trit] TritApi." + message);
     }
 
     private static CapabilityReport SafeCapabilities() =>

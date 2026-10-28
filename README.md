@@ -143,7 +143,7 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 | 模组 `.tmod` 打包 | ✅ 走 tML 官方管线，含 `lib/TritRuntime.Shim.dll` + `lib/Native/trit_rt.dll` + 三件套图标 | `-p:BuildMod=true`（需先关游戏） |
 | 模组**进游戏实跑**（客户端） | ✅ 已跑通（本机 tML 1.4.4.9 / 2026.8.3.0） | 见下 |
 | 模组**专用服务器实跑**（无头） | ✅ 装载 / 自检 / 原生库加载全通；`mode=Native` | 见下 |
-| 服务器侧 tick 数据 | ❌ 未取得 | 无玩家连接时服务器不跑世界更新循环（引擎行为），见 issue |
+| 服务器侧 tick 数据 | ❌ 未取得 | **已用探针定性**：无玩家连接时 `Main.GameUpdateCount` 两分钟一动不动（引擎行为），见下 |
 
 
 ### 真机实跑记录（2026-10-26）
@@ -197,12 +197,40 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 
 **还发现一个「装好了但全程空转」的静默故障：**
 
-服务器上跑 100+ 秒，一条 tick 日志都没有。逐层二分定位：
+服务器上跑 100+ 秒，一条 tick 日志都没有。这一条后来**复查时推翻并重做了**（见下节）：
+那一轮 `serverconfig.txt` 里的 `world=` 是注释掉的，服务器停在选世界界面（`Main.gameMenu=true`），
+所以"服务器不跑世界更新循环"这个结论当时其实没有被真正验证过。
 
-1. `Terraria.Main.Update(GameTime)` **在服务器端从不触发**（服务器走 `Main.DedServ` 自己的循环）
-2. 换成官方 `ModSystem.PostUpdateEverything()` 后**依然不触发**；已确认 `TritWorldSystem`
-   被 tML 实例化（`OnModLoad` 日志打出来了），回调却一次没到
-3. 服务器 85 秒内日志零世界更新 → **无玩家连接时服务器不跑世界更新循环**，是引擎行为
+### 专用服务器复查（2026-10-29）：用探针把结论钉死
+
+带上 `-world` 载入真实世界重跑，并且**先补一条诊断**——原来的日志分不出这两种情况：
+
+- (a) `PostUpdateEverything` 压根没被调用；
+- (b) 回调到了，但被我们自己的 `Main.gameMenu` 判断 early-return 掉。
+
+两者在日志里长得一模一样（都是"一条 tick 数据都没有"），上一次就是在这里误判的。
+现在 `TritWorldSystem` 会在"回调到了但还在菜单"时打一条明确日志。
+
+然后又加了一个**临时后台采样线程**（独立于 ModSystem 回调，验完即删），每 3 秒读一次
+`Main.GameUpdateCount` 与 `PostUpdateEverything` 的实际调用次数。结果：
+
+```
+t=0..2   GameUpdateCount=0  delta=0   gameMenu=True   PostUpdateEverything 次数=0   ← 还在载入
+t=3..39  GameUpdateCount=0  delta=0   gameMenu=False  PostUpdateEverything 次数=0   ← 世界已载入，两分钟一动不动
+```
+
+**结论（这次有直接证据，不是推断）**：世界确实载入了（4200×1200、`gameMenu=False`、已开始监听），
+但 `Main.GameUpdateCount` 在整整两分钟里**一次都没推进**，`PostUpdateEverything` 也一次没到。
+所以是**引擎在无玩家连接时不跑世界更新循环**，不是 tML 没把回调接到服务器端——
+**驱动方式不用改**（`ModSystem` 的选择是对的），要拿服务器 tick 数据必须有玩家连进来。
+
+顺带记录两个排查中踩的坑：
+
+- `serverconfig.txt` 默认只开了 `priority=1`，`world=` 是注释掉的。注释里明写着
+  "unless a world is specified, some settings … will be ignored"——不指定世界时服务器停在选世界界面，
+  看起来"服务起来了"其实根本没进世界。
+- tML 服务器的控制台**不认 `time` 命令**（回 `: Invalid command.`），
+  想探世界时间在不在走不能靠它。
 
 tick 驱动因此从 MonoMod 钩子改为官方 `ModSystem`（不依赖内部方法签名，客户端服务器一致），
 并补了两条可观测性日志（首次采样确认、`GameUpdateCount` 恒定时告警）——

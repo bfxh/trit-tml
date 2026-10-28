@@ -28,6 +28,12 @@ public sealed class TritWorldSystem : ModSystem
 {
     private bool announced;
 
+    // 「回调压根没到」和「回调到了但还在菜单、被自己 early-return 掉」在日志里长得一模一样：
+    // 都是"一条 tick 数据都没有"。不区分这两种，就会把配置问题误判成引擎行为
+    // （专用服务器那一轮就是这么误判的：serverconfig 里 world= 没开，
+    // 服务器停在选世界界面，于是我们得出"服务器不跑世界更新循环"的错误结论）。
+    private bool announcedMenuSkip;
+
     /// <summary>装载确认：日志里没有这一行就说明 tML 没实例化本类。</summary>
     public override void OnModLoad()
     {
@@ -44,6 +50,14 @@ public sealed class TritWorldSystem : ModSystem
     {
         if (Main.gameMenu)
         {
+            if (!announcedMenuSkip)
+            {
+                announcedMenuSkip = true;
+                TritRuntimeMod.Instance?.Logger.Info(
+                    "[trit] tick 回调已到达，但当前不在世界中（Main.gameMenu=true），暂不采样；" +
+                    "若长时间停在这一步，说明还没载入世界（服务器多半是 serverconfig 里没开 world=）");
+            }
+
             return;
         }
 
