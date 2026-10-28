@@ -327,6 +327,7 @@ impl TritRuntime {
             op::BUDGET => self.op_budget(payload),
             op::METRICS => self.op_metrics(payload),
             op::SESSION_RESET => self.op_session_reset(payload),
+            op::TXN_APPLY => self.op_txn_apply(payload),
             _ => Err(RtError::InvalidInput(format!("未知 opcode {opcode:#x}"))),
         };
         if let Err(error) = &result {
@@ -512,6 +513,39 @@ impl TritRuntime {
         self.txns.finish_commit(txn_id)?;
         self.stats.txns_committed += 1;
         self.stats.intents_applied += applied as u64;
+        let mut writer = Writer::new();
+        writer.u32(applied);
+        writer.u64(log_seq);
+        Ok(writer.into_vec())
+    }
+
+    /// 一步提交一整批意图：一次解码、一次仲裁、一次落地，不克隆意图。
+    ///
+    /// 结果与 `TXN_BEGIN` + `TXN_SUBMIT_BATCH(txn_id != 0)` + `TXN_COMMIT`
+    /// 等价（见 `wire::op::TXN_APPLY` 的说明），但把三步的拷贝与往返并成一步。
+    fn op_txn_apply(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        let mut reader = Reader::new(payload);
+        let count = reader.u32()? as usize;
+        // 与 op_txn_submit_batch 同样的上限：坏载荷里的 count 可能是 0xFFFF_FFFF。
+        let mut intents = Vec::with_capacity(count.min(8192));
+        for _ in 0..count {
+            let key = reader.u32()?;
+            let delta = wire::trit_from_byte(reader.u8()?);
+            intents.push(Intent {
+                txn_id: 0,
+                key,
+                delta,
+            });
+        }
+        if intents.is_empty() {
+            let mut writer = Writer::new();
+            writer.u32(0);
+            writer.u64(self.log.seq());
+            return Ok(writer.into_vec());
+        }
+        let (applied, log_seq) = self.commit_intents(&intents, 0)?;
+        self.stats.intents_applied += applied as u64;
+        self.stats.txns_committed += 1;
         let mut writer = Writer::new();
         writer.u32(applied);
         writer.u64(log_seq);
@@ -1142,6 +1176,70 @@ mod tests {
         assert_eq!(reader.u32().unwrap(), 1); // applied
         assert_eq!(reader.u64().unwrap(), 1); // log seq
         assert_eq!(rt.world()[&42], Ternary::True);
+    }
+
+    #[test]
+    fn txn_apply_matches_the_three_step_flow() {
+        // TXN_APPLY 必须与 BEGIN + SUBMIT_BATCH(txn != 0) + COMMIT 等价：
+        // 同样的 applied、同样的 log_seq、同样的世界投影。只要有一条不等，
+        // 上层把热路径切过去就是换了一套语义。
+        let changes: [(u32, u8); 5] = [(7, 2), (11, 2), (19, 0), (23, 2), (31, 0)];
+
+        let mut three_step = default_runtime();
+        let txn_id = {
+            let mut w = Writer::new();
+            w.u32(0);
+            let out = three_step.dispatch(op::TXN_BEGIN, &w.into_vec()).unwrap();
+            Reader::new(&out).u64().unwrap()
+        };
+        {
+            let mut w = Writer::new();
+            w.u64(txn_id);
+            w.u32(changes.len() as u32);
+            for (key, delta) in changes {
+                w.u32(key).u8(delta);
+            }
+            three_step
+                .dispatch(op::TXN_SUBMIT_BATCH, &w.into_vec())
+                .unwrap();
+        }
+        let three_step_result = {
+            let mut w = Writer::new();
+            w.u64(txn_id);
+            let out = three_step.dispatch(op::TXN_COMMIT, &w.into_vec()).unwrap();
+            let mut reader = Reader::new(&out);
+            (reader.u32().unwrap(), reader.u64().unwrap())
+        };
+
+        let mut one_step = default_runtime();
+        let one_step_result = {
+            let mut w = Writer::new();
+            w.u32(changes.len() as u32);
+            for (key, delta) in changes {
+                w.u32(key).u8(delta);
+            }
+            let out = one_step.dispatch(op::TXN_APPLY, &w.into_vec()).unwrap();
+            let mut reader = Reader::new(&out);
+            (reader.u32().unwrap(), reader.u64().unwrap())
+        };
+
+        assert_eq!(
+            one_step_result, three_step_result,
+            "applied/log_seq 必须一致"
+        );
+        assert_eq!(one_step.world(), three_step.world(), "世界投影必须一致");
+        assert_eq!(one_step_result.0, changes.len() as u32);
+    }
+
+    #[test]
+    fn txn_apply_on_empty_batch_is_a_noop() {
+        let mut rt = default_runtime();
+        let mut w = Writer::new();
+        w.u32(0);
+        let out = rt.dispatch(op::TXN_APPLY, &w.into_vec()).unwrap();
+        let mut reader = Reader::new(&out);
+        assert_eq!(reader.u32().unwrap(), 0, "空批次不落地任何车道");
+        assert_eq!(rt.world().len(), 0, "空批次不产生世界车道");
     }
 
     #[test]

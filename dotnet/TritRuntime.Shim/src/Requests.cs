@@ -65,6 +65,24 @@ public static class Requests
         return writer.ToArray();
     }
 
+    /// <summary>一步提交整批：<c>count u32, [key u32, delta u8] * n</c>（无事务号）。</summary>
+    public static byte[] TxnApply(IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas)
+    {
+        if (keys.Count != deltas.Count)
+        {
+            throw new ArgumentException("批量提交的 keys 与 deltas 条数必须一致", nameof(deltas));
+        }
+
+        // u32 count + 每条 (u32 key + u8 delta)。
+        var writer = new WireWriter(4 + keys.Count * 5).U32((uint)keys.Count);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            writer.U32(keys[i]).U8((byte)deltas[i]);
+        }
+
+        return writer.ToArray();
+    }
+
     /// <summary>仲裁：<c>count u32, [txn_id u64, key u32, delta u8] * n</c>。</summary>
     public static byte[] Arbitrate(IReadOnlyList<WriteIntent> intents)
     {

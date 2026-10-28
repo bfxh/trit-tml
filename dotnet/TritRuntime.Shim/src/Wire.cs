@@ -109,6 +109,18 @@ public static class Opcode
     /// 所以没有因为它递增 <c>ABI_VERSION</c>。
     /// </remarks>
     public const uint SessionReset = 0x1B;
+
+    /// <summary>
+    /// 一步提交一整批意图：<c>count u32, [key u32, delta u8] * n</c>
+    /// → <c>applied u32, log_seq u64</c>。
+    /// </summary>
+    /// <remarks>
+    /// 与 <see cref="TxnBegin"/> + <see cref="TxnSubmitBatch"/>(事务号 != 0) +
+    /// <see cref="TxnCommit"/> 的结果等价，但只走一趟 FFI、只解一次载荷，
+    /// 并省掉提交时对整批意图的二次拷贝。属于<b>可选</b>操作：老内核返回
+    /// "未知 opcode"，<c>ApplyBatch</c> 会回退到三步流程。
+    /// </remarks>
+    public const uint TxnApply = 0x1C;
 }
 
 /// <summary>查询编号，与 Rust 侧 <c>trit_rt::wire::query</c> 对齐。</summary>

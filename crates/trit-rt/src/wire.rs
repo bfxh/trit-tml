@@ -89,6 +89,17 @@ pub mod op {
     /// 所以没有因为它递增 ABI 版本——老内核返回 [`crate::error::RtError::InvalidInput`]，
     /// 上层记一条日志后继续跑，不会像 `TXN_SUBMIT_BATCH` 那样每 tick 失败。
     pub const SESSION_RESET: u32 = 0x1B;
+    /// 一步提交一整批意图（二进制）：`count u32, [key u32, delta u8] * n`
+    /// → `applied u32, log_seq u64`。
+    ///
+    /// 与 `TXN_BEGIN` + `TXN_SUBMIT_BATCH(txn_id != 0)` + `TXN_COMMIT` 三步的结果
+    /// **逐字节等价**，但只走一次 FFI、只解一次载荷，并且省掉 `TXN_COMMIT` 里
+    /// `clone_intents` 对整批意图的二次拷贝（战斗高峰一个 tick 就是上千条）。
+    ///
+    /// 语义边界：不做跨事务仲裁——这与 `txn_id == 0` 的自动提交一致；需要
+    /// 跨事务/可回滚的语义仍走三步流程。属**可选**操作：老内核返回
+    /// [`crate::error::RtError::InvalidInput`]，上层回退到三步流程即可。
+    pub const TXN_APPLY: u32 = 0x1C;
 }
 
 /// 查询编号。

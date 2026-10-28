@@ -32,6 +32,8 @@ public sealed class NativeKernel : ITritKernel
     private readonly ArbitrationMode arbitration;
     private string lastError = string.Empty;
     private bool disposed;
+    /// <summary>内核是否不认识 <c>0x1C TXN_APPLY</c>（老版本 DLL）：置位后永久走三步流程。</summary>
+    private bool txnApplyUnsupported;
 
     private NativeKernel(NativeApi api, ulong handle, ArbitrationMode arbitration)
     {
@@ -243,6 +245,57 @@ public sealed class NativeKernel : ITritKernel
     {
         var response = Submit(Opcode.TxnCommit, Requests.TxnCommit(txnId));
         return KernelResponseMapper.ToCommitResult(response);
+    }
+
+    /// <summary>一步提交整批意图（一次 FFI，不做整批克隆）。</summary>
+    /// <remarks>
+    /// 0x1C 是可选操作：老内核不认识它（返回 <see cref="TritRuntime.Wire.Status.BadOp"/>），
+    /// 首次遇到就永久回退到「开事务 + 批量提交 + 提交」三步流程，不再每 tick 白试一次。
+    /// 两条路径的结果逐字节等价，回退只影响速度，不影响语义。
+    /// </remarks>
+    public TxnCommitResult ApplyBatch(IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas)
+    {
+        if (txnApplyUnsupported)
+        {
+            return CommitThreeStep(keys, deltas);
+        }
+
+        try
+        {
+            var response = Submit(Opcode.TxnApply, Requests.TxnApply(keys, deltas));
+            return KernelResponseMapper.ToCommitResult(response);
+        }
+        catch (KernelException ex) when (ex.Status == TritRuntime.Wire.Status.BadOp)
+        {
+            txnApplyUnsupported = true;
+            return CommitThreeStep(keys, deltas);
+        }
+    }
+
+    /// <summary>三步提交（老内核的回退路径）。异常时回滚，不泄漏悬挂事务。</summary>
+    private TxnCommitResult CommitThreeStep(
+        IReadOnlyList<uint> keys,
+        IReadOnlyList<TritDelta> deltas)
+    {
+        var txnId = BeginTransaction();
+        try
+        {
+            SubmitIntents(txnId, keys, deltas);
+            return Commit(txnId);
+        }
+        catch (Exception)
+        {
+            try
+            {
+                RollbackTransaction(txnId);
+            }
+            catch (KernelException)
+            {
+                // 回滚也失败只能放弃：原始错误更重要，别再拿它盖掉真正的故障。
+            }
+
+            throw;
+        }
     }
 
     /// <summary>回滚事务。</summary>

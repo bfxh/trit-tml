@@ -54,6 +54,7 @@
 | `0x19` | `METRICS` | **JSON** | **JSON** `{"prometheus": "<text>"}` |
 | `0x1A` | `TXN_SUBMIT_BATCH` | 二进制 `txn_id u64, count u32, [key u32, delta u8] * n` | 空 |
 | `0x1B` | `SESSION_RESET` | 空（必须为空） | 空 |
+| `0x1C` | `TXN_APPLY` | 二进制 `count u32, [key u32, delta u8] * n` | 二进制 `applied u32, log_seq u64` |
 
 > v2 新增的 6 个 opcode 一律用 **UTF-8 JSON**（既有 opcode 保持二进制不变，避免破坏兼容）。
 > 空载荷等价于 `{}`。
@@ -73,6 +74,31 @@ txn_id u64 | count u32 | (key u32 | delta u8) * count
 存在理由同上：逐条 `0x07` 每条都要付一次 FFI 往返（实测 0.5µs/条），
 模组的 `WorldBridge` 每 tick 会提交所有变化车道，战斗高峰可达 1600 条 ≈ 0.86ms
 主线程时间；改走批量后同一批只剩一次调用。
+
+### `0x1C TXN_APPLY`
+
+把「开事务 → 批量提交 → 提交」三步并成一步，响应直接给出结果：
+
+```
+请求：count u32 | (key u32 | delta u8) * count
+响应：applied u32 | log_seq u64
+```
+
+- 结果与 `0x13 TXN_BEGIN` + `0x1A`(txn_id != 0) + `0x14 TXN_COMMIT` **逐字节等价**
+  （同一 `applied`、同一 `log_seq`、同一世界投影、同一事务日志内容）。
+- 做的只是省开销：少两次 FFI 往返，且不再需要 `COMMIT` 里把整批意图克隆一份交给
+  仲裁——战斗高峰一批就是上千条。
+- 语义边界：不做跨事务仲裁，等同 `txn_id == 0` 的自动提交。需要可回滚/跨事务语义时
+  仍走三步流程。
+- `count == 0` 合法：`applied = 0`，`log_seq` 回当前值。
+- **可选操作**：老内核返回 `TT_ERR_BAD_OP`，壳会回退三步流程（与 `0x1B` 一样，未单独递增版本号）。
+
+实测（13,020 车道，12,000 tick）：
+
+| 变化/tick | 三步 | 一步 | 降幅 |
+|---|---|---|---|
+| 1,300（真实档） | 0.055 ms/tick | 0.032 ms/tick | −42% |
+| 8,000（超载档） | 0.395 ms/tick | 0.261 ms/tick | −34% |
 
 ### `0x1B SESSION_RESET`
 

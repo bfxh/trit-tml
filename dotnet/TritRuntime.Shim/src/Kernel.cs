@@ -126,6 +126,15 @@ public interface ITritKernel : IDisposable
     /// <summary>便捷方法：提交事务。</summary>
     TxnCommitResult Commit(ulong txnId);
 
+    /// <summary>
+    /// 便捷方法：一步提交整批意图，等价于 开事务 + 批量提交 + 提交。
+    /// <para>
+    /// 热路径用：省掉两次 FFI 与一次整批意图的克隆（见 <c>op::TXN_APPLY</c>）。
+    /// 需要跨事务仲裁或可回滚语义时仍走三步流程。
+    /// </para>
+    /// </summary>
+    TxnCommitResult ApplyBatch(IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas);
+
     /// <summary>便捷方法：回滚事务。</summary>
     void RollbackTransaction(ulong txnId);
 

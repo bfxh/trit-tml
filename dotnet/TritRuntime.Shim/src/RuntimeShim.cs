@@ -178,6 +178,10 @@ public sealed class RuntimeShim : IDisposable
     /// <summary>提交事务。</summary>
     public TxnCommitResult Commit(ulong txnId) => host.Kernel.Commit(txnId);
 
+    /// <summary>一步提交整批意图：等价于 开事务 + 批量提交 + 提交，但只有一次 FFI。</summary>
+    public TxnCommitResult ApplyBatch(IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas) =>
+        host.Kernel.ApplyBatch(keys, deltas);
+
     /// <summary>回滚事务。</summary>
     public void RollbackTransaction(ulong txnId) => host.Kernel.RollbackTransaction(txnId);
 
@@ -223,7 +227,22 @@ public sealed class RuntimeShim : IDisposable
     public ShadowDiffer? Differ => host.Differ;
 
     /// <summary>提交扫描任务；原生路径异步执行，托管回退同步完成后入队。</summary>
-    public ulong SubmitScan(ScanRequest request) => host.Kernel.SubmitScan(request);
+    public ulong SubmitScan(ScanRequest request)
+    {
+        ulong jobId = host.Kernel.SubmitScan(request);
+        System.Threading.Interlocked.Increment(ref jobsInflight);
+        return jobId;
+    }
+
+    /// <summary>已提交、结果尚未被取走的任务数（保守上界）。</summary>
+    /// <remarks>
+    /// 只服务一个判断：值为 0 时 <c>PollJobs</c> 必定空手，那一趟 FFI 与两次缓冲分配
+    /// 就可以整趟省掉。计数偏大只会多轮询几次，不会漏结果；偏小才是缺陷，
+    /// 所以取与取消都按「能减多少减多少、越界夹到 0」处理。
+    /// </remarks>
+    public int JobsInflight => System.Threading.Volatile.Read(ref jobsInflight);
+
+    private int jobsInflight;
 
     /// <summary>取出已完成任务，取出即出队。</summary>
     /// <param name="limit">最多取几条；<c>&lt;= 0</c> 表示全部。</param>
@@ -231,14 +250,53 @@ public sealed class RuntimeShim : IDisposable
     /// 归属过滤；<see langword="null"/> 表示不限归属。
     /// <b>只有本次真正返回的任务会出队</b>，其他 owner 的结果仍留在队列里。
     /// </param>
-    public IReadOnlyList<JobResult> PollJobs(int limit = 0, string? owner = null) =>
-        host.Kernel.PollJobs(limit, owner);
+    public IReadOnlyList<JobResult> PollJobs(int limit = 0, string? owner = null)
+    {
+        IReadOnlyList<JobResult> jobs = host.Kernel.PollJobs(limit, owner);
+        if (jobs.Count > 0)
+        {
+            System.Threading.Interlocked.Add(ref jobsInflight, -jobs.Count);
+            ClampJobsInflight();
+        }
+
+        return jobs;
+    }
 
     /// <summary>协作式取消单个任务。</summary>
-    public int CancelJob(ulong jobId) => host.Kernel.CancelJob(jobId);
+    public int CancelJob(ulong jobId)
+    {
+        int canceled = host.Kernel.CancelJob(jobId);
+        if (canceled > 0)
+        {
+            System.Threading.Interlocked.Add(ref jobsInflight, -canceled);
+            ClampJobsInflight();
+        }
+
+        return canceled;
+    }
 
     /// <summary>协作式取消指定 owner 的任务。</summary>
-    public int CancelOwner(string owner) => host.Kernel.CancelOwner(owner);
+    public int CancelOwner(string owner)
+    {
+        int canceled = host.Kernel.CancelOwner(owner);
+        if (canceled > 0)
+        {
+            System.Threading.Interlocked.Add(ref jobsInflight, -canceled);
+            ClampJobsInflight();
+        }
+
+        return canceled;
+    }
+
+    private void ClampJobsInflight()
+    {
+        // 别的模组带 owner 过滤取走了结果时，本实例的记账可能比真实剩余量还低；
+        // 夹到 0 只影响"下次要不要轮询"，与结果正确性无关。
+        if (System.Threading.Volatile.Read(ref jobsInflight) < 0)
+        {
+            System.Threading.Interlocked.Exchange(ref jobsInflight, 0);
+        }
+    }
 
     /// <summary>查询或切换 GPU 后端状态。</summary>
     public GpuStatusReport GpuStatus(GpuPolicy? policy = null, bool probe = false) =>

@@ -956,6 +956,13 @@ public sealed class ManagedKernel : ITritKernel
         return KernelResponseMapper.ToCommitResult(response, lastError);
     }
 
+    /// <summary>一步提交整批意图（等价于 开事务 + 批量提交 + 提交）。</summary>
+    public TxnCommitResult ApplyBatch(IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas)
+    {
+        var response = Submit(Opcode.TxnApply, Requests.TxnApply(keys, deltas));
+        return KernelResponseMapper.ToCommitResult(response, lastError);
+    }
+
     /// <summary>回滚事务。</summary>
     public void RollbackTransaction(ulong txnId)
     {
@@ -1160,6 +1167,7 @@ public sealed class ManagedKernel : ITritKernel
             Opcode.TxnRollback => OpTxnRollback(payload),
             Opcode.TxnSubmit => OpTxnSubmit(payload),
             Opcode.TxnSubmitBatch => OpTxnSubmitBatch(payload),
+            Opcode.TxnApply => OpTxnApply(payload),
             Opcode.Arbitrate => OpArbitrate(payload),
             Opcode.Query => OpQuery(payload),
             Opcode.Step => OpStep(payload),
@@ -1950,6 +1958,28 @@ public sealed class ManagedKernel : ITritKernel
         var intents = txns.CloneIntents(txnId);
         var (applied, logSeq) = CommitIntents(intents, txnId);
         txns.FinishCommit(txnId);
+        stats.TxnsCommitted += 1;
+        stats.IntentsApplied += applied;
+        return new WireWriter().U32(applied).U64(logSeq).ToArray();
+    }
+
+    /// <summary>一步提交：读一批无事务号的意图，一次仲裁 + 一次落地。</summary>
+    private byte[] OpTxnApply(byte[] payload)
+    {
+        var reader = new WireReader(payload);
+        var count = reader.U32();
+        var intents = new WriteIntent[count];
+        for (int i = 0; i < count; i++)
+        {
+            intents[i] = new WriteIntent(0, reader.U32(), (TritDelta)reader.U8());
+        }
+
+        if (intents.Length == 0)
+        {
+            return new WireWriter().U32(0).U64(log.Seq).ToArray();
+        }
+
+        var (applied, logSeq) = CommitIntents(intents, 0);
         stats.TxnsCommitted += 1;
         stats.IntentsApplied += applied;
         return new WireWriter().U32(applied).U64(logSeq).ToArray();

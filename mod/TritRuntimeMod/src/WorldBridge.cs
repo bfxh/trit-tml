@@ -360,24 +360,35 @@ internal sealed class WorldBridge
                 continue;
             }
 
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldActive, npc.active ? 1 : 0, state.Present && state.Active ? 1 : 0, state.Present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldLife, npc.life, state.Life, state.Present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldLifeMax, npc.lifeMax, state.LifeMax, state.Present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldPositionX, (int)npc.position.X, state.X, state.Present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldPositionY, (int)npc.position.Y, state.Y, state.Present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldVelocityX, (int)npc.velocity.X, state.Vx, state.Present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldVelocityY, (int)npc.velocity.Y, state.Vy, state.Present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldDirection, npc.direction, state.Dir, state.Present);
+            // 每个字段只读一次：原来「比较时读一遍、写回时再读一遍」，
+            // 每个实体每 tick 多付 7 次属性读 + 4 次 float→int 转换。
+            bool present = state.Present;
+            int life = npc.life;
+            int lifeMax = npc.lifeMax;
+            int x = (int)npc.position.X;
+            int y = (int)npc.position.Y;
+            int vx = (int)npc.velocity.X;
+            int vy = (int)npc.velocity.Y;
+            int dir = npc.direction;
+
+            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldActive, 1, present && state.Active ? 1 : 0, present);
+            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldLife, life, state.Life, present);
+            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldLifeMax, lifeMax, state.LifeMax, present);
+            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldPositionX, x, state.X, present);
+            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldPositionY, y, state.Y, present);
+            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldVelocityX, vx, state.Vx, present);
+            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldVelocityY, vy, state.Vy, present);
+            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldDirection, dir, state.Dir, present);
 
             state.Present = true;
-            state.Active = npc.active;
-            state.Life = npc.life;
-            state.LifeMax = npc.lifeMax;
-            state.X = (int)npc.position.X;
-            state.Y = (int)npc.position.Y;
-            state.Vx = (int)npc.velocity.X;
-            state.Vy = (int)npc.velocity.Y;
-            state.Dir = npc.direction;
+            state.Active = true;
+            state.Life = life;
+            state.LifeMax = lifeMax;
+            state.X = x;
+            state.Y = y;
+            state.Vx = vx;
+            state.Vy = vy;
+            state.Dir = dir;
         }
 
         return active;
@@ -426,20 +437,27 @@ internal sealed class WorldBridge
                 continue;
             }
 
-            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldActive, 1, state.Present && state.Active ? 1 : 0, state.Present);
-            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldPositionX, (int)projectile.position.X, state.X, state.Present);
-            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldPositionY, (int)projectile.position.Y, state.Y, state.Present);
-            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldVelocityX, (int)projectile.velocity.X, state.Vx, state.Present);
-            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldVelocityY, (int)projectile.velocity.Y, state.Vy, state.Present);
-            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldDirection, projectile.direction, state.Dir, state.Present);
+            bool present = state.Present;
+            int x = (int)projectile.position.X;
+            int y = (int)projectile.position.Y;
+            int vx = (int)projectile.velocity.X;
+            int vy = (int)projectile.velocity.Y;
+            int dir = projectile.direction;
+
+            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldActive, 1, present && state.Active ? 1 : 0, present);
+            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldPositionX, x, state.X, present);
+            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldPositionY, y, state.Y, present);
+            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldVelocityX, vx, state.Vx, present);
+            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldVelocityY, vy, state.Vy, present);
+            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldDirection, dir, state.Dir, present);
 
             state.Present = true;
             state.Active = true;
-            state.X = (int)projectile.position.X;
-            state.Y = (int)projectile.position.Y;
-            state.Vx = (int)projectile.velocity.X;
-            state.Vy = (int)projectile.velocity.Y;
-            state.Dir = projectile.direction;
+            state.X = x;
+            state.Y = y;
+            state.Vx = vx;
+            state.Vy = vy;
+            state.Dir = dir;
         }
 
         return active;
@@ -488,26 +506,36 @@ internal sealed class WorldBridge
                 continue;
             }
 
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldActive, 1, state.Present && state.Active ? 1 : 0, state.Present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldLife, player.statLife, state.Life, state.Present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldLifeMax, player.statLifeMax2, state.LifeMax, state.Present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldMana, player.statMana, state.Mana, state.Present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldPositionX, (int)player.position.X, state.X, state.Present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldPositionY, (int)player.position.Y, state.Y, state.Present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldVelocityX, (int)player.velocity.X, state.Vx, state.Present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldVelocityY, (int)player.velocity.Y, state.Vy, state.Present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldDirection, player.direction, state.Dir, state.Present);
+            bool present = state.Present;
+            int life = player.statLife;
+            int lifeMax = player.statLifeMax2;
+            int mana = player.statMana;
+            int x = (int)player.position.X;
+            int y = (int)player.position.Y;
+            int vx = (int)player.velocity.X;
+            int vy = (int)player.velocity.Y;
+            int dir = player.direction;
+
+            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldActive, 1, present && state.Active ? 1 : 0, present);
+            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldLife, life, state.Life, present);
+            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldLifeMax, lifeMax, state.LifeMax, present);
+            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldMana, mana, state.Mana, present);
+            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldPositionX, x, state.X, present);
+            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldPositionY, y, state.Y, present);
+            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldVelocityX, vx, state.Vx, present);
+            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldVelocityY, vy, state.Vy, present);
+            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldDirection, dir, state.Dir, present);
 
             state.Present = true;
             state.Active = true;
-            state.Life = player.statLife;
-            state.LifeMax = player.statLifeMax2;
-            state.Mana = player.statMana;
-            state.X = (int)player.position.X;
-            state.Y = (int)player.position.Y;
-            state.Vx = (int)player.velocity.X;
-            state.Vy = (int)player.velocity.Y;
-            state.Dir = player.direction;
+            state.Life = life;
+            state.LifeMax = lifeMax;
+            state.Mana = mana;
+            state.X = x;
+            state.Y = y;
+            state.Vx = vx;
+            state.Vy = vy;
+            state.Dir = dir;
         }
 
         return active;
@@ -553,17 +581,12 @@ internal sealed class WorldBridge
             return;
         }
 
-        ulong txn = 0;
-        bool committed = false;
         try
         {
-            // 一批车道一次提交：逐条 SubmitIntent 每条都要走一趟 FFI（实测 0.5µs/条），
-            // 战斗高峰一个 tick 就能堆到上千条，等于白烧 0.8ms 的主线程时间。
-            txn = shim.BeginTransaction();
-            shim.SubmitIntents(txn, changedKeys, changedTrits);
-
-            TxnCommitResult result = shim.Commit(txn);
-            committed = true;
+            // 一步提交：一趟 FFI 完成仲裁 + 落地。
+            // 原来走 开事务 → 批量提交 → 提交 三趟，提交时内核还要把整批意图
+            // 克隆一份交给仲裁；战斗高峰一个 tick 上千条，那份克隆是实打实的浪费。
+            TxnCommitResult result = shim.ApplyBatch(changedKeys, changedTrits);
             LastApplied = result.Applied;
             LastLogSeq = result.LogSeq;
         }
@@ -578,34 +601,13 @@ internal sealed class WorldBridge
         }
         catch (Exception ex)
         {
-            // 其它内核/传输异常：不泄漏悬挂事务，并节流告警，避免每 tick 刷屏。
+            // 其它内核/传输异常：节流告警，避免每 tick 刷屏。
             ConflictCount++;
             LastApplied = 0;
             if (ConflictCount <= 3 || settings.VerboseLogging)
             {
                 mod.Logger.Warn($"[trit] 事务提交异常（第 {ConflictCount} 次）：{ex.Message}");
             }
-        }
-        finally
-        {
-            // 只要没提交成功就回滚，杜绝事务泄漏累积到并发上限（-4）的二级故障。
-            if (!committed && txn != 0)
-            {
-                TryRollback(txn, null);
-            }
-        }
-    }
-
-    private void TryRollback(ulong txn, Exception? cause)
-    {
-        try
-        {
-            shim.RollbackTransaction(txn);
-        }
-        catch (Exception rollbackError)
-        {
-            string causeText = cause is null ? "无" : cause.Message;
-            mod.Logger.Warn($"[trit] 事务 {txn} 回滚失败（原错误：{causeText}）：{rollbackError.Message}");
         }
     }
 
@@ -761,6 +763,13 @@ internal sealed class WorldBridge
             return;
         }
 
+        // 先决定「要不要打」，再决定「要不要问内核」：非 verbose 下绝大多数到点
+        // 都会被墙钟节流掉，原来每次都先把 Stats 取回来、拼 20 多个字符串，才发现不打。
+        if (!settings.VerboseLogging && !Throttle(ref lastStatsLogAt))
+        {
+            return;
+        }
+
         try
         {
             ulong[] stats = shim.Stats();
@@ -770,13 +779,10 @@ internal sealed class WorldBridge
                 parts[i] = i + "=" + stats[i];
             }
 
-            if (settings.VerboseLogging || Throttle(ref lastStatsLogAt))
-            {
-                mod.Logger.Info(
-                    $"[trit] 统计 tick={tick} mode={shim.Mode} " +
-                    "counters[" + string.Join(" ", parts) + "] " +
-                    $"net_total={netTotal}");
-            }
+            mod.Logger.Info(
+                $"[trit] 统计 tick={tick} mode={shim.Mode} " +
+                "counters[" + string.Join(" ", parts) + "] " +
+                $"net_total={netTotal}");
         }
         catch (KernelException ex)
         {

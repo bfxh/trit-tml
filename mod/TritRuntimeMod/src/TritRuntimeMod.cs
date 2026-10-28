@@ -451,6 +451,14 @@ public sealed class TritRuntimeMod : Mod
                 return;
             }
 
+            // 没有在飞任务：轮询必然空手，这一趟 FFI 与两次缓冲分配直接省掉。
+            // 绝大多数会话都不提交扫描任务（只有 `trit scan` 类命令会），
+            // 所以这里省掉的是每 tick 的常态开销，而不是偶发开销。
+            if (shim.JobsInflight == 0)
+            {
+                return;
+            }
+
             IReadOnlyList<JobResult> jobs = shim.PollJobs(settings.PollJobsPerTick);
             if (jobs is null || jobs.Count == 0)
             {

@@ -394,6 +394,59 @@ public sealed class ParityTests
         kernel.Arbitrate(new[] { new WriteIntent(1, 8, TritDelta.Pos) });
     }
 
+    /// <summary>
+    /// <c>ApplyBatch</c>（一步提交）必须与 开事务 + 批量提交 + 提交 三步等价，
+    /// 且原生内核与托管回退内核给出完全相同的 applied / log_seq / 世界投影。
+    /// </summary>
+    [Fact]
+    public void ApplyBatchMatchesTheThreeStepFlow()
+    {
+        var pair = Pair();
+        if (pair is null)
+        {
+            return;
+        }
+
+        var (native, managed, _) = pair.Value;
+        uint[] keys = { 7, 11, 19, 23 };
+        TritDelta[] deltas = { TritDelta.Pos, TritDelta.Pos, TritDelta.Neg, TritDelta.Pos };
+        try
+        {
+            native.Step(1);
+            managed.Step(1);
+
+            var threeNative = CommitThreeStep(native, keys, deltas);
+            var threeManaged = CommitThreeStep(managed, keys, deltas);
+            Assert.Equal(threeNative, threeManaged);
+
+            var oneNative = native.ApplyBatch(keys, deltas);
+            var oneManaged = managed.ApplyBatch(keys, deltas);
+            Assert.Equal(oneManaged.Applied, oneNative.Applied);
+            Assert.Equal(oneManaged.LogSeq, oneNative.LogSeq);
+            Assert.Equal(keys.Length, (int)oneNative.Applied);
+
+            Assert.Equal(
+                native.Submit(Opcode.Query, Requests.Query(QueryId.WorldSize)).Payload,
+                managed.Submit(Opcode.Query, Requests.Query(QueryId.WorldSize)).Payload);
+            Assert.Equal(native.SnapshotBytes(), managed.SnapshotBytes());
+        }
+        finally
+        {
+            native.Dispose();
+            managed.Dispose();
+        }
+    }
+
+    private static TxnCommitResult CommitThreeStep(
+        ITritKernel kernel,
+        IReadOnlyList<uint> keys,
+        IReadOnlyList<TritDelta> deltas)
+    {
+        var txn = kernel.BeginTransaction();
+        kernel.SubmitIntents(txn, keys, deltas);
+        return kernel.Commit(txn);
+    }
+
     /// <summary>在两个内核上构造完全相同的世界投影。</summary>
     private static void BuildComparableWorld(ITritKernel kernel)
     {
