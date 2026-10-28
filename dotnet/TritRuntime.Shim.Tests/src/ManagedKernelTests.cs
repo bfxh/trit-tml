@@ -615,6 +615,30 @@ public sealed class ManagedKernelTests : IDisposable
         Assert.Equal(Status.Arg, response.Status);
     }
 
+    /// <summary>
+    /// 批量载荷的 <c>count</c> 是 u32：坏载荷可以写 0xFFFF_FFFF。
+    /// 托管侧若直接按 count 分配，一条 20 字节的坏载荷就能让进程去申请几十 GB；
+    /// 必须先按剩余字节数夹一道，与原生侧「边读边解、读不动就报错」保持一致。
+    /// </summary>
+    [Theory]
+    [InlineData(Opcode.TxnApply, 4)]
+    [InlineData(Opcode.TxnSubmitBatch, 12)]
+    public void BatchCountLargerThanThePayloadIsRejected(uint opcode, int headerBytes)
+    {
+        var writer = new WireWriter(headerBytes + 10);
+        if (headerBytes == 12)
+        {
+            writer.U64(1);
+        }
+
+        writer.U32(1000); // 声称 1000 条，实际只给了 2 条（10 字节）
+        writer.U32(1).U8((byte)TritDelta.Pos);
+        writer.U32(2).U8((byte)TritDelta.Neg);
+
+        var response = kernel.Submit(opcode, writer.ToArray());
+        Assert.Equal(Status.Decode, response.Status);
+    }
+
     /// <summary>从快照字节里取出世界投影（剥掉 u64 ID 前缀与帧）。</summary>
     private static SortedDictionary<uint, TritDelta> WorldOf(byte[] snapshotBytes)
     {

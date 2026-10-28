@@ -437,6 +437,40 @@ public sealed class ParityTests
         }
     }
 
+    /// <summary>
+    /// 坏载荷必须在两条路径上给出<b>同一个</b>状态码：否则「托管回退」不是回退，
+    /// 而是换了一套故障表现（原生报 ARG、托管却 OOM 或静默成功）。
+    /// </summary>
+    [Fact]
+    public void BothKernelsRejectABatchCountLargerThanThePayload()
+    {
+        var pair = Pair();
+        if (pair is null)
+        {
+            return;
+        }
+
+        var (native, managed, _) = pair.Value;
+        try
+        {
+            var writer = new WireWriter(14);
+            writer.U32(1000); // 声称 1000 条，实际只给 2 条
+            writer.U32(1).U8((byte)TritDelta.Pos);
+            writer.U32(2).U8((byte)TritDelta.Neg);
+
+            var bad = writer.ToArray();
+            Assert.Equal(
+                native.Submit(Opcode.TxnApply, bad).Status,
+                managed.Submit(Opcode.TxnApply, bad).Status);
+            Assert.Equal(Status.Decode, managed.Submit(Opcode.TxnApply, bad).Status);
+        }
+        finally
+        {
+            native.Dispose();
+            managed.Dispose();
+        }
+    }
+
     private static TxnCommitResult CommitThreeStep(
         ITritKernel kernel,
         IReadOnlyList<uint> keys,

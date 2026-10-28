@@ -1923,6 +1923,7 @@ public sealed class ManagedKernel : ITritKernel
         var reader = new WireReader(payload);
         var txnId = reader.U64();
         var count = reader.U32();
+        GuardBatchCount(count, payload.Length, headerBytes: 12);
         var intents = new WriteIntent[count];
         for (int i = 0; i < count; i++)
         {
@@ -1968,6 +1969,7 @@ public sealed class ManagedKernel : ITritKernel
     {
         var reader = new WireReader(payload);
         var count = reader.U32();
+        GuardBatchCount(count, payload.Length, headerBytes: 4);
         var intents = new WriteIntent[count];
         for (int i = 0; i < count; i++)
         {
@@ -1983,6 +1985,31 @@ public sealed class ManagedKernel : ITritKernel
         stats.TxnsCommitted += 1;
         stats.IntentsApplied += applied;
         return new WireWriter().U32(applied).U64(logSeq).ToArray();
+    }
+
+    /// <summary>
+    /// 批量载荷的条数闸门：<c>count</c> 是载荷里的 u32，坏载荷可以是 0xFFFF_FFFF。
+    /// </summary>
+    /// <remarks>
+    /// 原生内核是边读边解、读不动就报 <c>TT_ERR_DECODE</c>，从不为 count 预先分配；
+    /// 托管这边如果直接 <c>new WriteIntent[count]</c>，一条 20 字节的坏载荷就能让进程
+    /// 去申请几十 GB。所以先按剩余字节数夹一道——而且必须报与原生**同一个**状态码
+    /// （<see cref="Status.Decode"/>），否则"托管回退"不是回退，而是换了一套故障表现。
+    /// </remarks>
+    private static void GuardBatchCount(uint count, int payloadLength, int headerBytes)
+    {
+        long available = (payloadLength - headerBytes) / 5;
+        if (available < 0)
+        {
+            available = 0;
+        }
+
+        if (count > (uint)available)
+        {
+            throw new RtException(
+                Status.Decode,
+                $"批量提交条数 {count} 超出载荷长度（最多 {available} 条）");
+        }
     }
 
     private byte[] OpTxnRollback(byte[] payload)

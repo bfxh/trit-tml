@@ -131,7 +131,7 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 |---|---|---|
 | Rust 内核测试 | ✅ 130/130（98 单测 + 5 确定性 + 16 FFI + 11 运行时） | `cargo test -p trit-rt --release` |
 | Rust clippy / fmt | ✅ 0 警告 / 干净 | `cargo clippy --all-targets`、`cargo fmt --check` |
-| C# 兼容壳测试 | ✅ 149/149 | `dotnet test`，含原生 vs 托管逐字节对拍 |
+| C# 兼容壳测试 | ✅ 152/152 | `dotnet test`，含原生 vs 托管逐字节对拍 |
 | 原生 / 托管语义等价 | ✅ 快照字节、统计、PRNG 流、冲突诊断全部对拍 | `ParityTests` |
 | 原生 / 托管**扫描结果逐字节等价** | ✅ 4 合法 + 5 非法 + 4 容错载荷，两侧 `JOB_POLL` 记录逐字节相同 | `ParallelApiTests.ManagedAndNativeScanResultsAgreeWhenV2NativeIsAvailable` |
 | 非法请求语义统一 | ✅ 非法 trit / 未知 kind / 缺 pattern / 超容量两侧都产生 `failed` 任务，`error` 文案逐字一致、无前缀 | `ParallelApiTests` + `crates/trit-rt` 测试 |
