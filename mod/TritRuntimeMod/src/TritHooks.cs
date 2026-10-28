@@ -43,6 +43,13 @@ internal sealed class TritHooks
     private int failures;
     private bool tripped;
 
+    /// <summary>同类周期性日志的最小间隔（秒）。</summary>
+    private const double MinLogIntervalSeconds = 15.0;
+
+    // 钩子是每秒 60 × 实体数 次的热路径：200 个 NPC / 1000 条弹幕就是每秒几万次。
+    // 观测一旦持续抛异常，不节流就是每秒几万条带完整栈回溯的日志。
+    private readonly ErrorThrottle hookErrorLog = new(MinLogIntervalSeconds);
+
     public TritHooks(TritRuntimeMod mod, TritSettings settings, WorldBridge bridge)
     {
         this.mod = mod;
@@ -180,14 +187,24 @@ internal sealed class TritHooks
         }
         catch (Exception ex)
         {
+            // 计数语义不变：**连续**失败才熔断。成功一次就归零是刻意的——
+            // 偶发的单条异常不该把整层观测停掉。代价是间歇性失败永远不会触发熔断，
+            // 于是"每次失败都打日志"会一直持续下去，所以日志必须另有节流兜底。
             failures++;
-            mod.Logger.Error($"[trit] 钩子 {name} 观测异常（连续第 {failures} 次）：{ex}");
+
+            if (hookErrorLog.ShouldLog(out int dropped))
+            {
+                mod.Logger.Error(
+                    $"[trit] 钩子 {name} 观测异常（连续第 {failures} 次）：{ex}" +
+                    (dropped > 0 ? $"（自上次报告以来又吞掉 {dropped} 次）" : string.Empty));
+            }
 
             int threshold = settings.MaxConsecutiveHookFailures;
             if (threshold > 0 && failures >= threshold)
             {
                 // 只置位不摘钩：在回调内部改动钩子链是不安全的。
                 // 置位后所有 Guarded 立即空转，orig 仍会被正常调用。
+                // 熔断这条**不节流**——它是状态变更，整个会话只可能发生一次。
                 tripped = true;
                 mod.Logger.Error($"[trit] 连续 {failures} 次异常，三进制观测层已停用（游戏逻辑不受影响）。");
             }

@@ -231,7 +231,27 @@ tick 驱动因此从 MonoMod 钩子改为官方 `ModSystem`（不依赖内部方
 | 1 | 游戏内 `Build` 报 **70 条 CS8632 警告**，本地 `dotnet build` 却是 0 警告 | tML 游戏内编译**不读** csproj 的 `<Nullable>`，源码里所有 `?` 注解被静默忽略 | 每个 `.cs` 首行加 `#nullable enable`（csproj 的属性对游戏内编译无效）；CI 加一步逐文件检查防回退 |
 | 2 | `WARN [FNA]: Image loading failed: unknown image type`（打包期） | `icon_small.png` 最初按 80×80 出的，规格要求 **30×30**；但换成正经 30×30、甚至换成 `icon_workshop.png` 的内容仍然报——**与文件内容无关，是按文件名触发的**（tML 2026.8.3.0 自身行为；其它模组根本不带这个文件，所以只有我们会撞上） | 图标仍按规格出（icon 80×80 / icon_small 30×30 / icon_workshop 512×512），警告定性为 tML 侧噪声，记录在案 |
 | 3 | `WARN: Failed to load icon_small.png. Reason: does not exist` | 同上，缺文件时人人都报（Calamity / Thorium / HEROsMod 全在报） | 已补文件，本模组不再报这条 |
-| 4 | `TritRuntimeMod AssemblyLoadContext still using memory`（卸载后） | 与别的模组那条 `mod class still using memory` 不同，是 ALC 级；模组侧无 Timer/后台线程/静态事件注册，**定位需要 heap dump** | 已知未修：只影响开发期热重载，功能与内存均无影响（内核与钩子在 `Unload` 里都已释放） |
+| 4 | `TritRuntimeMod AssemblyLoadContext still using memory`（卸载后） | 与别的模组那条 `mod class still using memory` 不同，是 ALC 级。**已用实验否掉头号假设**：见下 | 已知未修：只影响开发期热重载，功能与内存均无影响（内核与钩子在 `Unload` 里都已释放） |
+
+**关于 #4，做过一次定向实验（结论是"不是我们"）：** 头号怀疑对象是「原生库句柄没 `NativeLibrary.Free`」——
+`NativeApi.Dispose` 刻意不卸载模块（卸载后别的实例持有的函数指针会悬空），而 `NativeLibrary.Load`
+会把模块绑到**调用方程序集所在的 ALC**，`trit_rt.dll` 正是从兼容壳里加载的。
+于是写了最小复现（可收集 ALC → 在其中 `Load(trit_rt.dll)` → `Unload()` → 20 轮强制 GC → 弱引用是否还活）：
+
+| 组 | 操作 | ALC 卸载成功 |
+|---|---|---|
+| A | 基线：不加载原生库 | ✅ 卸载（**证明探针有分辨力**） |
+| B | 加载后**从不** `Free` | ✅ 卸载 |
+| C | 加载后 `Free` | ✅ 卸载 |
+| D | 显式绑 ALC 后不 `Free` | ✅ 卸载 |
+
+四组句柄都是同一个真实模块基址（`0x7FFFAA140000`），加载确实发生了。
+**结论：保留原生库句柄不阻止 ALC 卸载，"刻意不 Free"的决定因此仍然成立**——
+Free 了也不会改善，只会引入悬垂函数指针的风险。剩下的是 tML 自己的缓存与 GC 时机，不在我们能改的范围。
+
+（第一版探针四组全报"仍存活"，是**探针本身的错**：`Run` 的局部变量 `Assembly`/`MethodInfo`
+在栈帧里就把 ALC 钉住了。改成收集 GC 在栈帧退出之后做，基线立刻变 False，实验才有分辨力。
+这个坑值得记：验证"能不能卸载"时，验证代码自己往往就是那个引用。）
 
 另外日志里出现过一次 `KeyNotFoundException: CalamityMod.NPCs.CalamityGlobalNPC`，
 栈顶有 `TritRuntimeMod.TritHooks`——**不是本模组的问题**：异常来自 `CalamityMod...AresBody.AI()`，
@@ -289,6 +309,13 @@ tick 驱动因此从 MonoMod 钩子改为官方 `ModSystem`（不依赖内部方
 8. **`icon_small.png` 必须 30×30**（bestiary 过滤图标，与 80×80 的 `icon.png` 不同规格）；
    tML 打包时会为它打一条 `Image loading failed: unknown image type`——实测与文件内容无关
    （换成任何合法 PNG 都报），属 tML 侧噪声，不影响打包结果。
+9. **错误日志不能复用成功路径的节流槽**：`MaybeReportStats` 原本先 `Throttle(ref lastStatsLogAt)`
+   决定"打不打统计"，再 `try { Stats() } catch { Throttle(ref lastStatsLogAt) }` 决定"打不打失败告警"——
+   同一个槽在几微秒前刚被推进到"现在"，catch 里那次必然返回 false，
+   结果是**非 verbose 下"读取统计失败"永远打不出来**。错误日志必须各用独立的节流器。
+10. **设置里"采样上限"必须两头都夹**：`WorldBridge` 按 `new EntityState[MaxNpcs]` 开定长数组，
+    装载期一次性分配。只夹负数、不夹上界的话，设置文件里一个 `2000000000` 就是 80 GB 的分配请求，
+    表现为"模组本次会话不提供服务"——根因却只是一个数字打错。
 
 
 ## 不做什么

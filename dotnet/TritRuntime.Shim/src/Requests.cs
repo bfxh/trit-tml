@@ -1,3 +1,5 @@
+#nullable enable
+
 using System.Buffers;
 using System.Text.Json;
 using TritRuntime.Wire;

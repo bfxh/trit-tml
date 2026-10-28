@@ -88,6 +88,15 @@ internal sealed class WorldBridge
     private double lastStatusLogAt = double.NegativeInfinity;
     private bool warnedStaticGameTick;
 
+    // 错误日志各用一个节流器，绝不共用节流槽：
+    // 成功路径的节流（下面那几个 last*LogAt）会把槽的时间戳推到"现在"，
+    // 同一趟里再问一次就是 false——共用会导致错误告警永远打不出来。
+    // 影子对拍原本借的是 lastStatsLogAt，正是这个坑。
+    private readonly ErrorThrottle tickErrorLog = new(MinLogIntervalSeconds);
+    private readonly ErrorThrottle statsErrorLog = new(MinLogIntervalSeconds);
+    private readonly ErrorThrottle statusErrorLog = new(MinLogIntervalSeconds);
+    private readonly ErrorThrottle shadowLog = new(MinLogIntervalSeconds);
+
     private bool disposed;
 
     public WorldBridge(TritRuntimeMod mod, TritSettings settings, RuntimeShim shim)
@@ -302,7 +311,17 @@ internal sealed class WorldBridge
             // 桥接层任何异常都不允许冒到游戏主循环。
             // 不再尝试回滚：改成 TXN_APPLY 一步提交后，本类根本不开事务，
             // 不存在"悬挂事务"这回事，那次 Rollback(0) 只是往错误路径里塞一趟必定失败的 FFI。
-            mod.Logger.Error("[trit] tick 流水线异常，已跳过本 tick：" + ex);
+            //
+            // 必须节流：这里每 tick 都可能走到。内核一旦持续抛异常，
+            // 60 条/秒、每条一整份栈回溯，几分钟就能把日志推到几十 MB
+            // （真机踩过：4 分钟 13 MB / 8.9 万行）。吞掉几条要说出来，
+            // 否则"只报了一次"会让人误判成偶发。
+            if (tickErrorLog.ShouldLog(out int dropped))
+            {
+                mod.Logger.Error(
+                    "[trit] tick 流水线异常，已跳过本 tick：" + ex +
+                    (dropped > 0 ? $"（自上次报告以来又跳过 {dropped} 个 tick）" : string.Empty));
+            }
         }
         finally
         {
@@ -722,16 +741,20 @@ internal sealed class WorldBridge
             }
 
             string summary = differ.Recent.Count > 0 ? differ.Recent[0].Summary : "（无摘要）";
-            if (Throttle(ref lastStatsLogAt))
+            if (shadowLog.ShouldLog(out int dropped))
             {
-                mod.Logger.Warn($"[trit] 影子对拍发现不一致（tick={tick}）：{summary}");
+                mod.Logger.Warn(
+                    $"[trit] 影子对拍发现不一致（tick={tick}）：{summary}" +
+                    (dropped > 0 ? $"（期间又吞掉 {dropped} 条）" : string.Empty));
             }
         }
         catch (KernelException ex)
         {
-            if (Throttle(ref lastStatsLogAt))
+            if (shadowLog.ShouldLog(out int dropped))
             {
-                mod.Logger.Warn($"[trit] 影子对拍失败（tick={tick}）：{ex.Message}");
+                mod.Logger.Warn(
+                    $"[trit] 影子对拍失败（tick={tick}）：{ex.Message}" +
+                    (dropped > 0 ? $"（期间又吞掉 {dropped} 条）" : string.Empty));
             }
         }
     }
@@ -782,9 +805,13 @@ internal sealed class WorldBridge
         }
         catch (KernelException ex)
         {
-            if (Throttle(ref lastStatsLogAt))
+            // 这里不能用 lastStatsLogAt：上面的节流判断刚刚把它推到"现在"，
+            // 同一趟里再问必然是 false，等于非 verbose 下「读取统计失败」永不告警。
+            if (statsErrorLog.ShouldLog(out int dropped))
             {
-                mod.Logger.Warn($"[trit] 读取统计失败（tick={tick}）：{ex.Message}");
+                mod.Logger.Warn(
+                    $"[trit] 读取统计失败（tick={tick}）：{ex.Message}" +
+                    (dropped > 0 ? $"（期间又吞掉 {dropped} 条）" : string.Empty));
             }
         }
     }
@@ -835,9 +862,12 @@ internal sealed class WorldBridge
         }
         catch (KernelException ex)
         {
-            if (Throttle(ref lastStatusLogAt))
+            // 同上：不能复用 lastStatusLogAt，否则错误告警被成功路径的节流吞掉。
+            if (statusErrorLog.ShouldLog(out int dropped))
             {
-                mod.Logger.Warn($"[trit] 读取状态失败（tick={tick}）：{ex.Message}");
+                mod.Logger.Warn(
+                    $"[trit] 读取状态失败（tick={tick}）：{ex.Message}" +
+                    (dropped > 0 ? $"（期间又吞掉 {dropped} 条）" : string.Empty));
             }
         }
     }

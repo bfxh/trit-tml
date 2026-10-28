@@ -1,3 +1,5 @@
+#nullable enable
+
 using TritRuntime.Wire;
 
 namespace TritRuntime.Kernel;

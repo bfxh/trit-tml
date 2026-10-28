@@ -1,3 +1,5 @@
+#nullable enable
+
 using System.Runtime.InteropServices;
 using TritRuntime.Kernel;
 using TritRuntime.Wire;

@@ -1,3 +1,5 @@
+#nullable enable
+
 using TritRuntime.Kernel;
 using TritRuntime.Wire;
 using Xunit;

@@ -1,3 +1,5 @@
+#nullable enable
+
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;

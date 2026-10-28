@@ -50,6 +50,24 @@ public sealed class TritSettings
     /// <summary>每 tick 取回任务结果数上限。</summary>
     public const int MaxPollJobsPerTick = 256;
 
+    /// <summary>
+    /// 采样槽位上限：每 tick 最多跟踪多少个 NPC。
+    /// </summary>
+    /// <remarks>
+    /// <b>这个上限是内存护栏，不是性能建议。</b> <c>WorldBridge</c> 按
+    /// <c>new EntityState[MaxNpcs]</c> 直接开定长数组（40 字节/项），装载期一次性分配。
+    /// 设置文件里写一个 <c>2000000000</c>，装载时就是 80 GB 的分配请求 ——
+    /// 表现是"模组本次会话不提供服务"（异常被装配流程吞掉），根因却是一个数字打错。
+    /// 8192 项 ≈ 320 KB，放得下任何现实世界，也放不下任何手滑。
+    /// </remarks>
+    public const int MaxNpcsLimit = 8192;
+
+    /// <summary>采样槽位上限：每 tick 最多跟踪多少条弹幕（16384 项 ≈ 640 KB）。</summary>
+    public const int MaxProjectilesLimit = 16384;
+
+    /// <summary>采样槽位上限：每 tick 最多跟踪多少名玩家（1024 项 ≈ 40 KB）。</summary>
+    public const int MaxPlayersLimit = 1024;
+
     /// <summary>是否安装 Terraria.On_* 观测钩子。</summary>
     [JsonPropertyName("enableHooks")]
     public bool EnableHooks { get; set; } = true;
@@ -251,20 +269,11 @@ public sealed class TritSettings
     /// <summary>把明显不合理的值夹回安全范围。</summary>
     public void Sanitize()
     {
-        if (MaxNpcs < 0)
-        {
-            MaxNpcs = 0;
-        }
-
-        if (MaxProjectiles < 0)
-        {
-            MaxProjectiles = 0;
-        }
-
-        if (MaxPlayers < 0)
-        {
-            MaxPlayers = 0;
-        }
+        // 采样上限两头都要夹：负数没有意义，而**过大的值是内存问题**——
+        // 桥接层按这个数开定长数组，不夹住就是一个数字打错让模组装不起来。
+        MaxNpcs = Clamp(MaxNpcs, 0, MaxNpcsLimit);
+        MaxProjectiles = Clamp(MaxProjectiles, 0, MaxProjectilesLimit);
+        MaxPlayers = Clamp(MaxPlayers, 0, MaxPlayersLimit);
 
         if (SnapshotIntervalTicks < 0)
         {

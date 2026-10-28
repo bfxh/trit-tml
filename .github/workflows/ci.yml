@@ -81,14 +81,33 @@ jobs:
       # tML 在**游戏内**编译模组源码时不读 csproj 的 <Nullable>（实测：70 条 CS8632 警告，
       # 等于所有 `?` 注解在游戏内构建里被静默忽略）。只有文件内的 `#nullable enable` 有效，
       # 所以这里逐文件检查，防止有人新加文件时漏掉——漏了本地编译仍然是 0 警告，看不出来。
-      - name: 模组源码可空上下文
+      #
+      # 范围是全仓 C# 源码而不只是模组：兼容壳与测试目前都由自己的 csproj 构建、
+      # 走的是正确的可空上下文，但"依赖工程级设置"正是这次踩坑的根因——
+      # 一旦有人换了构建管线（发布脚本、游戏内构建、被别的工程当源码引入），
+      # 注解就会在同一份代码上静默失效。写进文件里，任何管线都吃同一套语义。
+      - name: C# 源码可空上下文
         shell: bash
         run: |
           missing=0
-          for f in mod/TritRuntimeMod/src/*.cs; do
+          for f in mod/TritRuntimeMod/src/*.cs \
+                   dotnet/TritRuntime.Shim/src/*.cs \
+                   dotnet/TritRuntime.Shim.Tests/src/*.cs; do
             head -3 "$f" | grep -q '#nullable enable' || { echo "缺少 #nullable enable：$f"; missing=1; }
           done
           exit $missing
+
+      # 上一条是"逐文件有指令"，这一条是"指令真的生效"：
+      # 强制 Nullable=disable 构建，若还有 CS8632，说明某个文件的 `?` 注解白写了。
+      # （全局属性会同时作用到被引用工程，正好把兼容壳也一起验了。）
+      - name: 任意可空设置下都不出 CS8632
+        shell: bash
+        run: |
+          dotnet build dotnet/TritRuntime.Shim.Tests/TritRuntime.Shim.Tests.csproj \
+            -c Release --nologo -p:Nullable=disable 2>&1 | tee /tmp/nullable.log
+          n=$(grep -c 'CS8632' /tmp/nullable.log || true)
+          echo "CS8632 条数：$n"
+          [ "$n" -eq 0 ]
 
 # 模组工程（mod/TritRuntimeMod）的编译与 .tmod 打包刻意不进 CI：
 # 它依赖本机安装的 tModLoader（tMLMod.targets、tModLoader.dll、Libraries/**），
