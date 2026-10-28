@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using TritRuntime.Wire;
 
 namespace TritRuntime.Kernel;
@@ -251,6 +252,53 @@ public sealed class RuntimeShim : IDisposable
 
     /// <summary>统计计数器。</summary>
     public ulong[] Stats() => host.Kernel.Stats();
+
+    /// <summary>世界投影车道数。</summary>
+    public uint WorldSize() => QueryU32(QueryId.WorldSize);
+
+    /// <summary>事务日志条数（每条约 5 字节，乘一下就是这个内核常驻的大头）。</summary>
+    public ulong LogLen() => QueryU64(QueryId.LogLen);
+
+    /// <summary>已建立的快照数。</summary>
+    public uint SnapshotCount() => QueryU32(QueryId.SnapshotCount);
+
+    private uint QueryU32(uint queryId)
+    {
+        var response = host.Kernel.Submit(Opcode.Query, Requests.Query(queryId));
+        if (!response.IsOk || response.Payload.Length < 4)
+        {
+            throw new KernelException(response.Status, $"查询 {queryId} 失败：{response.Payload.Length} 字节");
+        }
+
+        return BinaryPrimitives.ReadUInt32LittleEndian(response.Payload);
+    }
+
+    private ulong QueryU64(uint queryId)
+    {
+        var response = host.Kernel.Submit(Opcode.Query, Requests.Query(queryId));
+        if (!response.IsOk || response.Payload.Length < 8)
+        {
+            throw new KernelException(response.Status, $"查询 {queryId} 失败：{response.Payload.Length} 字节");
+        }
+
+        return BinaryPrimitives.ReadUInt64LittleEndian(response.Payload);
+    }
+
+    /// <summary>
+    /// 会话复位：把世界投影 / 日志 / 快照 / 事务 / 事件载荷 / 任务结果全部清空。
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> = 内核确实复位了；
+    /// <see langword="false"/> = 当前内核不认识这个操作（例如旧版原生库），
+    /// 此时什么都没发生——<b>不复位只是继续占内存，功能不受影响</b>，
+    /// 调用方不需要当成错误处理。
+    /// </returns>
+    /// <remarks>
+    /// 进出存档时调用。它是可选的：老原生库返回"未知 opcode"，
+    /// 所以没有因为它递增 <c>ABI_VERSION</c>（详见 <see cref="Opcode.SessionReset"/>）。
+    /// </remarks>
+    public bool ResetSession() =>
+        host.Kernel.Submit(Opcode.SessionReset, Array.Empty<byte>()).IsOk;
 
     /// <summary>
     /// <c>Mod.Call</c> 契约入口。模组侧这样暴露：

@@ -22,7 +22,7 @@ use trit_schedule::{
     run_resumable_threaded, run_runtime,
 };
 
-use crate::budget::{Admission, GlobalBudget};
+use crate::budget::{Admission, GlobalBudget, MEMORY_UNIT_BYTES};
 use crate::error::RtError;
 use crate::gpu::{GpuBackend, GpuConfig, GpuPolicy, GpuStatus};
 use crate::scan::{JobRecord, JobSlots, JobState, ScanJob, ScanKind, ScanRequest};
@@ -34,6 +34,40 @@ use crate::scan::{JobRecord, JobSlots, JobState, ScanJob, ScanKind, ScanRequest}
 /// 这个字段进了 `JOB_POLL` 的响应体，差一个字符影子差分就一直报分歧。
 const FAILED_BACKEND: &str = "";
 
+/// 完成结果最多积压多少条（之后丢弃最旧的一条）。
+///
+/// 正常路径下本模组每 tick 都轮询，队列恒为空的几十条；这个上限只在
+/// **调用方长期不轮询**时才起作用（本模组在轮询抛异常后会永久关闭轮询，
+/// 另一个模组也可能自己提交了却再也不取）。没有上限时，结果队列就是
+/// 一条只进不出的内存增长通道。
+const MAX_PENDING_RESULTS: usize = 8192;
+
+/// 「在飞载荷」字节预算（排队 + 在跑）。
+///
+/// 为什么必须有：任务池的队列是**无界**的，而每个排队任务都完整持有自己的
+/// trits 载荷。原来只有「在跑任务数 ≤ cpu 容量」和「同 mod 在跑数」两道闸，
+/// 于是提交一万个 4 MiB 的扫描 = 40 GiB 排在那里，游戏进程直接 OOM——
+/// 而提交方看到的只是「提交成功」。现在载荷总量超过 `memory_capacity`
+/// 就直接产生一条失败记录（与其它容量拒绝同口径），绝不静默吃内存。
+fn payload_capacity_bytes(config: &ParallelConfig) -> u64 {
+    u64::from(config.resolved_memory_capacity()) * MEMORY_UNIT_BYTES as u64
+}
+
+/// 尝试占住 `bytes` 字节的在飞载荷；超预算立刻退回占位并返回 `false`。
+fn reserve_payload(resident: &AtomicU64, cap_bytes: u64, bytes: u64) -> bool {
+    let before = resident.fetch_add(bytes, Ordering::AcqRel);
+    if before.saturating_add(bytes) > cap_bytes {
+        resident.fetch_sub(bytes, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
+/// 任务出队/跑完，归还载荷占位。
+fn release_payload(resident: &AtomicU64, bytes: u64) {
+    resident.fetch_sub(bytes, Ordering::AcqRel);
+}
+
 /// 任务池配置（运行时配置 JSON 的 `parallel` 段）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -43,7 +77,10 @@ pub struct ParallelConfig {
     /// 全局 CPU 槽位上限；0 = 自动（等于 worker 数）。旁路层不该把 CPU 吃满，
     /// 游戏主线程还要跑。
     pub cpu_capacity: u32,
-    /// 全局内存预算（单位 1 MiB）。
+    /// 全局内存预算（单位 1 MiB）：**排队 + 在跑**任务的载荷总量上限。
+    ///
+    /// 两个用途：单任务载荷超过它就是「永远放不下」（`Reject`）；
+    /// 所有在飞载荷加起来超过它，新提交也按容量拒绝，队列不会无界增长。
     pub memory_capacity: u32,
     /// 同一 owner 同时在跑的任务上限（防独占）。
     pub per_mod_inflight: usize,
@@ -110,6 +147,8 @@ struct QueuedJob {
     request: ScanRequest,
     kind: ScanKind,
     resources: Resources,
+    /// 载荷字节数：入队时从「在飞载荷」预算里占住，出队/跑完时归还。
+    bytes: u64,
     cancel: Arc<AtomicBool>,
     slots: Arc<JobSlots>,
 }
@@ -128,6 +167,8 @@ pub struct JobPool {
     flags: JobFlags,
     cancel: CancelToken,
     next_id: AtomicU64,
+    /// 当前「在飞载荷」字节数（排队 + 在跑），由 [`reserve_payload`] / [`release_payload`] 维护。
+    resident: Arc<AtomicU64>,
     worker: Option<thread::JoinHandle<()>>,
     config: ParallelConfig,
 }
@@ -151,6 +192,7 @@ impl JobPool {
         let metrics = Arc::new(Mutex::new(None));
         let flags: JobFlags = Arc::new(Mutex::new(HashMap::new()));
         let cancel = CancelToken::new();
+        let resident = Arc::new(AtomicU64::new(0));
 
         let worker = thread::Builder::new()
             .name("trit-rt-pool".to_string())
@@ -161,8 +203,11 @@ impl JobPool {
                 let metrics = Arc::clone(&metrics);
                 let flags = Arc::clone(&flags);
                 let cancel = cancel.clone();
+                let resident = Arc::clone(&resident);
                 move || {
-                    worker_loop(config, rx, results, budget, gpu, metrics, flags, cancel);
+                    worker_loop(
+                        config, rx, results, budget, gpu, metrics, flags, cancel, resident,
+                    );
                 }
             })
             .ok();
@@ -176,6 +221,7 @@ impl JobPool {
             flags,
             cancel,
             next_id: AtomicU64::new(1),
+            resident,
             worker,
             config,
         }
@@ -260,6 +306,43 @@ impl JobPool {
             return Ok(id);
         }
 
+        // 队列无界、每个排队任务都完整持有载荷：先占住预算再入队，
+        // 占不到就按容量拒绝（产生失败记录，与其它容量拒绝同口径）。
+        let bytes = request.payload_bytes() as u64;
+        let payload_cap = payload_capacity_bytes(&self.config);
+        if !reserve_payload(&self.resident, payload_cap, bytes) {
+            self.budget
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .on_reject(&request.owner);
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let mut record = JobRecord::new(
+                id,
+                &request.owner,
+                kind.as_str(),
+                JobState::Failed,
+                0,
+                FAILED_BACKEND,
+            );
+            record.error = if bytes > payload_cap {
+                // 单个任务就比整个预算还大：永远排不进去，与「超过全局容量」同口径。
+                format!(
+                    "任务需求 cpu={} memory={} 超过全局容量 cpu={} memory={}",
+                    resources.cpu,
+                    resources.memory,
+                    self.config.resolved_cpu_capacity(),
+                    self.config.resolved_memory_capacity()
+                )
+            } else {
+                format!(
+                    "在飞载荷预算已满（排队 + 在跑合计上限 {} MiB），本任务 {bytes} 字节被拒绝",
+                    payload_cap / MEMORY_UNIT_BYTES as u64
+                )
+            };
+            self.push(record);
+            return Ok(id);
+        }
+
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         self.flags
@@ -273,20 +356,46 @@ impl JobPool {
             request,
             kind,
             resources,
+            bytes,
             cancel,
             slots: Arc::new(JobSlots::default()),
         };
 
         match self.tx.as_ref() {
-            Some(tx) => tx
-                .send(job)
-                .map_err(|_| RtError::InvalidInput("任务池已关闭".to_string()))?,
+            Some(tx) => {
+                if tx.send(job).is_err() {
+                    // 通道关了 = worker 已退出：把刚占住的预算退回去，别留下假占用。
+                    release_payload(&self.resident, bytes);
+                    return Err(RtError::InvalidInput("任务池已关闭".to_string()));
+                }
+            }
             None => {
                 // worker 没起来（线程创建失败）：退化成同步执行，保证调用方仍拿到结果。
                 self.run_inline(job);
             }
         }
         Ok(id)
+    }
+
+    /// 会话复位：取消所有排队/在跑任务，并清空已完成的结果队列。
+    ///
+    /// 用于退出存档：旧世界的扫描任务跑到一半没有任何意义，它们的结果也不该
+    /// 混进下一张存档被谁取走。取消是协作式的（步骤边界退出），不会强杀线程；
+    /// 被取消的任务仍会照常产出 `cancelled` 记录，但队列在复位时已经清空了。
+    pub fn reset_session(&self) {
+        {
+            let flags = self
+                .flags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (_, cancel) in flags.values() {
+                cancel.store(true, Ordering::Release);
+            }
+        }
+        self.results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     /// 取出已完成的任务结果（取出即出队）。
@@ -506,6 +615,7 @@ impl JobPool {
             owner,
             request,
             kind,
+            bytes,
             cancel,
             slots,
             ..
@@ -524,6 +634,7 @@ impl JobPool {
         let steps = record.steps;
         let state = JobState::from_name(&record.state);
         self.push(record);
+        release_payload(&self.resident, bytes);
         let mut budget = self
             .budget
             .lock()
@@ -537,10 +648,7 @@ impl JobPool {
     }
 
     fn push(&self, record: JobRecord) {
-        self.results
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(record);
+        push_record(&self.results, record);
     }
 }
 
@@ -566,6 +674,7 @@ fn worker_loop(
     metrics: Arc<Mutex<Option<RuntimeMetrics>>>,
     flags: JobFlags,
     cancel: CancelToken,
+    resident: Arc<AtomicU64>,
 ) {
     let capacity = Resources::new(
         config.resolved_cpu_capacity(),
@@ -607,6 +716,7 @@ fn worker_loop(
             &results,
             capacity,
             config.resolved_max_batch(),
+            &resident,
         );
         if batch.is_empty() {
             // 全被"同一 mod 在跑上限"挡住了：等一会儿再试，不空转。
@@ -729,14 +839,20 @@ fn worker_loop(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&job.id);
+            // 任务已经跑完/被丢弃：它持有的载荷随 job 一起在这里释放，预算同步归还。
+            release_payload(&resident, job.bytes);
         }
     }
 }
 
 fn push_record(sink: &Arc<Mutex<Vec<JobRecord>>>, record: JobRecord) {
-    sink.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(record);
+    let mut queue = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if queue.len() >= MAX_PENDING_RESULTS {
+        // 调用方长期不轮询（例如它自己把轮询关掉了）：丢最旧的一条，保住最新结果。
+        // 没有这一步，结果队列就是一条只进不出的内存增长通道。
+        queue.remove(0);
+    }
+    queue.push(record);
 }
 
 /// 从队首挑一批能跑的任务；被"同 mod 上限"挡住的留在队列里。
@@ -746,6 +862,7 @@ fn take_batch(
     sink: &Arc<Mutex<Vec<JobRecord>>>,
     capacity: Resources,
     max_batch: usize,
+    resident: &Arc<AtomicU64>,
 ) -> Vec<QueuedJob> {
     let mut batch = Vec::new();
     let mut used = Resources::default();
@@ -777,6 +894,8 @@ fn take_batch(
             job.slots.set(JobState::Failed, 0);
             push_record(sink, record);
             let job = pending.remove(index).expect("下标在界内");
+            // 判失败出队 = 载荷永远跑不到，立刻归还它占的预算，否则预算会被死任务吃掉。
+            release_payload(resident, job.bytes);
             let mut budget_guard = budget
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -970,6 +1089,57 @@ mod tests {
             records[0].error
         );
         assert_eq!(records[0].backend, FAILED_BACKEND);
+    }
+
+    #[test]
+    fn the_queued_payload_total_is_capped_by_the_memory_budget() {
+        // 预算 8 MiB：连发 8 个 2 MiB 的扫描。前几个排进去，后面的必须在提交时
+        // 就被拒（变成失败记录），不能让它们无声无息地排在内存里。
+        let pool = JobPool::new(
+            ParallelConfig {
+                workers: 1,
+                per_mod_inflight: 64,
+                scan_chunk: 1 << 20,
+                memory_capacity: 8,
+                ..ParallelConfig::default()
+            },
+            GpuConfig::default(),
+        );
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            ids.push(
+                pool.submit(request("m", ScanKind::Histogram, vec![1; 2 << 20]))
+                    .expect("提交本身不该失败"),
+            );
+        }
+        let records = poll_until(&pool, ids.len(), Duration::from_secs(20));
+        assert_eq!(records.len(), ids.len(), "每个提交都要有一条记录");
+        let rejected = records
+            .iter()
+            .filter(|record| record.error.contains("在飞载荷预算已满"))
+            .count();
+        assert!(rejected > 0, "总载荷超出预算时必须拒绝一部分：{records:?}");
+        assert!(
+            pool.resident.load(Ordering::Relaxed) <= 8 << 20,
+            "在飞载荷永远不该超过预算，实际 {} 字节",
+            pool.resident.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn a_finished_job_returns_its_payload_budget() {
+        let pool = pool(2, 2);
+        let _ = pool
+            .submit(request("m", ScanKind::Histogram, vec![1; 512]))
+            .unwrap();
+        let records = poll_until(&pool, 1, Duration::from_secs(5));
+        assert_eq!(records.len(), 1);
+        // 排队占的预算必须在跑完后归还，否则长时间跑下去预算会被"已结束"的任务吃光。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pool.resident.load(Ordering::Relaxed) != 0 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(pool.resident.load(Ordering::Relaxed), 0);
     }
 
     #[test]

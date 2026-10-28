@@ -24,17 +24,18 @@ pub enum TxnState {
 
 /// 一条已落地的事务记录（日志项）。
 ///
-/// 这是**逻辑视图**，物理上日志按列存储（见 [`TxnLog`]）：每条 `LogEntry` 若
-/// 独立成结构体会按 8 字节对齐占 32 字节，而这个结构里有 u64、u32、u8 混排，
-/// 浪费近一半空间。1M 条日志就是 32MB vs 17MB 的差别——对游戏进程是要命的比例。
+/// 这是**逻辑视图**，物理上日志按列存储（见 [`TxnLog`]），逐条还原成这个
+/// 结构只是给诊断/测试一个方便的形状。
+///
+/// **刻意不存 `txn_id` 与 `tick`**：两者都是「这条记录是谁在什么时候写的」，
+/// 而没有任何代码路径读它们——重放只需要 `(key, delta)`，回滚靠快照的完整
+/// 世界投影，冲突诊断读的是**未落地**意图而不是日志。存它们要每条约
+/// 12 字节：100 万条就是 12MB 常驻，换来的信息一次都没被读过。
+/// 真需要按 tick 定位时，用相邻快照的 `(tick, log_seq)` 锚点夹出区间即可。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogEntry {
-    /// 事务 ID。
-    pub txn_id: u64,
     /// 日志序列号（从 1 开始）。
     pub seq: u64,
-    /// 落地时的 tick。
-    pub tick: u64,
     /// 世界键。
     pub key: u32,
     /// 仲裁后的增量。
@@ -68,22 +69,21 @@ impl Txn {
 /// 事务日志。
 ///
 /// **按列（SoA）存储**，不是 `Vec<LogEntry>`：日志条目是本进程里最大的常驻
-/// 结构（默认上限 100 万条），而 `LogEntry` 混排 u64/u32/u8，逐条对齐后要
-/// 32 字节。拆成 4 个并列数组后是 4+1+4+8 = 17 字节/条，同样的上限直接省下
-/// 15MB（实测 1M 条常驻从 ~32MB 降到 ~17MB）。
+/// 结构（默认上限 100 万条），而 `LogEntry` 里 u64/u32/u8 混排，逐条对齐后
+/// 要 32 字节。拆成并列数组后每条只留**真正参与重放的两列** `key u32` +
+/// `delta u8` = **5 字节**，1M 条上限常驻约 5MB。
 ///
-/// `seq` 不单独存：日志只追加、且截断永远切前缀，所以第 `i` 条的序号恒等于
-/// `base_seq + 1 + i`，用算术即可还原，没必要每条再存 8 字节。
+/// 三样东西刻意不存：
+/// - `seq`：日志只追加、截断永远切前缀，第 `i` 条序号恒为 `base_seq + 1 + i`；
+/// - `txn_id`（8 字节/条）+ `tick`（4 字节/条）：没有代码路径读它们。重放只要
+///   `(key, delta)`，回滚靠快照的完整世界投影，冲突诊断读的是未落地意图。
+///   这两列曾是 1M 条 12MB 常驻，纯粹为「将来可能要用」付的账。
 #[derive(Debug, Clone, Default)]
 pub struct TxnLog {
     /// 世界键，每条一个。
     keys: Vec<u32>,
     /// 仲裁后的增量（1/0/2 → u8）。
     deltas: Vec<u8>,
-    /// 落地时的 tick。u32 足够：42 亿 tick ≈ 2.2 年连续游戏。
-    ticks: Vec<u32>,
-    /// 事务 ID（u64，事务表 id 也是 u64，不做窄化以免长期运行后静默错配）。
-    txn_ids: Vec<u64>,
     /// 已被截断掉的最后一条序号；`seq_at(0) = base_seq + 1`。
     base_seq: u64,
     /// 全局单调序号（= 最后一条的 seq）。
@@ -96,19 +96,12 @@ impl TxnLog {
     }
 
     /// 追加一条已仲裁落地的记录。
-    pub fn append(&mut self, txn_id: u64, tick: u64, resolved: &ResolvedIntent) -> LogEntry {
+    pub fn append(&mut self, resolved: &ResolvedIntent) -> LogEntry {
         self.next_seq += 1;
-        // tick 窄化到 u32：超出范围的 tick 在游戏里不可能出现，但静默截断会
-        // 让回放对不上——用饱和转换把异常值钉在 u32::MAX，至少不会回绕成 0。
-        let tick32 = u32::try_from(tick).unwrap_or(u32::MAX);
         self.keys.push(resolved.key);
         self.deltas.push(resolved.delta as u8);
-        self.ticks.push(tick32);
-        self.txn_ids.push(txn_id);
         LogEntry {
-            txn_id,
             seq: self.next_seq,
-            tick,
             key: resolved.key,
             delta: resolved.delta,
         }
@@ -163,9 +156,7 @@ impl TxnLog {
     pub fn replay_from(&self, seq: u64) -> impl Iterator<Item = LogEntry> + '_ {
         let start = self.start_after(seq);
         (start..self.len()).map(move |index| LogEntry {
-            txn_id: self.txn_ids[index],
             seq: self.seq_at(index),
-            tick: self.ticks[index] as u64,
             key: self.keys[index],
             delta: crate::wire::trit_from_byte(self.deltas[index]),
         })
@@ -173,7 +164,7 @@ impl TxnLog {
 
     /// 丢弃序号 `<= seq` 的记录（保留更晚的记录）。
     ///
-    /// 记录按 seq 升序连续存储，前缀长度可以直接算出；四列必须一起切，
+    /// 记录按 seq 升序连续存储，前缀长度可以直接算出；两列必须一起切，
     /// 否则下标会错位。`next_seq` 保持单调，不影响 `seq()` 与 `replay_from`。
     /// 调用方须保证 `seq` 不高于任一仍需回滚/重放的快照锚点。
     pub fn truncate_before(&mut self, seq: u64) {
@@ -187,8 +178,6 @@ impl TxnLog {
         }
         self.keys.drain(0..cut);
         self.deltas.drain(0..cut);
-        self.ticks.drain(0..cut);
-        self.txn_ids.drain(0..cut);
         self.base_seq += cut as u64;
     }
 }
@@ -381,22 +370,14 @@ mod tests {
     #[test]
     fn log_is_append_only_and_replays_forward() {
         let mut log = TxnLog::new();
-        let first = log.append(
-            1,
-            0,
-            &ResolvedIntent {
-                key: 1,
-                delta: Ternary::True,
-            },
-        );
-        log.append(
-            1,
-            0,
-            &ResolvedIntent {
-                key: 2,
-                delta: Ternary::False,
-            },
-        );
+        let first = log.append(&ResolvedIntent {
+            key: 1,
+            delta: Ternary::True,
+        });
+        log.append(&ResolvedIntent {
+            key: 2,
+            delta: Ternary::False,
+        });
         assert_eq!(log.len(), 2);
         assert_eq!(log.seq(), 2);
         assert!(!log.is_full(8));

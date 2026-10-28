@@ -17,8 +17,12 @@ namespace TritRuntime.Kernel;
 /// </remarks>
 public sealed class NativeKernel : ITritKernel
 {
-    /// <summary>本机期望的 ABI 版本；v2 新增并行任务池、GPU 与全局预算 opcode。</summary>
-    public const uint ExpectedAbiVersion = 2;
+    /// <summary>
+    /// 本机期望的 ABI 版本。v2 新增并行任务池 / GPU / 全局预算；v3 新增
+    /// <c>0x1A TXN_SUBMIT_BATCH</c> 且本壳每 tick 都用它，所以老 DLL 必须被
+    /// 这里挡下（否则每 tick 都吃 BAD_OP，表象是模组完全失效）。
+    /// </summary>
+    public const uint ExpectedAbiVersion = 3;
 
     /// <summary>本机期望的最低运行时版本（0.1.0）。</summary>
     public const uint MinimumRuntimeVersion = 0x00_01_00_00;

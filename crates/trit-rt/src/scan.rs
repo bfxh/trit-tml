@@ -290,10 +290,17 @@ impl ScanRequest {
         normalize_owner(&self.owner)
     }
 
+    /// 载荷实际占用的字节数（`trits` + `pattern`）。
+    ///
+    /// 队列里的每个任务都把这份载荷**整个**拿在手里，直到它跑完——
+    /// 排队本身就要吃内存，所以任务池按这个数做「在飞载荷」预算。
+    pub fn payload_bytes(&self) -> usize {
+        self.trits.len().saturating_add(self.pattern.len())
+    }
+
     /// 任务占用的资源：1 个 CPU 槽位 + 载荷字节数换算的内存单位（至少 1）。
     pub fn resources(&self) -> Resources {
-        let bytes = self.trits.len().saturating_add(self.pattern.len());
-        Resources::new(1, memory_units(bytes).max(1))
+        Resources::new(1, memory_units(self.payload_bytes()).max(1))
     }
 }
 

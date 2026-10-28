@@ -67,10 +67,13 @@ public sealed class ManagedConfig
             return new ManagedConfig
             {
                 Seed = dto.Seed ?? 0x5EED_1234,
-                MaxSubscribers = dto.MaxSubscribers ?? 65_536,
-                MaxOpenTxns = dto.MaxOpenTxns ?? 4_096,
-                MaxSnapshots = dto.MaxSnapshots ?? 64,
-                MaxLogEntries = dto.MaxLogEntries ?? (1 << 20),
+                // 容量下限必须与 Rust 侧 RuntimeConfig::sanitize 完全一致：
+                // 两个内核在同一份坏配置下要表现得一样，否则回退到托管路径时
+                // 才会暴露「日志永远是满的」这类停摆问题。
+                MaxSubscribers = Math.Max(1, dto.MaxSubscribers ?? 65_536),
+                MaxOpenTxns = Math.Max(1, dto.MaxOpenTxns ?? 4_096),
+                MaxSnapshots = Math.Max(1, dto.MaxSnapshots ?? 64),
+                MaxLogEntries = Math.Max(4_096, dto.MaxLogEntries ?? (1 << 20)),
                 Arbitration = ParseArbitration(dto.Arbitration),
                 Shadow = dto.Shadow ?? true,
             };
@@ -779,13 +782,16 @@ public sealed class ManagedKernel : ITritKernel
     public const int MaxPrngCount = 1 << 16;
 
     private readonly ManagedConfig config;
+    // 这三个**不是** readonly：会话复位时整实例替换，比逐个 Clear() 更容易保证
+    // 「一点旧状态都不留」（尤其是 TxnLog 的内部容量）。
+    // 路由器不替换：订阅关系属于"模组装载期"，跨存档依然有效。
     private readonly EventRouter router;
-    private readonly TxnLog log = new();
-    private readonly TxnTable txns;
+    private TxnLog log = new();
+    private TxnTable txns;
     private readonly SortedDictionary<uint, TritDelta> world = new();
     private readonly SortedDictionary<ulong, SnapshotRecord> snapshots = new();
     private readonly SortedDictionary<uint, TritDelta[]> eventPayloads = new();
-    private readonly DeterministicPrng prng;
+    private DeterministicPrng prng;
     private readonly ShadowLog shadow = new();
     private readonly Stats stats = new();
     /// <summary>已完成任务队列；由 <see cref="scanGate"/> 保护。</summary>
@@ -1099,6 +1105,37 @@ public sealed class ManagedKernel : ITritKernel
         return applied;
     }
 
+    /// <summary>
+    /// 会话复位：清空与"这张存档"相关的一切状态，保留配置与跨存档统计。
+    /// </summary>
+    /// <remarks>
+    /// 与原生内核 <c>0x1B SESSION_RESET</c> 同语义（见 <see cref="Opcode.SessionReset"/>）：
+    /// 世界投影 / 日志 / 快照 / 事务 / 事件载荷 / 已完成任务 / tick / PRNG 全部归零，
+    /// 订阅者与统计计数器保留。进出存档时各调一次。
+    /// </remarks>
+    public void ResetSession()
+    {
+        lock (scanGate)
+        {
+            world.Clear();
+            snapshots.Clear();
+            eventPayloads.Clear();
+            completedJobs.Clear();
+            nextSnapshotId = 0;
+            tick = 0;
+            // 换实例而不是 Clear()：连内部容量一起丢掉，不会留下上一张存档撑出来的大数组。
+            // 订阅者**不动**：订阅关系属于模组装载期，跨存档依然有效，
+            // 清掉会让 WorldBridge 持有的 sub id 全部失效（派发静默停止）。
+            log = new TxnLog();
+            txns = new TxnTable(config.MaxOpenTxns);
+            prng = new DeterministicPrng(0);
+            shadow.Compared = 0;
+            shadow.Divergences = 0;
+            shadow.Recent.Clear();
+            lastError = string.Empty;
+        }
+    }
+
     /// <summary>销毁（托管内核无外部资源，保留以统一生命周期）。</summary>
     public void Dispose()
     {
@@ -1145,8 +1182,20 @@ public sealed class ManagedKernel : ITritKernel
             Opcode.GpuStatus => OpGpuStatus(payload),
             Opcode.Budget => OpBudget(),
             Opcode.Metrics => OpMetrics(),
+            Opcode.SessionReset => OpSessionReset(payload),
             _ => throw new RtException(Status.Arg, $"输入非法：未知 opcode {opcode:#x}"),
         };
+    }
+
+    private byte[] OpSessionReset(byte[] payload)
+    {
+        if (payload.Length != 0)
+        {
+            throw new RtException(Status.Arg, $"输入非法：SESSION_RESET 不接受载荷，收到 {payload.Length} 字节");
+        }
+
+        ResetSession();
+        return Array.Empty<byte>();
     }
 
     private byte[] OpScanSubmit(byte[] payload)

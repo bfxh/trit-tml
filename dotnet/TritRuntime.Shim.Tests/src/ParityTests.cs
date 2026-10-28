@@ -170,6 +170,50 @@ public sealed class ParityTests
     }
 
     [Fact]
+    public void SessionResetLeavesBothKernelsInTheSameEmptyState()
+    {
+        var pair = Pair();
+        if (pair is null)
+        {
+            return;
+        }
+
+        var (native, managed, _) = pair.Value;
+        try
+        {
+            // 先让两个内核都攒出真实状态（世界车道 / 日志 / 快照 / 事件），
+            // 再各自复位，然后逐项对拍：复位后的状态必须完全一致，
+            // 否则"退出存档"在原生内核和托管回退上会留下不同的起点。
+            BuildComparableWorld(native);
+            BuildComparableWorld(managed);
+            native.Snapshot();
+            managed.Snapshot();
+
+            var nativeResponse = native.Submit(Opcode.SessionReset, Array.Empty<byte>());
+            var managedResponse = managed.Submit(Opcode.SessionReset, Array.Empty<byte>());
+            Assert.Equal(nativeResponse.Status, managedResponse.Status);
+            Assert.Equal(nativeResponse.Payload, managedResponse.Payload);
+
+            foreach (var query in new[]
+                     {
+                         QueryId.WorldSize, QueryId.DirtyCount, QueryId.LogLen, QueryId.SnapshotCount,
+                     })
+            {
+                Assert.Equal(
+                    native.Submit(Opcode.Query, Requests.Query(query)).Payload,
+                    managed.Submit(Opcode.Query, Requests.Query(query)).Payload);
+            }
+
+            Assert.Equal(native.SnapshotBytes(), managed.SnapshotBytes());
+        }
+        finally
+        {
+            native.Dispose();
+            managed.Dispose();
+        }
+    }
+
+    [Fact]
     public void PrngStreamsAreIdentical()
     {
         var pair = Pair();

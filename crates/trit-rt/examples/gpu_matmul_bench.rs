@@ -4,6 +4,7 @@
 //! 现在的实现把每个窗口摊成一行、n 恒等于 1，等于拿 GPU 做一个巨型点积——
 //! 这是 GPU 最不擅长的形状。n 提到 64 才是矩阵乘。
 
+#[cfg(feature = "gpu")]
 use std::time::Instant;
 
 #[cfg(feature = "gpu")]

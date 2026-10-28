@@ -142,6 +142,10 @@ public sealed class TritRuntimeMod : Mod
             {
                 writer.WriteStartObject();
 
+                // 日志条数上限直接决定回滚窗口与常驻内存（约 5 字节/条），
+                // 是这套设置里唯一需要玩家按机器调的量。
+                writer.WriteNumber("max_log_entries", settings.MaxLogEntries);
+
                 writer.WriteStartObject("parallel");
                 // 关掉并行时收敛到"一个工作线程 + 单模组单任务"，等价于串行执行。
                 writer.WriteNumber("workers", settings.EnableParallel ? settings.WorkerCount : 1);
@@ -532,6 +536,14 @@ public sealed class TritRuntimeMod : Mod
         }
 
         mailbox.RemoveRange(0, count);
+        if (mailbox.Count == 0)
+        {
+            // 取空就摘掉这个键：每个 owner 的邮箱有容量上限，但**键的个数没有**，
+            // 调用方每次换一个 owner 名（比如把任务序号拼进 owner）就会让这张表
+            // 无界增长。空邮箱与不存在的键在语义上完全一样，删掉不影响任何调用。
+            ownerMailboxes.Remove(key);
+        }
+
         return taken;
     }
 
@@ -598,6 +610,55 @@ public sealed class TritRuntimeMod : Mod
         // 内核的部分命令（例如无载荷的 Query）确实以 null 作为合法返回，
         // 所以这里不能用空合并掩盖，只做可空性抑制。
         return runtime.Call(command, rest)!;
+    }
+
+    /// <summary>
+    /// 退出/切换存档时复位整个会话：内核的世界投影、日志、快照、任务结果与
+    /// 桥接层的差分采样状态全部丢弃。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 这是「整个游戏的常驻内存」里最大的一块可控项：默认配置下日志约 5MB、
+    /// 快照数 MB、世界车道表数 MB。它们都是<b>某一张存档的投影</b>，退出存档后
+    /// 既没有语义、又一直挂在进程里，换存档还会继续往上叠。
+    /// </para>
+    /// <para>
+    /// 复位顺序：先清任务邮箱与环形缓冲（它们持有 <see cref="JobResult"/> 的 JSON 字符串），
+    /// 再清桥接层采样，最后让内核释放自己的状态。任一步失败都只记日志，绝不冒泡。
+    /// </para>
+    /// </remarks>
+    internal void ResetWorldSession()
+    {
+        if (!loaded)
+        {
+            return;
+        }
+
+        ownerMailboxes.Clear();
+        recentJobs.Clear();
+
+        try
+        {
+            bridge?.ResetSession();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("[trit] 复位采样状态时异常（不影响运行）：" + ex.Message);
+        }
+
+        try
+        {
+            if (shim is not null && !shim.ResetSession())
+            {
+                // 旧版原生库不认识这个操作。不复位只是继续占内存，功能完全不受影响，
+                // 所以这里只记一次提示，不降级、不重试。
+                Logger.Info("[trit] 当前内核不支持会话复位（旧版原生库），退出存档后内存不会归还；功能不受影响。");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("[trit] 会话复位失败（不影响运行）：" + ex.Message);
+        }
     }
 
     private void Teardown()

@@ -550,6 +550,53 @@ public sealed class ManagedKernelTests : IDisposable
     }
 
     [Fact]
+    public void ZeroCapacitiesInConfigAreClampedLikeTheNativeKernel()
+    {
+        // Rust 侧 RuntimeConfig::sanitize 把容量下限夹到 1/1/1/4096；
+        // 托管回退必须给出同样的结果，否则一份坏配置只在回退时才炸。
+        var json = System.Text.Encoding.UTF8.GetBytes(
+            "{\"max_subscribers\":0,\"max_open_txns\":0,\"max_snapshots\":0,\"max_log_entries\":0}");
+        var config = ManagedConfig.FromJson(json);
+        Assert.Equal(1, config.MaxSubscribers);
+        Assert.Equal(1, config.MaxOpenTxns);
+        Assert.Equal(1, config.MaxSnapshots);
+        Assert.Equal(4096, config.MaxLogEntries);
+    }
+
+    [Fact]
+    public void SessionResetClearsWorldLogAndSnapshotsButKeepsSubscribers()
+    {
+        // 对应原生内核 0x1B：退出存档时把这张存档的投影全部放掉，
+        // 但订阅关系（属于模组装载期）必须原样保留，否则调用方手里的 sub id 全部失效、派发静默停止。
+        kernel.SubmitIntent(0, 1, TritDelta.Pos);
+        kernel.SubmitIntent(0, 2, TritDelta.Neg);
+        var sub = kernel.Subscribe(1, 100, 0, Array.Empty<uint>());
+        kernel.Publish(100, new[] { TritDelta.Pos });
+        kernel.Snapshot();
+        Assert.Equal(2u, QueryU32(QueryId.WorldSize));
+
+        var response = kernel.Submit(Opcode.SessionReset, Array.Empty<byte>());
+        Assert.Equal(Status.Ok, response.Status);
+        Assert.Empty(response.Payload);
+
+        Assert.Equal(0u, QueryU32(QueryId.WorldSize));
+        Assert.Equal(0ul, QueryU64(QueryId.LogLen));
+        Assert.Equal(0u, QueryU32(QueryId.SnapshotCount));
+
+        // 订阅仍在：复位后发布的事件依然派发得到这个 sub。
+        kernel.Publish(100, Array.Empty<TritDelta>());
+        var dispatch = kernel.Step(1).Intents;
+        Assert.Contains(dispatch, intent => intent.SubId == sub);
+    }
+
+    [Fact]
+    public void SessionResetRejectsAPayload()
+    {
+        var response = kernel.Submit(Opcode.SessionReset, new byte[] { 1 });
+        Assert.Equal(Status.Arg, response.Status);
+    }
+
+    [Fact]
     public void CapabilityReportMarksManagedWithoutAi()
     {
         var report = kernel.Capabilities();

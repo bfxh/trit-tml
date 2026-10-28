@@ -42,4 +42,24 @@ public sealed class TritWorldSystem : ModSystem
 
         TritRuntimeMod.Instance?.OnWorldTick();
     }
+
+    /// <summary>
+    /// 退出/切换存档：把整张存档的投影（世界车道、日志、快照、任务结果）放掉。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 用 tML 官方回调而不是钩子 <c>On_WorldGen.</c> 之类：这是两端（客户端 / 服务器）
+    /// 都会触发的生命周期点，且不依赖内部签名（与 <see cref="PostUpdateEverything"/>
+    /// 同一个理由，见类注释）。
+    /// </para>
+    /// <para>
+    /// 不做这一步的后果不是"崩"，而是"越玩越胖"：每张存档的日志、快照、
+    /// 世界投影都留在进程里，来回进出几次存档后内存只增不减。
+    /// 复位本身任何异常都在模组侧吞掉，绝不让退出存档卡住。
+    /// </para>
+    /// </remarks>
+    public override void OnWorldUnload()
+    {
+        TritRuntimeMod.Instance?.ResetWorldSession();
+    }
 }

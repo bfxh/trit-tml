@@ -58,11 +58,14 @@ pub struct RuntimeConfig {
     /// 保留窗口内（远小于此值）；仅当保留窗口异常偏大时，超出部分会触发
     /// 淘汰最旧快照直至日志落回此上限。写满即报错（上层回退到 C# 路径）。
     ///
-    /// 按 32 字节/条折算，默认上限 1M 条 ≈ 32MB 常驻——这是旁路层给日志的
-    /// 全部预算。早期默认 4M 条（128MB）在实测中把整个内核顶到 136MB 峰值，
-    /// 对游戏进程不可接受；且 4M 条按每 tick 数百条的变化量只覆盖约 106 秒，
-    /// 与 64 张快照 × 300 tick 的 320 秒窗口本就不匹配。要更长回滚窗口，
-    /// 调大本项或调小快照间隔（两者一起决定真正保留的日志量）。
+    /// **这个值同时就是回滚窗口**：每 tick 的变化量决定它能覆盖多少秒。
+    /// 模组实测约 1600 条/tick 时，1M 条 ≈ 625 tick ≈ 10 秒。
+    ///
+    /// 按 5 字节/条折算（日志是 SoA 的 `key u32` + `delta u8` 两列，`seq` 与
+    /// `txn_id` / `tick` 都不入库），默认 1M 条 ≈ **5MB** 常驻。早期是
+    /// `Vec<LogEntry>` 逐条对齐 32 字节、默认 4M 条，实测把内核顶到 136MB 峰值。
+    /// 要更长回滚窗口就调大本项，每 100 万条约 +5MB（可通过模组设置
+    /// `maxLogEntries` 调整，不必改内核配置）。
     pub max_log_entries: usize,
     /// 仲裁模式：`"strict"` 或 `"majority"`。
     pub arbitration: ArbitrationModeSerde,
@@ -113,10 +116,40 @@ impl RuntimeConfig {
         if bytes.is_empty() {
             return Ok(Self::default());
         }
-        serde_json::from_slice(bytes)
-            .map_err(|error| RtError::Decode(format!("配置 JSON 非法：{error}")))
+        let mut config: Self = serde_json::from_slice(bytes)
+            .map_err(|error| RtError::Decode(format!("配置 JSON 非法：{error}")))?;
+        config.sanitize();
+        Ok(config)
+    }
+
+    /// 把明显不合法的容量值夹回可工作的范围。
+    ///
+    /// 这不是「猜用户意图」，而是挡住一类会让内核**整体停摆**的坏配置：
+    /// 手写的 JSON（或将来别的调用方）把 `max_log_entries` 写成 0，日志永远
+    /// 判定为写满，此后每次提交都返回 `Capacity`；`max_open_txns` 写成 0，
+    /// `begin` 永远失败。夹住下限之后最坏也只是窗口变小，而不是功能消失。
+    fn sanitize(&mut self) {
+        self.max_subscribers = self.max_subscribers.max(1);
+        self.max_open_txns = self.max_open_txns.max(1);
+        self.max_snapshots = self.max_snapshots.max(1);
+        self.max_log_entries = self.max_log_entries.max(MIN_LOG_ENTRIES);
     }
 }
+
+/// 日志条数下限。
+///
+/// 低于此值连「一次批量提交 + 一张快照」的历史都存不住，`compact_log` 会
+/// 退化成每 tick 反复驱逐快照，所以宁可把配置夹到这儿也不让它生效。
+pub const MIN_LOG_ENTRIES: usize = 4096;
+
+/// 事件载荷保留条数上限。
+const MAX_EVENT_PAYLOADS: usize = 4096;
+
+/// 事件载荷保留字节上限（`Ternary` 一字节，故等于 trit 数）。
+///
+/// 只按条数限是不够的：4096 条 × 每条 100 万 trit = 4GB。这条闸门让
+/// 「少量超大事件」也收敛到固定预算内，默认 8MB。
+const MAX_EVENT_PAYLOAD_TRITS: usize = 8 << 20;
 
 /// 影子日志：只记录不一致，从不提交。
 #[derive(Debug, Clone, Default)]
@@ -181,6 +214,8 @@ pub struct TritRuntime {
     last_error: String,
     /// 每个事件最近一次发布的 trit 载荷。
     event_payloads: BTreeMap<u32, Vec<Ternary>>,
+    /// 当前所有事件载荷的 trit 总数（= 字节数，`Ternary` 一字节）。
+    event_payload_trits: usize,
     #[cfg(feature = "ai-voting")]
     ai_model: Option<trit_net::Model>,
     /// 并行任务池（v2）：扫描任务在这里跑，游戏主线程只提交与回收。
@@ -205,6 +240,7 @@ impl TritRuntime {
             stats: Stats::default(),
             last_error: String::new(),
             event_payloads: BTreeMap::new(),
+            event_payload_trits: 0,
             #[cfg(feature = "ai-voting")]
             ai_model: None,
             pool,
@@ -290,6 +326,7 @@ impl TritRuntime {
             op::GPU_STATUS => self.op_gpu_status(payload),
             op::BUDGET => self.op_budget(payload),
             op::METRICS => self.op_metrics(payload),
+            op::SESSION_RESET => self.op_session_reset(payload),
             _ => Err(RtError::InvalidInput(format!("未知 opcode {opcode:#x}"))),
         };
         if let Err(error) = &result {
@@ -299,6 +336,47 @@ impl TritRuntime {
     }
 
     // ---- opcode 实现 ----
+
+    /// `0x1B SESSION_RESET`：无载荷。
+    fn op_session_reset(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        if !payload.is_empty() {
+            return Err(RtError::InvalidInput(format!(
+                "SESSION_RESET 不接受载荷，收到 {} 字节",
+                payload.len()
+            )));
+        }
+        self.reset_session();
+        Ok(Vec::new())
+    }
+
+    /// 会话复位：清空与"这张存档"相关的一切状态，保留配置、统计与任务池线程。
+    ///
+    /// 为什么必要：世界投影 / 日志 / 快照 / 事务表 / 事件载荷都是**某个存档世界的投影**。
+    /// 玩家退出存档后，它们既没有语义（旧世界的车道值不该被当成新世界的真相，
+    /// 快照里的"世界"也不可能再回滚），又一直占着进程内存——默认配置下约 5MB 日志、
+    /// 数 MB 快照、再加车道表，换一张存档还会继续往上叠。进出存档时复位一次，
+    /// 进程占用直接回到基线。
+    ///
+    /// 有意**不**清的：`config`（玩家设置）、`stats`（跨存档的累计计数）、
+    /// `pool` 的后台线程与 GPU 后端（重建要重新探测，且它们不承载世界状态）、
+    /// **`router`（订阅关系）**——订阅属于"模组装载期"，跨存档依然有效；
+    /// 清掉它会让调用方手里的 sub id 全部失效，派发静默停止，比多占几 KB 糟得多。
+    pub fn reset_session(&mut self) {
+        self.world = BTreeMap::new();
+        self.snapshots = BTreeMap::new();
+        self.next_snapshot_id = 0;
+        // 换实例而不是 clear()：SoA 的 Vec 容量会随实例一起归还给分配器，
+        // 而 clear() 会保留上一张存档撑出来的容量（百万条级别的预留）。
+        self.log = TxnLog::new();
+        self.txns = TxnTable::new(self.config.max_open_txns);
+        self.event_payloads = BTreeMap::new();
+        self.event_payload_trits = 0;
+        self.shadow = ShadowLog::default();
+        self.prng = DeterministicPrng::new(0);
+        self.tick = 0;
+        self.last_error.clear();
+        self.pool.reset_session();
+    }
 
     fn op_subscribe(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
         let mut reader = Reader::new(payload);
@@ -328,18 +406,48 @@ impl TritRuntime {
         let event_id = reader.u32()?;
         let trits = reader.trits()?;
         self.stats.events_published += 1;
-        if self.event_payloads.len() >= 4096 {
-            // 简单的滚动淘汰：清掉最早插入的一批（BTreeMap 序即事件 ID 序）。
-            let oldest: Vec<u32> = self.event_payloads.keys().take(1024).copied().collect();
-            for key in oldest {
-                self.event_payloads.remove(&key);
-            }
-        }
+
+        // 两道闸，缺一不可：条数闸挡「很多个小事件」，字节闸挡「少量超大事件」。
+        // 只有条数闸时，4096 条 × 每条 100 万个 trit = 4GB 常驻，一次坏调用
+        // 就能把进程顶到系统拒绝分配——而调用方只是「发布了一个大事件」，看不出错。
+        self.event_payload_trits += trits.len();
         self.event_payloads.insert(event_id, trits);
+        self.evict_event_payloads(event_id);
+
         let dirty = self.router.publish(event_id);
         let mut writer = Writer::new();
         writer.u32(dirty as u32);
         Ok(writer.into_vec())
+    }
+
+    /// 按条数 + 字节双预算淘汰最旧的事件载荷，**绝不淘汰刚发布的那条**。
+    ///
+    /// 刚发布的那条若自身就超预算，就留它一个：淘汰它等于让 `publish` 什么都不做，
+    /// 调用方会拿到「成功」但监听者读不到载荷，这种静默失败比拒绝更难查。
+    /// 事件 ID 递增是既有假设（`BTreeMap` 序即 ID 序，原实现的淘汰也依赖它），
+    /// 所以最旧的恒为最小键，这里只看前两个键。
+    fn evict_event_payloads(&mut self, keep: u32) {
+        loop {
+            let over_count = self.event_payloads.len() > MAX_EVENT_PAYLOADS;
+            let over_bytes = self.event_payload_trits > MAX_EVENT_PAYLOAD_TRITS;
+            if !over_count && !over_bytes {
+                return;
+            }
+            let mut keys = self.event_payloads.keys().copied();
+            let victim = match keys.next() {
+                None => return,
+                Some(id) if id != keep => id,
+                // 最旧的就是刚发布的那条，退一步取第二旧的；没有第二旧的说明
+                // 只剩它一个，此时预算再超也只能留着（见上面的取舍说明）。
+                Some(_) => match keys.next() {
+                    Some(next) => next,
+                    None => return,
+                },
+            };
+            if let Some(dropped) = self.event_payloads.remove(&victim) {
+                self.event_payload_trits -= dropped.len();
+            }
+        }
     }
 
     fn op_txn_begin(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
@@ -775,7 +883,7 @@ impl TritRuntime {
                 .unwrap_or(Ternary::Unknown);
             let next = apply_delta(current, intent.delta);
             self.world.insert(intent.key, next);
-            self.log.append(txn_id, self.tick, &intent);
+            self.log.append(&intent);
             applied += 1;
         }
         Ok((applied, self.log.seq()))
@@ -992,6 +1100,20 @@ mod tests {
     }
 
     #[test]
+    fn zero_capacities_are_clamped_instead_of_bricking_the_runtime() {
+        // 手写配置把所有上限都写成 0：如果不夹下限，日志永远判定写满、
+        // begin 永远失败，内核整体停摆，而调用方只能看到一个 Capacity 错误。
+        let config = RuntimeConfig::from_json(
+            br#"{"max_subscribers":0,"max_open_txns":0,"max_snapshots":0,"max_log_entries":0}"#,
+        )
+        .unwrap();
+        assert_eq!(config.max_subscribers, 1);
+        assert_eq!(config.max_open_txns, 1);
+        assert_eq!(config.max_snapshots, 1);
+        assert_eq!(config.max_log_entries, MIN_LOG_ENTRIES);
+    }
+
+    #[test]
     fn full_transaction_lifecycle() {
         let mut rt = default_runtime();
         let begin = {
@@ -1105,6 +1227,57 @@ mod tests {
         assert!(matches!(error, RtError::InvalidInput(_)));
     }
 
+    /// 退出存档时必须把"这张存档的投影"全部放掉：世界车道、日志、快照、事件载荷、
+    /// tick 与 PRNG 都归零。不归零的话旧世界的车道值会被当成新世界的真相，
+    /// 而且这些内存会一直挂到游戏退出。
+    #[test]
+    fn session_reset_releases_the_whole_world_projection() {
+        let mut rt = default_runtime();
+        // 造点真实状态：几条车道 + 一张快照 + 一个事件载荷 + 一次 publish。
+        for key in [11u32, 22, 33] {
+            let mut w = Writer::new();
+            w.u64(0).u32(key).u8(2);
+            rt.dispatch(op::TXN_SUBMIT, &w.into_vec()).unwrap();
+        }
+        let mut w = Writer::new();
+        w.u32(9).trits(&[Ternary::True, Ternary::False]);
+        rt.dispatch(op::PUBLISH, &w.into_vec()).unwrap();
+        let step = {
+            let mut w = Writer::new();
+            w.u64(5);
+            w.into_vec()
+        };
+        rt.dispatch(op::STEP, &step).unwrap();
+        let snap = {
+            let mut w = Writer::new();
+            w.u32(0);
+            w.into_vec()
+        };
+        rt.dispatch(op::SNAPSHOT, &snap).unwrap();
+        assert_eq!(rt.world().len(), 3);
+        assert!(!rt.snapshots.is_empty());
+        assert!(rt.tick() > 0);
+
+        let out = rt.dispatch(op::SESSION_RESET, b"").unwrap();
+        assert!(out.is_empty(), "SESSION_RESET 没有返回值");
+
+        assert!(rt.world().is_empty(), "世界投影必须清空");
+        assert!(rt.snapshots.is_empty(), "快照必须清空");
+        assert_eq!(rt.log_len(), 0, "事务日志必须清空");
+        assert!(rt.event_payloads.is_empty(), "事件载荷必须清空");
+        assert_eq!(rt.event_payload_trits, 0);
+        assert_eq!(rt.tick(), 0, "tick 归零（新存档从 0 开始）");
+        // 复位不碰配置：容量闸门仍然按配置生效。
+        assert!(rt.config.max_log_entries > 0);
+    }
+
+    #[test]
+    fn session_reset_rejects_a_payload() {
+        let mut rt = default_runtime();
+        let error = rt.dispatch(op::SESSION_RESET, b"x").unwrap_err();
+        assert!(matches!(error, RtError::InvalidInput(_)), "{error}");
+    }
+
     /// 回归：事务日志在「持续提交 + 周期快照」下必须保持有界，不能只追加
     /// 直至写满触发容量错误（此前在密集游戏约 2~3 分钟即触顶的 bug）。
     #[test]
@@ -1149,6 +1322,29 @@ mod tests {
             autocommit(&mut rt, 5000 + k, 2);
         }
         assert!(rt.log_len() < (1 << 14));
+    }
+
+    /// 回归：事件载荷必须**按字节**收敛，不能只按条数。
+    ///
+    /// 旧行为只有 4096 条的闸门，于是「少量超大事件」能直接把进程撑爆：
+    /// 4096 × 100 万 trit = 4GB。这里连续发布 40 个各 100 万 trit 的事件。
+    #[test]
+    fn event_payloads_are_bounded_by_bytes_not_just_count() {
+        let mut rt = TritRuntime::new(RuntimeConfig::default());
+        let big = vec![Ternary::True; 1 << 20]; // 1M trit = 1MB
+        for event_id in 1..=40u32 {
+            let mut w = Writer::new();
+            w.u32(event_id).trits(&big);
+            rt.dispatch(op::PUBLISH, &w.into_vec()).unwrap();
+        }
+        assert!(
+            rt.event_payload_trits <= MAX_EVENT_PAYLOAD_TRITS,
+            "事件载荷超预算：{} > {}",
+            rt.event_payload_trits,
+            MAX_EVENT_PAYLOAD_TRITS
+        );
+        // 最新的一条必须在：淘汰它等于让 publish 静默无效。
+        assert!(rt.event_payloads.contains_key(&40));
     }
 
     /// 回归：调用方**从不落快照**时，提交也必须能持续（自保快照兜底）。

@@ -99,6 +99,16 @@ public static class Opcode
     /// 事务号为 0 表示整批自动提交。
     /// </summary>
     public const uint TxnSubmitBatch = 0x1A;
+
+    /// <summary>
+    /// 会话复位（无载荷）：清空世界投影 / 日志 / 快照 / 事务 / 事件载荷 / 任务结果。
+    /// </summary>
+    /// <remarks>
+    /// 进出存档时调用一次。它是<b>可选</b>操作：老版本原生内核返回"未知 opcode"，
+    /// 上层记一条日志后继续跑——不复位只是多占内存，不影响任何功能，
+    /// 所以没有因为它递增 <c>ABI_VERSION</c>。
+    /// </remarks>
+    public const uint SessionReset = 0x1B;
 }
 
 /// <summary>查询编号，与 Rust 侧 <c>trit_rt::wire::query</c> 对齐。</summary>

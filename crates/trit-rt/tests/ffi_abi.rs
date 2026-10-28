@@ -82,7 +82,7 @@ fn create_capabilities_and_destroy() {
     unsafe {
         let handle = tt_rt_create(std::ptr::null(), 0);
         assert_ne!(handle, 0, "空配置应走默认值并成功创建");
-        assert_eq!(tt_rt_abi_version(), 2);
+        assert_eq!(tt_rt_abi_version(), 3);
         assert_eq!(tt_rt_version(), 0x00_01_00_00);
         let caps = tt_rt_capabilities(handle);
         assert!(caps & (1 << 0) != 0, "ROUTER 能力位应置起");

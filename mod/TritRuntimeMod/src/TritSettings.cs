@@ -24,6 +24,15 @@ public sealed class TritSettings
     /// <summary>全局内存预算上限（MiB）。</summary>
     public const int MaxMemoryCapacityMb = 8192;
 
+    /// <summary>事务日志条数上限（默认）。内核侧的默认值必须与此一致。</summary>
+    public const int DefaultMaxLogEntries = 1 << 20;
+
+    /// <summary>事务日志条数下限（低于此值连一次批量提交的历史都存不住）。</summary>
+    public const int MinLogEntries = 4096;
+
+    /// <summary>事务日志条数上限（16M 条约 80MB，再多就该改用更长快照间隔而不是堆日志）。</summary>
+    public const int MaxLogEntriesLimit = 16 << 20;
+
     /// <summary>单模组同时在跑任务数上限。</summary>
     public const int MaxPerModInflight = 16;
 
@@ -101,9 +110,26 @@ public sealed class TritSettings
     [JsonPropertyName("workerCount")]
     public int WorkerCount { get; set; }
 
-    /// <summary>全局内存预算（MiB）。0 = 不限制。</summary>
+    /// <summary>
+    /// 并行任务池的内存预算（MiB）。0 = 不限制。
+    /// </summary>
+    /// <remarks>
+    /// 只管任务池（超过预算的任务直接判失败，不会排队等待）；事务日志与快照
+    /// 的常驻内存由 <see cref="MaxLogEntries"/> 与快照间隔决定，见那边的说明。
+    /// </remarks>
     [JsonPropertyName("memoryCapacityMb")]
     public int MemoryCapacityMb { get; set; } = 512;
+
+    /// <summary>
+    /// 事务日志条数上限。**这个值就是回滚窗口**：每 tick 的变化量决定它覆盖多少秒。
+    /// </summary>
+    /// <remarks>
+    /// 每 100 万条约 5MB 常驻（日志按列存储，每条只有 <c>key</c> + <c>delta</c>）。
+    /// 实测约 1600 条变化/tick 时，100 万条 ≈ 10 秒、400 万条 ≈ 40 秒。
+    /// 内存吃紧就往小调，需要更长撤销历史就往大调；两头的代价都只在这一个数上。
+    /// </remarks>
+    [JsonPropertyName("maxLogEntries")]
+    public int MaxLogEntries { get; set; } = DefaultMaxLogEntries;
 
     /// <summary>同一模组（owner）同时在跑的任务上限，防独占。</summary>
     [JsonPropertyName("perModInflight")]
@@ -260,6 +286,7 @@ public sealed class TritSettings
         }
 
         MemoryCapacityMb = Clamp(MemoryCapacityMb, 0, MaxMemoryCapacityMb);
+        MaxLogEntries = Clamp(MaxLogEntries, MinLogEntries, MaxLogEntriesLimit);
         PerModInflight = Clamp(PerModInflight, 1, MaxPerModInflight);
         ScanChunk = Clamp(ScanChunk, MinScanChunk, MaxScanChunk);
         GpuMinTrits = Clamp(GpuMinTrits, 0, MaxGpuMinTrits);

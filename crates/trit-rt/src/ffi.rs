@@ -17,7 +17,13 @@ use crate::wire::{Writer, frame_response, op};
 ///
 /// v2：新增并行任务池 / GPU 后端 / 全局预算三组能力（opcode `0x14..0x19`，
 /// 载荷与响应为 UTF-8 JSON，既有 opcode 的二进制格式不变）。
-pub const ABI_VERSION: u32 = 2;
+///
+/// v3：新增 `0x1A TXN_SUBMIT_BATCH`，且 C# 壳**每个 tick 都用它**。这必须
+/// 递增版本号——只加 opcode 不算破坏性变更，但「客户端默认依赖新 opcode」
+/// 算了：v2 的老 DLL 会让每次批量提交拿到 `BAD_OP`，于是每 tick 都失败、
+/// 钩子被熔断，表象是「模组忽然完全没作用」。递增后这种混装会在装载期被
+/// 版本检查挡下，干净地退回托管内核（功能完整，只是慢）。
+pub const ABI_VERSION: u32 = 3;
 
 /// 运行时版本：`0x00_MM_mm_pp`（0.1.0）。
 pub const RUNTIME_VERSION: u32 = 0x00_01_00_00;

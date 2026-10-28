@@ -840,6 +840,44 @@ internal sealed class WorldBridge
         }
     }
 
+    /// <summary>
+    /// 会话复位：把"上一张存档的采样状态"整体丢弃，让新存档从零开始。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 为什么必须丢：采样是<b>差分</b>的——上一 tick 的 <see cref="EntityState"/> 存在时，
+    /// 只有变化才会产生增量。若不清，新存档里第 0 号 NPC 会被拿去和旧存档的第 0 号 NPC
+    /// 比较，产出一批"看起来像变化"的假增量；而内核那边的世界投影此时已经清空，
+    /// 这些假增量就成了新存档的第一批"真相"。
+    /// </para>
+    /// <para>
+    /// 清数组而不是重建：容量是按设置算好的定长结构，重建每次进出存档都要重新分配，
+    /// 还可能在 <see cref="Terraria.Main"/> 的强引用下多留一份。
+    /// </para>
+    /// </remarks>
+    public void ResetSession()
+    {
+        Array.Clear(npcState, 0, npcState.Length);
+        Array.Clear(projectileState, 0, projectileState.Length);
+        Array.Clear(playerState, 0, playerState.Length);
+        changedKeys.Clear();
+        changedTrits.Clear();
+
+        tick = 0;
+        prevActiveNpc = -1;
+        prevActiveProjectile = -1;
+        prevActivePlayer = -1;
+        lastGameTick = 0;
+        lastGameTickValid = false;
+        LastApplied = 0;
+        LastLogSeq = 0;
+        SnapshotCount = 0;
+        LastIntentCount = 0;
+        ConflictCount = 0;
+        npcTickedCount = 0;
+        projectileTickedCount = 0;
+    }
+
     /// <summary>取消订阅并释放内核句柄。</summary>
     public void Dispose()
     {

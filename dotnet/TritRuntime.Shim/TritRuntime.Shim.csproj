@@ -1,6 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <!-- 单一目标 net8.0：与 tModLoader 1.4.4+ 的宿主运行时一致。
+         试过双目标 net6.0（tML 1.4.3 及更早），代价不划算：net6 的
+         System.Text.Json 不带源生成器需要的 `JsonSerializerContext.GeneratedSerializerOptions`，
+         `required` 成员还需要自己补 RequiredMemberAttribute 的 polyfill，最终要往
+         .tmod 里多塞一份 System.Text.Json。旧宿主请用对应版本的源码分支构建。 -->
     <TargetFramework>net8.0</TargetFramework>
     <LangVersion>12.0</LangVersion>
     <Nullable>enable</Nullable>

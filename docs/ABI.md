@@ -34,6 +34,13 @@
 | `tt_rt_submit(handle, opcode, payload, len, out, cap)` | 通用分发（v2 的新 opcode 全走这条路） |
 | `tt_rt_step` / `tt_rt_snapshot` / `tt_rt_diff` / `tt_rt_capabilities` / `tt_rt_last_error` | 既有便捷入口 |
 
+### ABI 版本
+
+| 版本 | 变更 |
+| --- | --- |
+| v2 | 新增并行任务池 / GPU / 全局预算（opcode `0x14..0x19`，JSON 载荷） |
+| **v3** | 新增 `0x1A TXN_SUBMIT_BATCH`；C# 壳每 tick 都依赖它，故版本号必须递增——v2 的 DLL 与本壳混装时每次批量提交都会拿到 `TT_ERR_BAD_OP`，表现为「模组每 tick 失败、钩子被熔断」。壳在装载期就比对版本，不符直接退回托管内核（功能完整，只是慢）。`0x1B SESSION_RESET` 同属 v3，但它是**可选**操作，没有为它单独递增版本。 |
+
 ## opcode 表
 
 | opcode | 名称 | 载荷 | 响应 |
@@ -46,6 +53,7 @@
 | `0x18` | `BUDGET` | **JSON** | **JSON** 全局预算快照 |
 | `0x19` | `METRICS` | **JSON** | **JSON** `{"prometheus": "<text>"}` |
 | `0x1A` | `TXN_SUBMIT_BATCH` | 二进制 `txn_id u64, count u32, [key u32, delta u8] * n` | 空 |
+| `0x1B` | `SESSION_RESET` | 空（必须为空） | 空 |
 
 > v2 新增的 6 个 opcode 一律用 **UTF-8 JSON**（既有 opcode 保持二进制不变，避免破坏兼容）。
 > 空载荷等价于 `{}`。
@@ -62,9 +70,27 @@ txn_id u64 | count u32 | (key u32 | delta u8) * count
 - `txn_id == 0`：整批**一次性**仲裁 + 落地 + 追加一条日志，而不是逐条自动提交。
 - `count == 0` 是合法的空操作。
 
-存在的理由是可测的：逐条 `0x07` 每条都要付一次 FFI 往返（实测 0.5µs/条），
+存在理由同上：逐条 `0x07` 每条都要付一次 FFI 往返（实测 0.5µs/条），
 模组的 `WorldBridge` 每 tick 会提交所有变化车道，战斗高峰可达 1600 条 ≈ 0.86ms
 主线程时间；改走批量后同一批只剩一次调用。
+
+### `0x1B SESSION_RESET`
+
+无载荷、无响应。清空**与某一张存档相关**的一切内核状态：
+
+- 世界投影（车道表）、事务日志、快照、未落地意图、事件载荷、影子差分；
+- `tick` 与 PRNG 归零。
+
+**不清**：配置（`tt_rt_create` 传入的那些）、统计计数器、事件订阅、
+任务池线程与 GPU 后端。
+
+调用时机是「退出/切换存档」。实测收益（`examples/mem_bench.rs`，默认
+`max_log_entries`，20000 tick 真实负载）：复位把进程工作集从 11.7MB 降到
+6.3MB，即**回收 5.4MB**；不复位的话这部分一直挂到游戏退出，换一张存档还会继续往上叠。
+
+它是**可选**操作，所以没有单独递增 ABI 版本：老内核返回 `TT_ERR_ARG`（未知 opcode），
+壳只记一条日志继续跑——不复位只是多占内存，功能不受影响，不会像
+`0x1A` 那样每 tick 失败。发送非空载荷会被拒绝（`TT_ERR_ARG`）。
 
 ## 能力位
 
@@ -90,19 +116,23 @@ txn_id u64 | count u32 | (key u32 | delta u8) * count
 
 `#[serde(default)]`：缺省字段用默认值，旧配置文件不受影响。
 
+容量类字段（`max_subscribers` / `max_open_txns` / `max_snapshots` /
+`max_log_entries`）在解析后会被**夹到可工作的下限**（分别为 1/1/1/4096）：
+写成 0 不会让内核停摆，只是把窗口缩到最小。
+
 ```json
 {
   "seed": 0,
   "max_subscribers": 65536,
   "max_open_txns": 4096,
   "max_snapshots": 64,
-  "max_log_entries": 4194304,   // 事务日志硬上限（安全阀）。日志随快照截断保持在保留窗口内（远小于此值），仅窗口异常偏大时逐出最旧快照兜底
+  "max_log_entries": 1048576,   // 事务日志硬上限（安全阀），同时是回滚窗口；按 5 字节/条折算，100 万条 ≈ 5MB。日志随快照截断保持在保留窗口内（远小于此值），仅窗口异常偏大时逐出最旧快照兜底
   "arbitration": "majority",
   "shadow": true,
   "parallel": {
     "workers": 0,              // 0 = 自动：min(可用并行度, 4)，至少 1
     "cpu_capacity": 0,          // 0 = 自动：等于 workers（每个任务默认占 1 个 CPU 单位）
-    "memory_capacity": 512,     // 全局内存预算（单位 1 MiB）
+    "memory_capacity": 512,     // 在飞载荷预算（单位 1 MiB）：所有「排队 + 在跑」任务的 trits 总量上限
     "per_mod_inflight": 2,      // 同一 owner 同时在跑的任务上限（防独占）
     "scan_chunk": 4096,         // 扫描任务每步处理的元素数
     "max_batch": 8              // 单轮最多派发的任务数
@@ -145,6 +175,13 @@ txn_id u64 | count u32 | (key u32 | delta u8) * count
 但**不让整个 opcode 失败**——同一份请求在原生与托管两条路径上必须给出**逐字节相同**
 的 `failed` 记录（`error` 文案、字段顺序、字符编码都一致），否则影子差分一直报假分歧。
 `rejected` 计数照记（见 `0x18 BUDGET`），但 `SCAN_SUBMIT` 本身回 `{"job": <id>}`。
+
+**在飞载荷预算**（同上，`memory_capacity` 以 1 MiB 为单位）：队列里的每个任务都完整
+持有自己的 `trits`，所以「排队 + 在跑」的载荷总量也受这个预算约束。超了就产生
+`failed` 任务（`error` 里写明预算与本次需求），**而不是无界排队**——否则提交一万个
+4 MiB 扫描就是 40 GiB 挂在进程里，提交方却只会看到「提交成功」。正常释放点：
+任务跑完（或判失败出队）时立即归还占位。
+完成结果队列另有 8192 条上限，超出丢最旧的一条——这是给「提交了却长期不轮询」的调用方兜底。
 
 **owner 归一化口径**（提交侧与轮询侧必须用同一个函数）：
 去首尾空白 → 为空则归为 `"unknown"`。否则「以空 owner 提交」的任务用

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using Microsoft.Xna.Framework;
 using Terraria.ModLoader;
@@ -41,9 +42,9 @@ public sealed class TritCommand : ModCommand
 
     public override CommandType Type => CommandType.World | CommandType.Console;
 
-    public override string Usage => "trit <status|gpu|budget|metrics|jobs|cancel|scan|help> [参数]";
+    public override string Usage => "trit <status|gpu|mem|budget|metrics|jobs|cancel|scan|help> [参数]";
 
-    public override string Description => "旁路三进制运行时：总览、GPU、预算、任务与扫描。";
+    public override string Description => "旁路三进制运行时：总览、GPU、内存、预算、任务与扫描。";
 
     public override void Action(CommandCaller caller, string input, string[] args)
     {
@@ -67,6 +68,11 @@ public sealed class TritCommand : ModCommand
 
                 case "metrics":
                     Metrics(caller);
+                    break;
+
+                case "mem":
+                case "memory":
+                    Mem(caller);
                     break;
 
                 case "jobs":
@@ -294,6 +300,61 @@ public sealed class TritCommand : ModCommand
     }
 
     /// <summary>
+    /// 整进程内存：工作集 / 专用字节 / GC 堆 / 内核常驻，以及本模组的预算旋钮。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 为什么要看**进程**而不是本模组：tModLoader 里所有模组共用一个进程，
+    /// 本模组真正让玩家感受到的是"这游戏占了多少内存"，而不是我自己分配了多少。
+    /// 所以这里报的是 <see cref="Process.WorkingSet64"/> 与
+    /// <see cref="Process.PrivateMemorySize64"/>，再加上托管堆（<see cref="GC"/> 视角）
+    /// 与内核自己的账（世界车道 / 日志 / 快照）。
+    /// </para>
+    /// <para>
+    /// 日志与快照的字节数是**按已知单条大小推算**的，不是分配器实测值——
+    /// 运行时没有为它们维护字节计数（那本身也是每 tick 的开销）。
+    /// 实测值请看 <c>crates/trit-rt/examples/mem_bench.rs</c>。
+    /// </para>
+    /// </remarks>
+    private static void Mem(CommandCaller caller)
+    {
+        try
+        {
+            if (!Require(caller, out TritRuntimeMod? mod, out RuntimeShim? shim))
+            {
+                return;
+            }
+
+            Process process = Process.GetCurrentProcess();
+            Say(caller,
+                $"进程工作集={Mb(process.WorkingSet64)} 专用={Mb(process.PrivateMemorySize64)} " +
+                $"峰值工作集={Mb(process.PeakWorkingSet64)}", Color.Gray);
+            Say(caller,
+                $"托管堆={Mb(GC.GetTotalMemory(false))} " +
+                $"（GC 已提交={Mb(GC.GetGCMemoryInfo().TotalCommittedBytes)} 上限={Mb(GC.GetGCMemoryInfo().TotalAvailableMemoryBytes)}）",
+                Color.Gray);
+
+            TritSettings settings = mod!.Settings;
+            uint world = SafeQueryU32(() => shim!.WorldSize());
+            ulong logLen = SafeQueryU64(() => shim!.LogLen());
+            uint snaps = SafeQueryU32(() => shim!.SnapshotCount());
+            Say(caller,
+                $"内核：世界车道={world} 日志={logLen} 条（约 {Mb((long)logLen * 5)}） 快照={snaps} 张",
+                Color.Gray);
+            Say(caller,
+                $"预算：maxLogEntries={settings.MaxLogEntries}（约 {Mb(settings.MaxLogEntries * 5L)} 上限）" +
+                $" 任务池内存={settings.MemoryCapacityMb}MiB workers={settings.WorkerCount}",
+                Color.Gray);
+            Say(caller,
+                "提示：退出存档会自动复位内核状态；日志预算越大，撤销窗口越长、常驻越多。", Color.Gray);
+        }
+        catch (Exception ex)
+        {
+            Error(caller, "命令失败：" + ex.Message);
+        }
+    }
+
+    /// <summary>
     /// 列出最近完成的任务。
     /// 刻意<b>不</b>直接调 <c>PollJobs</c>：取出即出队，命令这样做会把每 tick 自动轮询
     /// 攒下的结果抢走。这里读的是模组自己的环形缓冲，是纯读取。
@@ -488,6 +549,7 @@ public sealed class TritCommand : ModCommand
             Say(caller, "  trit gpu on|off|auto        切换策略并写回设置文件", Color.Gray);
             Say(caller, "  trit gpu probe              强制重新探测（会卡一下，几百毫秒）", Color.Gray);
             Say(caller, "  trit budget                 全局预算与各模组账本", Color.Gray);
+            Say(caller, "  trit mem                    整进程工作集 / 托管堆 / 内核常驻 / 预算旋钮", Color.Gray);
             Say(caller, "  trit metrics                最近一轮任务池指标（Prometheus，截断）", Color.Gray);
             Say(caller, "  trit jobs                   最近完成的任务（读环形缓冲，不抢队列）", Color.Gray);
             Say(caller, "  trit cancel <id|owner>      取消任务（协作式，步骤边界退出）", Color.Gray);
@@ -642,6 +704,36 @@ public sealed class TritCommand : ModCommand
         {
             LoggerWarn("读取全局预算失败：" + ex.Message);
             return null;
+        }
+    }
+
+    /// <summary>把字节数格式化成 MB（一位小数）。</summary>
+    private static string Mb(long bytes) =>
+        (bytes / (double)(1 << 20)).ToString("0.0", CultureInfo.InvariantCulture) + "MB";
+
+    private static uint SafeQueryU32(Func<uint> query)
+    {
+        try
+        {
+            return query();
+        }
+        catch (Exception ex)
+        {
+            LoggerWarn("读取内核计数失败：" + ex.Message);
+            return 0;
+        }
+    }
+
+    private static ulong SafeQueryU64(Func<ulong> query)
+    {
+        try
+        {
+            return query();
+        }
+        catch (Exception ex)
+        {
+            LoggerWarn("读取内核计数失败：" + ex.Message);
+            return 0;
         }
     }
 

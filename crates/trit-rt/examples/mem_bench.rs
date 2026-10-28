@@ -11,6 +11,10 @@
 //! 用法：
 //!   cargo run --release -p trit-rt --example mem_bench
 //!   cargo run --release -p trit-rt --example mem_bench -- --ticks 60000
+//!   cargo run --release -p trit-rt --example mem_bench -- --log-entries 4194304
+//!
+//! `--log-entries` 直接对应模组设置里的 `maxLogEntries`，用来量「窗口换内存」
+//! 的实际价码，而不是按字节数估算。
 
 use trit_rt::runtime::{RuntimeConfig, TritRuntime};
 use trit_rt::wire::{self, Writer};
@@ -112,7 +116,19 @@ fn main() {
     let changes_per_tick = 1600;
 
     let lanes = all_lanes();
-    let mut runtime = TritRuntime::new(RuntimeConfig::default());
+    let mut config = RuntimeConfig::default();
+    if let Some(entries) = args
+        .iter()
+        .position(|a| a == "--log-entries")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        // 走 from_json 而不是直接赋值：这样量的就是模组真实经过
+        // `RuntimeConfig::from_json` 的那条路径（含下限夹取）。
+        config = RuntimeConfig::from_json(format!(r#"{{"max_log_entries":{entries}}}"#).as_bytes())
+            .expect("config");
+    }
+    let mut runtime = TritRuntime::new(config);
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let base = mem::rss_mb();
     println!(
@@ -186,6 +202,22 @@ fn main() {
 
     let (rss, peak) = mem::rss_mb();
     println!("done rss={rss:.1}MB peak={peak:.1}MB");
+
+    // 退出存档的实测：SESSION_RESET 之后，内核占的内存必须真的还回去，
+    // 而不是"清空了索引但页还挂着"。分配器可能保留一部分给下次复用，
+    // 所以这里如实打印前后两个数，不做「应当等于基线」的断言。
+    let before = mem::rss_mb().0;
+    runtime
+        .dispatch(wire::op::SESSION_RESET, &[])
+        .expect("session reset");
+    let after = mem::rss_mb().0;
+    println!(
+        "session_reset: rss {before:.1}MB -> {after:.1}MB（回收 {:.1}MB）world={} log={} snaps={}",
+        before - after,
+        query_u64(&mut runtime, wire::query::WORLD_SIZE),
+        query_u64(&mut runtime, wire::query::LOG_LEN),
+        query_u64(&mut runtime, wire::query::SNAPSHOT_COUNT),
+    );
 }
 
 /// `WORLD_SIZE` / `SNAPSHOT_COUNT` 回 u32，`LOG_LEN` 回 u64，按实际宽度读。
