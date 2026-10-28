@@ -832,56 +832,75 @@ impl ScanJob {
             let (pos, neg) = trit_gpu::pack_dual_rail(&self.pattern);
             self.pattern_packed = Some((pos, neg));
         }
-        let (packed_pos, packed_neg) = self
-            .packed
-            .as_ref()
-            .map(|(p, n)| (p.clone(), n.clone()))
-            .unwrap_or_default();
-        let (pattern_pos, pattern_neg) = self
-            .pattern_packed
-            .as_ref()
-            .map(|(p, n)| (p.clone(), n.clone()))
-            .unwrap_or_default();
-
-        let mut a_pos = Vec::with_capacity(total * words);
-        let mut a_neg = Vec::with_capacity(total * words);
-        self.scratch_pos.resize(words, 0);
-        self.scratch_neg.resize(words, 0);
-        for window in 0..total {
-            window_into(
-                &packed_pos,
-                &packed_neg,
-                window,
-                self.pattern.len(),
-                &mut self.scratch_pos,
-                &mut self.scratch_neg,
-            );
-            a_pos.extend_from_slice(&self.scratch_pos);
-            a_neg.extend_from_slice(&self.scratch_neg);
-        }
-
-        let scores = {
-            let mut backend = self
-                .gpu
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            backend.matmul(
-                total,
-                1,
-                words,
-                DualRail {
-                    pos: &a_pos,
-                    neg: &a_neg,
-                },
-                DualRail {
-                    pos: &pattern_pos,
-                    neg: &pattern_neg,
-                },
-            )
+        // 图案很小（也就几个字），直接复制一份交给 GPU 侧；值缓冲有几百 KB 到几 MB，
+        // **绝对不能整块 clone**——旧实现每次尝试 GPU 都把整个双导轨缓冲复制一遍，
+        // 光这两行内存拷贝就比 GPU 的计算本身还贵。
+        let (pattern_pos, pattern_neg) = match self.pattern_packed.as_ref() {
+            Some((pos, neg)) => (pos.clone(), neg.clone()),
+            None => return false,
         };
-        let Some(scores) = scores else {
+        let Some((packed_pos, packed_neg)) = self.packed.as_ref() else {
             return false;
         };
+
+        // 分块展开窗口：旧实现一次性建 `total × words` 的 im2col 缓冲
+        // （4M 窗口 × 2 字 = 32MB），既吃内存又把 CPU 缓存全冲掉，还会顶到
+        // 上游的 dispatch 网格上限。按块展开后峰值只剩 `block × words`（几百 KB），
+        // 而且每块单独 dispatch，永远不会越界。
+        const WINDOW_BLOCK: usize = 1 << 15;
+        let mut scores = Vec::with_capacity(total);
+        let mut block_pos: Vec<u32> = Vec::with_capacity(WINDOW_BLOCK * words);
+        let mut block_neg: Vec<u32> = Vec::with_capacity(WINDOW_BLOCK * words);
+        self.scratch_pos.resize(words, 0);
+        self.scratch_neg.resize(words, 0);
+
+        let mut window = 0usize;
+        while window < total {
+            let block_end = (window + WINDOW_BLOCK).min(total);
+            block_pos.clear();
+            block_neg.clear();
+            for index in window..block_end {
+                window_into(
+                    packed_pos,
+                    packed_neg,
+                    index,
+                    self.pattern.len(),
+                    &mut self.scratch_pos,
+                    &mut self.scratch_neg,
+                );
+                block_pos.extend_from_slice(&self.scratch_pos);
+                block_neg.extend_from_slice(&self.scratch_neg);
+            }
+
+            let rows = block_end - window;
+            let block = {
+                let mut backend = self
+                    .gpu
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                backend.matmul(
+                    rows,
+                    1,
+                    words,
+                    DualRail {
+                        pos: &block_pos,
+                        neg: &block_neg,
+                    },
+                    DualRail {
+                        pos: &pattern_pos,
+                        neg: &pattern_neg,
+                    },
+                )
+            };
+            // 任何一块被拒（形状不划算 / 设备丢失 / panic）就整趟回 CPU：
+            // 半 GPU 半 CPU 的分数不可比，也违背「同一请求结果必须一致」。
+            let Some(block_scores) = block else {
+                return false;
+            };
+            scores.extend_from_slice(&block_scores);
+            window = block_end;
+        }
+
         self.matches = scores
             .into_iter()
             .enumerate()

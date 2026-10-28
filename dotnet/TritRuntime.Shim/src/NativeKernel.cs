@@ -136,18 +136,31 @@ public sealed class NativeKernel : ITritKernel
         return KernelResponseMapper.ToCapabilityReport(response, KernelMode.Native, lastError);
     }
 
+    /// <summary>
+    /// 每线程复用的响应缓冲。
+    ///
+    /// 每 tick 至少三次 <see cref="Submit"/>（Begin / SubmitBatch / Commit），
+    /// 原本每次 <c>new byte[512]</c>，60 tick/s 就是每秒 180 个短命数组、约 90KB
+    /// 垃圾，纯粹喂给 GC。复用与 <see cref="WireFormat.Unframe"/> 一起看是安全的：
+    /// Unframe 返回的是新数组，缓冲内容不会渗出。按线程分桶是因为
+    /// <see cref="Submit"/> 没有加锁，跨线程共享会被别的调用覆盖。
+    /// </summary>
+    [ThreadStatic]
+    private static byte[]? scratchOutput;
+
     /// <summary>提交一个 opcode，返回拆框后的载荷。</summary>
     public KernelResponse Submit(uint opcode, byte[] payload)
     {
-        var capacity = 512;
         while (true)
         {
-            var output = new byte[capacity];
+            var output = scratchOutput ??= new byte[512];
+            var capacity = output.Length;
             var status = api.Submit(handle, opcode, payload, payload.Length, output, capacity);
             if (status == Status.Buffer && capacity >= 8)
             {
                 // 协议：所需长度已写进 output 前 8 字节。
                 capacity = (int)BinaryPrimitives.ReadUInt64LittleEndian(output) + 16;
+                scratchOutput = new byte[capacity];
                 continue;
             }
 
@@ -208,6 +221,17 @@ public sealed class NativeKernel : ITritKernel
     public void SubmitIntent(ulong txnId, uint key, TritDelta delta)
     {
         Submit(Opcode.TxnSubmit, Requests.TxnSubmit(txnId, key, delta));
+    }
+
+    /// <summary>批量提交意图。</summary>
+    public void SubmitIntents(ulong txnId, IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas)
+    {
+        if (keys.Count == 0)
+        {
+            return;
+        }
+
+        Submit(Opcode.TxnSubmitBatch, Requests.TxnSubmitBatch(txnId, keys, deltas));
     }
 
     /// <summary>提交事务。</summary>

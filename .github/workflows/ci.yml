@@ -30,12 +30,19 @@ jobs:
         run: cargo fmt --all --check
 
       - name: clippy
-        run: cargo clippy -p trit-rt --all-targets -- -D warnings
+        # 带 gpu feature 一起查：否则 gpu 分支的代码在 CI 里根本编译不到，
+        # 改坏了也发现不了（这个分支确实坏过一次）。
+        run: cargo clippy -p trit-rt --all-targets --features gpu -- -D warnings
 
       - name: test
-        run: cargo test -p trit-rt --release
+        run: |
+          cargo test -p trit-rt --release
+          cargo test -p trit-rt --release --features gpu
 
       - name: build cdylib
+        # 发布用的 DLL **不带** gpu feature：运行时对 n=1 的窗口扫描一律走 CPU
+        # （实测 GPU 慢 58 倍且会 panic，见 crates/trit-rt/src/gpu.rs），
+        # 带 wgpu 只是白涨体积；需要排查 GPU 时用 --features gpu 单独出包。
         run: cargo build --release -p trit-rt
 
       - uses: actions/upload-artifact@v4

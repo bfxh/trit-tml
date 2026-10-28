@@ -23,6 +23,10 @@ pub enum TxnState {
 }
 
 /// 一条已落地的事务记录（日志项）。
+///
+/// 这是**逻辑视图**，物理上日志按列存储（见 [`TxnLog`]）：每条 `LogEntry` 若
+/// 独立成结构体会按 8 字节对齐占 32 字节，而这个结构里有 u64、u32、u8 混排，
+/// 浪费近一半空间。1M 条日志就是 32MB vs 17MB 的差别——对游戏进程是要命的比例。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogEntry {
     /// 事务 ID。
@@ -62,9 +66,27 @@ impl Txn {
 }
 
 /// 事务日志。
+///
+/// **按列（SoA）存储**，不是 `Vec<LogEntry>`：日志条目是本进程里最大的常驻
+/// 结构（默认上限 100 万条），而 `LogEntry` 混排 u64/u32/u8，逐条对齐后要
+/// 32 字节。拆成 4 个并列数组后是 4+1+4+8 = 17 字节/条，同样的上限直接省下
+/// 15MB（实测 1M 条常驻从 ~32MB 降到 ~17MB）。
+///
+/// `seq` 不单独存：日志只追加、且截断永远切前缀，所以第 `i` 条的序号恒等于
+/// `base_seq + 1 + i`，用算术即可还原，没必要每条再存 8 字节。
 #[derive(Debug, Clone, Default)]
 pub struct TxnLog {
-    entries: Vec<LogEntry>,
+    /// 世界键，每条一个。
+    keys: Vec<u32>,
+    /// 仲裁后的增量（1/0/2 → u8）。
+    deltas: Vec<u8>,
+    /// 落地时的 tick。u32 足够：42 亿 tick ≈ 2.2 年连续游戏。
+    ticks: Vec<u32>,
+    /// 事务 ID（u64，事务表 id 也是 u64，不做窄化以免长期运行后静默错配）。
+    txn_ids: Vec<u64>,
+    /// 已被截断掉的最后一条序号；`seq_at(0) = base_seq + 1`。
+    base_seq: u64,
+    /// 全局单调序号（= 最后一条的 seq）。
     next_seq: u64,
 }
 
@@ -76,56 +98,98 @@ impl TxnLog {
     /// 追加一条已仲裁落地的记录。
     pub fn append(&mut self, txn_id: u64, tick: u64, resolved: &ResolvedIntent) -> LogEntry {
         self.next_seq += 1;
-        let entry = LogEntry {
+        // tick 窄化到 u32：超出范围的 tick 在游戏里不可能出现，但静默截断会
+        // 让回放对不上——用饱和转换把异常值钉在 u32::MAX，至少不会回绕成 0。
+        let tick32 = u32::try_from(tick).unwrap_or(u32::MAX);
+        self.keys.push(resolved.key);
+        self.deltas.push(resolved.delta as u8);
+        self.ticks.push(tick32);
+        self.txn_ids.push(txn_id);
+        LogEntry {
             txn_id,
             seq: self.next_seq,
             tick,
             key: resolved.key,
             delta: resolved.delta,
-        };
-        self.entries.push(entry);
-        entry
+        }
     }
 
-    /// 当前序列号（= 日志长度）。
+    /// 当前序列号（全局单调，截断不会让它回退）。
     pub fn seq(&self) -> u64 {
         self.next_seq
     }
 
     /// 日志长度。
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.keys.is_empty()
     }
 
     /// 是否已达到容量上限。
     pub fn is_full(&self, max_entries: usize) -> bool {
-        self.entries.len() >= max_entries
+        self.len() >= max_entries
     }
 
-    /// 从 `seq` 之后开始的重放迭代器（确定性重放用）。
-    pub fn replay_from(&self, seq: u64) -> impl Iterator<Item = &LogEntry> {
-        self.entries.iter().filter(move |entry| entry.seq > seq)
+    /// 第 `index` 条的全局序号。
+    fn seq_at(&self, index: usize) -> u64 {
+        self.base_seq + 1 + index as u64
+    }
+
+    /// 序号严格大于 `seq` 的第一条的下标。
+    ///
+    /// 因为序号连续，直接算即可——不必二分查找，更不必像旧实现那样
+    /// `filter` 扫全表。
+    pub fn start_after(&self, seq: u64) -> usize {
+        if seq <= self.base_seq {
+            return 0;
+        }
+        ((seq - self.base_seq) as usize).min(self.len())
+    }
+
+    /// 第 `index` 条的键。
+    pub fn key_at(&self, index: usize) -> u32 {
+        self.keys[index]
+    }
+
+    /// 第 `index` 条的增量。
+    pub fn delta_at(&self, index: usize) -> Ternary {
+        crate::wire::trit_from_byte(self.deltas[index])
+    }
+
+    /// 从 `seq` 之后开始的重放条目（按值产出逻辑视图，仅供诊断/测试）。
+    pub fn replay_from(&self, seq: u64) -> impl Iterator<Item = LogEntry> + '_ {
+        let start = self.start_after(seq);
+        (start..self.len()).map(move |index| LogEntry {
+            txn_id: self.txn_ids[index],
+            seq: self.seq_at(index),
+            tick: self.ticks[index] as u64,
+            key: self.keys[index],
+            delta: crate::wire::trit_from_byte(self.deltas[index]),
+        })
     }
 
     /// 丢弃序号 `<= seq` 的记录（保留更晚的记录）。
     ///
-    /// 记录按 seq 升序存储，因此做一次前缀切除即可。`next_seq` 保持单调，
-    /// 不影响后续 `seq()`（= 全局序号）与 `replay_from`（只依赖 `> seq`）。
+    /// 记录按 seq 升序连续存储，前缀长度可以直接算出；四列必须一起切，
+    /// 否则下标会错位。`next_seq` 保持单调，不影响 `seq()` 与 `replay_from`。
     /// 调用方须保证 `seq` 不高于任一仍需回滚/重放的快照锚点。
     pub fn truncate_before(&mut self, seq: u64) {
-        let cut = self.entries.partition_point(|entry| entry.seq <= seq);
-        if cut > 0 {
-            self.entries.drain(0..cut);
+        let cut = if seq <= self.base_seq {
+            0
+        } else {
+            ((seq - self.base_seq) as usize).min(self.len())
+        };
+        if cut == 0 {
+            return;
         }
-    }
-
-    /// 全部记录（统计/导出用）。
-    pub fn entries(&self) -> &[LogEntry] {
-        &self.entries
+        self.keys.drain(0..cut);
+        self.deltas.drain(0..cut);
+        self.ticks.drain(0..cut);
+        self.txn_ids.drain(0..cut);
+        self.base_seq += cut as u64;
     }
 }
 
@@ -139,6 +203,14 @@ pub struct TxnTable {
     rolled_back: u64,
 }
 
+/// 已关闭事务的保留条数。
+///
+/// 保留它们只是为了「重复提交 / 重复回滚」能报出 `TxnState` 而不是
+/// `TxnNotFound`（诊断友好）。但**绝不能全留**：模组每 tick 开一个事务，
+/// 全留会让事务表随 tick 无界增长，而且 `max_open` 的计数被历史事务占满——
+/// 实测跑到 4096 tick 之后 `begin` 永久失败，整个旁路层就此停摆。
+const CLOSED_TXN_RETAIN: usize = 1024;
+
 impl TxnTable {
     pub fn new(max_open: usize) -> Self {
         Self {
@@ -149,11 +221,32 @@ impl TxnTable {
 
     /// 开事务。
     pub fn begin(&mut self, tick: u64) -> Result<u64, RtError> {
-        if self.txns.len() >= self.max_open {
+        // 上限只约束「真正打开中」的事务；已关闭的不算并发。
+        let open = self
+            .txns
+            .values()
+            .filter(|txn| txn.state == TxnState::Open)
+            .count();
+        if open >= self.max_open {
             return Err(RtError::Capacity(format!(
                 "并发事务数达到上限 {}",
                 self.max_open
             )));
+        }
+        // 已关闭事务留最近 `CLOSED_TXN_RETAIN` 条即可。键是自增 id，
+        // BTreeMap 序即开启顺序，取前若干个就是最旧的。
+        let closed = self.txns.len() - open;
+        if closed > CLOSED_TXN_RETAIN {
+            let stale: Vec<u64> = self
+                .txns
+                .iter()
+                .filter(|(_, txn)| txn.state != TxnState::Open)
+                .map(|(id, _)| *id)
+                .take(closed - CLOSED_TXN_RETAIN)
+                .collect();
+            for id in stale {
+                self.txns.remove(&id);
+            }
         }
         self.next_id += 1;
         let id = self.next_id;
@@ -224,9 +317,12 @@ impl TxnTable {
         Ok(())
     }
 
-    /// 未关闭事务数。
+    /// 未关闭事务数（已关闭的按 `CLOSED_TXN_RETAIN` 保留在表里，不计入）。
     pub fn open_count(&self) -> usize {
-        self.txns.len()
+        self.txns
+            .values()
+            .filter(|txn| txn.state == TxnState::Open)
+            .count()
     }
 
     /// 除 `exclude` 外所有未关闭事务的待落地意图（提交时做跨事务仲裁）。

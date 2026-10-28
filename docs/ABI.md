@@ -45,9 +45,26 @@
 | `0x17` | `GPU_STATUS` | **JSON** | **JSON** GPU 后端状态 |
 | `0x18` | `BUDGET` | **JSON** | **JSON** 全局预算快照 |
 | `0x19` | `METRICS` | **JSON** | **JSON** `{"prometheus": "<text>"}` |
+| `0x1A` | `TXN_SUBMIT_BATCH` | 二进制 `txn_id u64, count u32, [key u32, delta u8] * n` | 空 |
 
 > v2 新增的 6 个 opcode 一律用 **UTF-8 JSON**（既有 opcode 保持二进制不变，避免破坏兼容）。
 > 空载荷等价于 `{}`。
+
+### `0x1A TXN_SUBMIT_BATCH`
+
+`0x07 TXN_SUBMIT` 的批量化版本，载荷仍是二进制（不引入 JSON）：
+
+```
+txn_id u64 | count u32 | (key u32 | delta u8) * count
+```
+
+- `txn_id != 0`：整批压进该事务，行为与逐条 `0x07` 完全一致（同一事务内的意图顺序也一致）。
+- `txn_id == 0`：整批**一次性**仲裁 + 落地 + 追加一条日志，而不是逐条自动提交。
+- `count == 0` 是合法的空操作。
+
+存在的理由是可测的：逐条 `0x07` 每条都要付一次 FFI 往返（实测 0.5µs/条），
+模组的 `WorldBridge` 每 tick 会提交所有变化车道，战斗高峰可达 1600 条 ≈ 0.86ms
+主线程时间；改走批量后同一批只剩一次调用。
 
 ## 能力位
 

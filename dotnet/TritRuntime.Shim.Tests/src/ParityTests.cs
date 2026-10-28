@@ -128,6 +128,48 @@ public sealed class ParityTests
     }
 
     [Fact]
+    public void BatchSubmitLandsExactlyLikeOneByOneSubmit()
+    {
+        var pair = Pair();
+        if (pair is null)
+        {
+            return;
+        }
+
+        var (native, managed, _) = pair.Value;
+        try
+        {
+            // 同一批车道：一边逐条提交，一边批量提交；最终世界必须逐字节相同。
+            var keys = new uint[64];
+            var deltas = new TritDelta[64];
+            for (int i = 0; i < keys.Length; i++)
+            {
+                keys[i] = (uint)(500 + i);
+                deltas[i] = i % 3 == 0 ? TritDelta.Neg : i % 3 == 1 ? TritDelta.Zero : TritDelta.Pos;
+            }
+
+            ulong txn = native.BeginTransaction();
+            for (int i = 0; i < keys.Length; i++)
+            {
+                native.SubmitIntent(txn, keys[i], deltas[i]);
+            }
+
+            native.Commit(txn);
+
+            ulong batchTxn = managed.BeginTransaction();
+            managed.SubmitIntents(batchTxn, keys, deltas);
+            managed.Commit(batchTxn);
+
+            Assert.Equal(native.SnapshotBytes(), managed.SnapshotBytes());
+        }
+        finally
+        {
+            native.Dispose();
+            managed.Dispose();
+        }
+    }
+
+    [Fact]
     public void PrngStreamsAreIdentical()
     {
         var pair = Pair();

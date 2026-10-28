@@ -17,6 +17,25 @@ use serde::{Deserialize, Serialize};
 /// 要到「数据大到装不进缓存」才拉开差距。
 pub const DEFAULT_MIN_TRITS: usize = 1 << 20;
 
+/// 一次矩阵乘里至少要有的列数，才允许上 GPU。
+///
+/// 真机实测（RTX 4060 Ti / Vulkan，见 `examples/scan_bench.rs`）：
+/// 把 `n = 1` 的窗口扫描当作矩阵乘交给 GPU，1M 窗口要 697.9ms，
+/// 同一份数据 CPU 位并行只要 12.0ms——**慢 58 倍**。原因是单列矩阵乘就是巨型点积，
+/// 数据全在显存里来回搬，GPU 的算力一点用不上；而且上游 `forward::matmul_packed`
+/// 每次调用都重建 instance/adapter/device/着色器，开销比计算本身还大。
+///
+/// 所以 Auto 策略下 `n` 太小的形状一律 CPU；`On` 是玩家显式要求，不受此限。
+pub const MIN_GPU_COLUMNS: usize = 8;
+
+/// 单次 dispatch 的窗口数硬上限。
+///
+/// 上游 `forward::matmul_packed` 的 dispatch 网格随 `m`（和 `words`）线性增长，
+/// 超过 wgpu 的 65535 上限时不是返回错误，而是**validation panic**——
+/// 从 FFI 边界 unwind 出去会直接带崩游戏进程。实测 `m = 65532`、`words = 2`
+/// 就已经触发（网格 262128）。这里在调用前挡住，宁可慢也不能崩。
+const MAX_GPU_ROWS: usize = 65_532;
+
 /// 单个缓冲区上限：`wgpu` 默认 limits 的 storage binding 是 128 MiB，这里留一半。
 const MAX_BUFFER_BYTES: usize = 64 << 20;
 
@@ -129,8 +148,6 @@ pub struct DualRail<'a> {
 #[derive(Debug)]
 pub struct GpuBackend {
     status: GpuStatus,
-    /// 是否已经探测过（探测要初始化 wgpu，不能在每次能力查询里做）。
-    probed: bool,
     /// 自检失败后**永久**关闭，避免每帧重试。
     disabled: bool,
 }
@@ -150,7 +167,6 @@ impl GpuBackend {
                 reason,
                 ..GpuStatus::default()
             },
-            probed: false,
             disabled: false,
         }
     }
@@ -163,7 +179,7 @@ impl GpuBackend {
     pub fn set_policy(&mut self, policy: GpuPolicy) {
         self.status.policy = policy;
         if policy != GpuPolicy::Off && !self.status.available && self.status.reason.is_empty() {
-            self.status.reason = "尚未探测（调用 GPU_STATUS 触发探测）".to_string();
+            self.status.reason = "尚未探测（显式 GPU_PROBE 或大矩阵乘时才初始化）".to_string();
         }
     }
 
@@ -172,18 +188,9 @@ impl GpuBackend {
         self.status.min_trits = min_trits;
     }
 
-    /// 只探测一次；已探测过就什么都不做。
-    pub fn ensure_probed(&mut self, trits: usize) {
-        if self.probed {
-            return;
-        }
-        self.probe(trits);
-    }
-
     /// 强制重新探测（策略切换或玩家显式要求时用）。
     #[cfg_attr(not(feature = "gpu"), allow(unused_variables))]
     pub fn probe(&mut self, trits: usize) {
-        self.probed = true;
         self.status.jobs = 0;
         self.status.gpu_jobs = 0;
         self.status.fallbacks = 0;
@@ -282,6 +289,11 @@ impl GpuBackend {
             return None;
         }
         self.status.jobs += 1;
+        // 形状门槛（理由见 `MIN_GPU_COLUMNS` / `MAX_GPU_ROWS` 的注释）：
+        // 先看列数再看行数，两次都是「直接回 CPU」，不记回退——这不是故障。
+        if n < MIN_GPU_COLUMNS || m > MAX_GPU_ROWS {
+            return None;
+        }
         let trits = m.saturating_mul(words).saturating_mul(32);
         if !self.should_use(trits) {
             return None;
@@ -293,7 +305,16 @@ impl GpuBackend {
 
         #[cfg(feature = "gpu")]
         {
-            let gpu = trit_gpu::forward::matmul_packed(m, n, words, a.pos, a.neg, b.pos, b.neg);
+            // 上游在形状越界时是 **validation panic** 而不是返回 None（实测见
+            // `MAX_GPU_ROWS`），这里再兜一层：panic 只丢这一次 GPU 机会，
+            // 不能让它穿过 FFI 变成整局游戏的崩溃。
+            let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                trit_gpu::forward::matmul_packed(m, n, words, a.pos, a.neg, b.pos, b.neg)
+            }))
+            .unwrap_or_else(|_| {
+                self.note_fallback("GPU 矩阵乘触发上游 panic（形状越界），本次回退 CPU", false);
+                None
+            });
             let Some(gpu) = gpu else {
                 self.note_fallback(
                     "GPU 矩阵乘返回空（设备丢失或 dispatch 失败），本次回退 CPU",
@@ -372,7 +393,6 @@ mod tests {
         let mut backend = GpuBackend::new(GpuConfig::default());
         // 没有 gpu feature 时 available 永远为 false，这里只验证门槛逻辑本身。
         backend.status.available = true;
-        backend.probed = true;
         assert!(!backend.should_use(1024));
         assert!(backend.should_use(DEFAULT_MIN_TRITS));
     }
@@ -384,7 +404,6 @@ mod tests {
             min_trits: DEFAULT_MIN_TRITS,
         });
         backend.status.available = true;
-        backend.probed = true;
         assert!(backend.should_use(16));
     }
 

@@ -390,17 +390,20 @@ impl JobPool {
         count
     }
 
-    /// GPU 状态（首次调用会触发一次探测）。
+    /// GPU 状态（**不触发探测**）。
+    ///
+    /// 探测要初始化 wgpu 并做 1M trit 的 CPU/GPU 对拍，真机实测 **1219.8ms**；
+    /// 旧实现把这一步塞在第一次状态查询里，而模组恰好在装载时查状态，
+    /// 等于每次进游戏白卡一秒多。现在只有显式 `probe=true` 或真的有大矩阵乘才探测。
     pub fn gpu_status(&self) -> GpuStatus {
-        let mut backend = self
+        let backend = self
             .gpu
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        backend.ensure_probed(1 << 20);
-        backend.status()
+        pending_probe_reason(backend.status())
     }
 
-    /// 强制重新探测 GPU。
+    /// 强制重新探测 GPU（显式要求，调用方自愿承担初始化开销）。
     pub fn gpu_probe(&self, trits: usize) -> GpuStatus {
         let mut backend = self
             .gpu
@@ -410,15 +413,14 @@ impl JobPool {
         backend.status()
     }
 
-    /// 切换 GPU 策略。
+    /// 切换 GPU 策略（**不触发探测**，理由同 [`Self::gpu_status`]）。
     pub fn set_gpu_policy(&self, policy: GpuPolicy) -> GpuStatus {
         let mut backend = self
             .gpu
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         backend.set_policy(policy);
-        backend.ensure_probed(1 << 20);
-        backend.status()
+        pending_probe_reason(backend.status())
     }
 
     /// GPU 是否可用（已探测且可用）。
@@ -796,6 +798,16 @@ fn take_batch(
         batch.push(pending.remove(index).expect("下标在界内"));
     }
     batch
+}
+
+/// 状态里「为什么还没探测」要说清楚，否则外部只能看到 `available=false` 一片空白。
+fn pending_probe_reason(status: GpuStatus) -> GpuStatus {
+    let mut status = status;
+    if status.reason.is_empty() && !status.available {
+        status.reason =
+            "尚未探测（装载期不探测；显式 GPU_PROBE 或出现大矩阵乘时才初始化）".to_string();
+    }
+    status
 }
 
 #[cfg(test)]

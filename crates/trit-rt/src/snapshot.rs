@@ -10,7 +10,6 @@
 
 use std::collections::BTreeMap;
 
-use trit_core::bulk::TriVec;
 use trit_core::value::Ternary;
 
 use crate::error::RtError;
@@ -20,6 +19,10 @@ use crate::wire::{Reader, Writer};
 pub const SNAPSHOT_VERSION: u8 = 1;
 
 /// 一个快照。
+///
+/// **只存序列化字节**：`bytes` 已经是完整的世界投影编码，`decode_world` 可无损
+/// 还原。早期版本还额外留一份 `BTreeMap` 副本，等于每张快照存两份世界——
+/// 64 张快照就是 64 份冗余，而这份副本从不参与回滚之外的计算。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// 快照 ID。
@@ -28,10 +31,16 @@ pub struct Snapshot {
     pub tick: u64,
     /// 打快照时的事务日志序列号（回滚到此快照会截断更高序列）。
     pub log_seq: u64,
-    /// 世界投影。
-    pub world: BTreeMap<u32, Ternary>,
-    /// 序列化字节。
+    /// 世界投影的唯一权威副本（序列化字节）。
     pub bytes: Vec<u8>,
+}
+
+impl Snapshot {
+    /// 解码出世界投影（拷贝一份 `BTreeMap`；只在 diff / 回滚时调用）。
+    pub fn world(&self) -> Result<BTreeMap<u32, Ternary>, RtError> {
+        let (_, _, world) = decode_world(&self.bytes)?;
+        Ok(world)
+    }
 }
 
 /// 一条差分项：`(键, 旧值, 新值)`。
@@ -47,11 +56,6 @@ pub struct DiffEntry {
 
 /// 把世界投影编码为字节。
 pub fn encode_world(world: &BTreeMap<u32, Ternary>, tick: u64, log_seq: u64) -> Vec<u8> {
-    // 三进制张量投影：密集 TriVec 覆盖所有活跃车道。
-    let values: Vec<Ternary> = world.values().copied().collect();
-    let tensor = TriVec::from_ternary(&values);
-    let trits: Vec<Ternary> = (0..tensor.len()).map(|index| tensor.get(index)).collect();
-
     let mut writer = Writer::new();
     writer.u8(SNAPSHOT_VERSION);
     writer.u64(tick);
@@ -60,7 +64,10 @@ pub fn encode_world(world: &BTreeMap<u32, Ternary>, tick: u64, log_seq: u64) -> 
     for key in world.keys() {
         writer.u32(*key);
     }
-    writer.trits(&trits);
+    // 直接按「键序」把值打包：键与值一一对应，不需要再经 TriVec 往返
+    // （那会多出两份等长的中间 Vec）。
+    let values: Vec<Ternary> = world.values().copied().collect();
+    writer.trits(&values);
     writer.into_vec()
 }
 

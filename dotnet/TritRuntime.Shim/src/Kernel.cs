@@ -114,6 +114,15 @@ public interface ITritKernel : IDisposable
     /// <summary>便捷方法：提交意图（txnId == 0 自动提交）。</summary>
     void SubmitIntent(ulong txnId, uint key, TritDelta delta);
 
+    /// <summary>
+    /// 便捷方法：批量提交意图（txnId == 0 时整批一次性自动提交）。
+    /// <para>
+    /// 逐条 <see cref="SubmitIntent"/> 每条都要走一趟 FFI（实测 0.5µs/条），
+    /// 每 tick 有成百上千条车道变化时批量接口能把这一层开销压掉一个数量级。
+    /// </para>
+    /// </summary>
+    void SubmitIntents(ulong txnId, IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas);
+
     /// <summary>便捷方法：提交事务。</summary>
     TxnCommitResult Commit(ulong txnId);
 

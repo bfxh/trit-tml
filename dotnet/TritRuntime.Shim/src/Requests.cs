@@ -47,6 +47,24 @@ public static class Requests
     public static byte[] TxnSubmit(ulong txnId, uint key, TritDelta delta) =>
         new WireWriter().U64(txnId).U32(key).U8((byte)delta).ToArray();
 
+    /// <summary>批量提交：<c>txn_id u64, count u32, [key u32, delta u8] * n</c>。</summary>
+    public static byte[] TxnSubmitBatch(ulong txnId, IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas)
+    {
+        if (keys.Count != deltas.Count)
+        {
+            throw new ArgumentException("批量提交的 keys 与 deltas 条数必须一致", nameof(deltas));
+        }
+
+        // 载荷长度可精确算出：u64 txn_id + u32 count + 每条 (u32 key + u8 delta)。
+        var writer = new WireWriter(12 + keys.Count * 5).U64(txnId).U32((uint)keys.Count);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            writer.U32(keys[i]).U8((byte)deltas[i]);
+        }
+
+        return writer.ToArray();
+    }
+
     /// <summary>仲裁：<c>count u32, [txn_id u64, key u32, delta u8] * n</c>。</summary>
     public static byte[] Arbitrate(IReadOnlyList<WriteIntent> intents)
     {

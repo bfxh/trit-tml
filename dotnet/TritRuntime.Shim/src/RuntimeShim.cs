@@ -167,6 +167,13 @@ public sealed class RuntimeShim : IDisposable
     public void SubmitIntent(ulong txnId, uint key, TritDelta delta) =>
         host.Kernel.SubmitIntent(txnId, key, delta);
 
+    /// <summary>
+    /// 批量提交意图（txnId == 0 时整批一次性自动提交）。
+    /// 逐条提交每条一趟 FFI，批量提交同一批只付一次调用开销。
+    /// </summary>
+    public void SubmitIntents(ulong txnId, IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas) =>
+        host.Kernel.SubmitIntents(txnId, keys, deltas);
+
     /// <summary>提交事务。</summary>
     public TxnCommitResult Commit(ulong txnId) => host.Kernel.Commit(txnId);
 

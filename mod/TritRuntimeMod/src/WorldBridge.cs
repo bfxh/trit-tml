@@ -557,11 +557,10 @@ internal sealed class WorldBridge
         bool committed = false;
         try
         {
+            // 一批车道一次提交：逐条 SubmitIntent 每条都要走一趟 FFI（实测 0.5µs/条），
+            // 战斗高峰一个 tick 就能堆到上千条，等于白烧 0.8ms 的主线程时间。
             txn = shim.BeginTransaction();
-            for (int i = 0; i < changedKeys.Count; i++)
-            {
-                shim.SubmitIntent(txn, changedKeys[i], changedTrits[i]);
-            }
+            shim.SubmitIntents(txn, changedKeys, changedTrits);
 
             TxnCommitResult result = shim.Commit(txn);
             committed = true;

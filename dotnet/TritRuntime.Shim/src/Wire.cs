@@ -93,6 +93,12 @@ public static class Opcode
 
     /// <summary>查询任务池 Prometheus 指标。</summary>
     public const uint Metrics = 0x19;
+
+    /// <summary>
+    /// 批量提交意图：<c>txn_id u64, count u32, [key u32, delta u8] * n</c>。
+    /// 事务号为 0 表示整批自动提交。
+    /// </summary>
+    public const uint TxnSubmitBatch = 0x1A;
 }
 
 /// <summary>查询编号，与 Rust 侧 <c>trit_rt::wire::query</c> 对齐。</summary>
@@ -317,7 +323,25 @@ public sealed class WireException : Exception
 /// <summary>线格式写入器。</summary>
 public sealed class WireWriter
 {
-    private readonly MemoryStream stream = new();
+    private readonly MemoryStream stream;
+
+    /// <summary>构造写入器（不预分配容量，适合小载荷）。</summary>
+    public WireWriter()
+    {
+        stream = new MemoryStream();
+    }
+
+    /// <summary>
+    /// 构造写入器并一次性预分配容量。
+    ///
+    /// 每 tick 的批量提交载荷是「16 字节头 + 每条 5 字节」，动辄 8KB——不预分配
+    /// 的话 MemoryStream 会按 256/512/1024… 反复扩容拷贝，一 tick 白烧约 28KB
+    /// 垃圾（60 tick/s ≈ 1.7MB/s）。调用方能算长度就应当算。
+    /// </summary>
+    public WireWriter(int capacity)
+    {
+        stream = new MemoryStream(capacity);
+    }
 
     /// <summary>写 u8。</summary>
     public WireWriter U8(byte value)

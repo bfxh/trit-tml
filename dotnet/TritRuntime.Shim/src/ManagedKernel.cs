@@ -928,6 +928,21 @@ public sealed class ManagedKernel : ITritKernel
         }
     }
 
+    /// <summary>批量提交意图。</summary>
+    public void SubmitIntents(ulong txnId, IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas)
+    {
+        if (keys.Count == 0)
+        {
+            return;
+        }
+
+        var response = Submit(Opcode.TxnSubmitBatch, Requests.TxnSubmitBatch(txnId, keys, deltas));
+        if (!response.IsOk)
+        {
+            throw new KernelException(response.Status, $"批量提交意图失败：{lastError}");
+        }
+    }
+
     /// <summary>提交事务。</summary>
     public TxnCommitResult Commit(ulong txnId)
     {
@@ -1107,6 +1122,7 @@ public sealed class ManagedKernel : ITritKernel
             Opcode.TxnCommit => OpTxnCommit(payload),
             Opcode.TxnRollback => OpTxnRollback(payload),
             Opcode.TxnSubmit => OpTxnSubmit(payload),
+            Opcode.TxnSubmitBatch => OpTxnSubmitBatch(payload),
             Opcode.Arbitrate => OpArbitrate(payload),
             Opcode.Query => OpQuery(payload),
             Opcode.Step => OpStep(payload),
@@ -1842,6 +1858,38 @@ public sealed class ManagedKernel : ITritKernel
         }
 
         txns.PushIntent(txnId, intent);
+        return Array.Empty<byte>();
+    }
+
+    private byte[] OpTxnSubmitBatch(byte[] payload)
+    {
+        var reader = new WireReader(payload);
+        var txnId = reader.U64();
+        var count = reader.U32();
+        var intents = new WriteIntent[count];
+        for (int i = 0; i < count; i++)
+        {
+            intents[i] = new WriteIntent(txnId, reader.U32(), (TritDelta)reader.U8());
+        }
+
+        if (intents.Length == 0)
+        {
+            return Array.Empty<byte>();
+        }
+
+        if (txnId == 0)
+        {
+            // 自动提交：整批一次仲裁 + 一次落地（与逐条 submit 等价）。
+            var (applied, _) = CommitIntents(intents, 0);
+            stats.IntentsApplied += applied;
+            return Array.Empty<byte>();
+        }
+
+        foreach (var intent in intents)
+        {
+            txns.PushIntent(txnId, intent);
+        }
+
         return Array.Empty<byte>();
     }
 

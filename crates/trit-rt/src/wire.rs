@@ -71,6 +71,13 @@ pub mod op {
     pub const BUDGET: u32 = 0x18;
     /// 任务池指标：`{}` → `{"prometheus": string}`
     pub const METRICS: u32 = 0x19;
+    /// 批量提交意图（二进制）：`txn_id u64, count u32, [key u32, delta u8] * n` → 空。
+    ///
+    /// `txn_id == 0` 时整批一次性自动提交（一次仲裁 + 一次落地），而不是逐条提交。
+    /// 存在的理由：模组每 tick 会有成百上千条车道变化，逐条走 [`TXN_SUBMIT`] 时
+    /// 每条一次 FFI + 一次 JSON/二进制装箱，实测 0.5µs/条；批量后同一批只付一次
+    /// 调用开销。
+    pub const TXN_SUBMIT_BATCH: u32 = 0x1A;
 }
 
 /// 查询编号。

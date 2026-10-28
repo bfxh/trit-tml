@@ -57,6 +57,12 @@ pub struct RuntimeConfig {
     /// 事务日志条数硬上限（安全阀）：正常情况下日志由「快照截断」维持在
     /// 保留窗口内（远小于此值）；仅当保留窗口异常偏大时，超出部分会触发
     /// 淘汰最旧快照直至日志落回此上限。写满即报错（上层回退到 C# 路径）。
+    ///
+    /// 按 32 字节/条折算，默认上限 1M 条 ≈ 32MB 常驻——这是旁路层给日志的
+    /// 全部预算。早期默认 4M 条（128MB）在实测中把整个内核顶到 136MB 峰值，
+    /// 对游戏进程不可接受；且 4M 条按每 tick 数百条的变化量只覆盖约 106 秒，
+    /// 与 64 张快照 × 300 tick 的 320 秒窗口本就不匹配。要更长回滚窗口，
+    /// 调大本项或调小快照间隔（两者一起决定真正保留的日志量）。
     pub max_log_entries: usize,
     /// 仲裁模式：`"strict"` 或 `"majority"`。
     pub arbitration: ArbitrationModeSerde,
@@ -75,7 +81,7 @@ impl Default for RuntimeConfig {
             max_subscribers: 65_536,
             max_open_txns: 4_096,
             max_snapshots: 64,
-            max_log_entries: 1 << 22,
+            max_log_entries: 1 << 20,
             arbitration: ArbitrationModeSerde::Majority,
             shadow: true,
             parallel: ParallelConfig::default(),
@@ -263,6 +269,7 @@ impl TritRuntime {
             op::TXN_COMMIT => self.op_txn_commit(payload),
             op::TXN_ROLLBACK => self.op_txn_rollback(payload),
             op::TXN_SUBMIT => self.op_txn_submit(payload),
+            op::TXN_SUBMIT_BATCH => self.op_txn_submit_batch(payload),
             op::ARBITRATE => self.op_arbitrate(payload),
             op::QUERY => self.op_query(payload),
             op::STEP => self.op_step(payload),
@@ -357,6 +364,34 @@ impl TritRuntime {
             return Ok(Vec::new());
         }
         self.txns.push_intent(txn_id, intent)?;
+        Ok(Vec::new())
+    }
+
+    fn op_txn_submit_batch(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        let mut reader = Reader::new(payload);
+        let txn_id = reader.u64()?;
+        let count = reader.u32()? as usize;
+        // 先按声明条数预分配，但设上限：坏载荷里的 count 可能是 0xFFFF_FFFF，
+        // 直接 with_capacity 会当场申请 20GB。
+        let mut intents = Vec::with_capacity(count.min(8192));
+        for _ in 0..count {
+            let key = reader.u32()?;
+            let delta = wire::trit_from_byte(reader.u8()?);
+            intents.push(Intent { txn_id, key, delta });
+        }
+        if intents.is_empty() {
+            return Ok(Vec::new());
+        }
+        if txn_id == 0 {
+            // 自动提交：整批一次仲裁 + 一次落地（与逐条 submit 的结果等价，
+            // 但只付一次调用与一次日志追加）。
+            let (applied, _) = self.commit_intents(&intents, 0)?;
+            self.stats.intents_applied += applied as u64;
+            return Ok(Vec::new());
+        }
+        for intent in intents {
+            self.txns.push_intent(txn_id, intent)?;
+        }
         Ok(Vec::new())
     }
 
@@ -503,7 +538,6 @@ impl TritRuntime {
             id,
             tick: self.tick,
             log_seq: self.log.seq(),
-            world: self.world.clone(),
             bytes,
         };
         if self.snapshots.len() >= self.config.max_snapshots.max(1) {
@@ -563,7 +597,6 @@ impl TritRuntime {
                 id,
                 tick: self.tick,
                 log_seq: self.log.seq(),
-                world: self.world.clone(),
                 bytes,
             };
             self.snapshots.insert(id, snapshot);
@@ -584,7 +617,7 @@ impl TritRuntime {
             .snapshots
             .get(&snap_b)
             .ok_or(RtError::SnapshotNotFound(snap_b))?;
-        let entries: Vec<DiffEntry> = diff_worlds(&before.world, &after.world);
+        let entries: Vec<DiffEntry> = diff_worlds(&before.world()?, &after.world()?);
         self.stats.diffs += 1;
         Ok(encode_diff(&entries))
     }
@@ -597,7 +630,7 @@ impl TritRuntime {
             .get(&snap_id)
             .ok_or(RtError::SnapshotNotFound(snap_id))?;
         // 只还原世界投影；日志保持只追加，之后可用 replay_from(snap.log_seq) 重做。
-        self.world = snapshot.world.clone();
+        self.world = snapshot.world()?;
         Ok(Vec::new())
     }
 
@@ -894,14 +927,18 @@ impl TritRuntime {
     }
 
     /// 从 `seq` 之后重放日志（确定性重放验证用）。
+    ///
+    /// 逐条按下标读，不再先把待重放条目 `collect` 成临时 `Vec`：日志可以有
+    /// 上百万条，那次 collect 本身就要分配十几 MB，而这里只需要滚动地取
+    /// 「当前这一条」的两个字段。
     pub fn replay_from(&mut self, seq: u64) -> usize {
-        let entries: Vec<(u32, Ternary)> = self
-            .log
-            .replay_from(seq)
-            .map(|entry| (entry.key, entry.delta))
-            .collect();
+        let start = self.log.start_after(seq);
+        let end = self.log.len();
         let mut applied = 0usize;
-        for (key, delta) in entries {
+        for index in start..end {
+            // 分字段借用：日志只读、世界只写，Rust 允许同时持有。
+            let key = self.log.key_at(index);
+            let delta = self.log.delta_at(index);
             let current = self.world.get(&key).copied().unwrap_or(Ternary::Unknown);
             self.world.insert(key, apply_delta(current, delta));
             applied += 1;
