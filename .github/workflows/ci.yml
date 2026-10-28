@@ -78,6 +78,18 @@ jobs:
       - name: 测试（含原生 vs 托管对拍）
         run: dotnet test dotnet/TritRuntime.Shim.Tests/TritRuntime.Shim.Tests.csproj -c Release --nologo
 
+      # tML 在**游戏内**编译模组源码时不读 csproj 的 <Nullable>（实测：70 条 CS8632 警告，
+      # 等于所有 `?` 注解在游戏内构建里被静默忽略）。只有文件内的 `#nullable enable` 有效，
+      # 所以这里逐文件检查，防止有人新加文件时漏掉——漏了本地编译仍然是 0 警告，看不出来。
+      - name: 模组源码可空上下文
+        shell: bash
+        run: |
+          missing=0
+          for f in mod/TritRuntimeMod/src/*.cs; do
+            head -3 "$f" | grep -q '#nullable enable' || { echo "缺少 #nullable enable：$f"; missing=1; }
+          done
+          exit $missing
+
 # 模组工程（mod/TritRuntimeMod）的编译与 .tmod 打包刻意不进 CI：
 # 它依赖本机安装的 tModLoader（tMLMod.targets、tModLoader.dll、Libraries/**），
 # 而 tML 走 Steam 分发，在 CI 上拉一份完整安装既不稳定也不符合许可。

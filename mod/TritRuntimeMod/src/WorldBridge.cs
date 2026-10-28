@@ -1,3 +1,5 @@
+#nullable enable
+
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -298,15 +300,9 @@ internal sealed class WorldBridge
         catch (Exception ex)
         {
             // 桥接层任何异常都不允许冒到游戏主循环。
+            // 不再尝试回滚：改成 TXN_APPLY 一步提交后，本类根本不开事务，
+            // 不存在"悬挂事务"这回事，那次 Rollback(0) 只是往错误路径里塞一趟必定失败的 FFI。
             mod.Logger.Error("[trit] tick 流水线异常，已跳过本 tick：" + ex);
-            try
-            {
-                shim.Kernel.RollbackTransaction(0); // 无效句柄会按错误码拒绝，只为确保不留下悬挂事务
-            }
-            catch
-            {
-                // 忽略：这里只是清理尝试
-            }
         }
         finally
         {

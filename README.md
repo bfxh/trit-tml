@@ -129,9 +129,9 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 
 | 项 | 状态 | 依据 |
 |---|---|---|
-| Rust 内核测试 | ✅ 119/119 | `cargo test -p trit-rt --release` |
+| Rust 内核测试 | ✅ 130/130（98 单测 + 5 确定性 + 16 FFI + 11 运行时） | `cargo test -p trit-rt --release` |
 | Rust clippy / fmt | ✅ 0 警告 / 干净 | `cargo clippy --all-targets`、`cargo fmt --check` |
-| C# 兼容壳测试 | ✅ 143/143 | `dotnet test`，含原生 vs 托管逐字节对拍 |
+| C# 兼容壳测试 | ✅ 149/149 | `dotnet test`，含原生 vs 托管逐字节对拍 |
 | 原生 / 托管语义等价 | ✅ 快照字节、统计、PRNG 流、冲突诊断全部对拍 | `ParityTests` |
 | 原生 / 托管**扫描结果逐字节等价** | ✅ 4 合法 + 5 非法 + 4 容错载荷，两侧 `JOB_POLL` 记录逐字节相同 | `ParallelApiTests.ManagedAndNativeScanResultsAgreeWhenV2NativeIsAvailable` |
 | 非法请求语义统一 | ✅ 非法 trit / 未知 kind / 缺 pattern / 超容量两侧都产生 `failed` 任务，`error` 文案逐字一致、无前缀 | `ParallelApiTests` + `crates/trit-rt` 测试 |
@@ -139,9 +139,9 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 | 多 mod 结果隔离 | ✅ 按 owner 过滤，只出队真正返回的那几条 | `ParallelApiTests` |
 | 原生库多实例隔离 | ✅ 每个实例只调用自己加载的模块 | `TwoNativeInstancesEachUseTheirOwnModule` |
 | 已知能力差异 | 仅 `Capabilities` 一处：托管回退无 AI 投票（`caps` 少 `0x100` 位、`abi=0`） | 测试中逐字节钉死 |
-| 模组编译 | ✅ 0 警告 0 错误（Debug/Release） | `dotnet build` |
-| 模组 `.tmod` 打包 | ✅ 走 tML 官方管线，含 `lib/TritRuntime.Shim.dll` + `lib/Native/trit_rt.dll` | `-p:BuildMod=true`（需先关游戏） |
-| 模组**进游戏实跑**（客户端） | ✅ 已跑通（本机 tML 1.4.4.9） | 见下 |
+| 模组编译 | ✅ 0 警告 0 错误（含 tML 游戏内编译口径，见下） | `dotnet build`、游戏内 `Build + Reload` |
+| 模组 `.tmod` 打包 | ✅ 走 tML 官方管线，含 `lib/TritRuntime.Shim.dll` + `lib/Native/trit_rt.dll` + 三件套图标 | `-p:BuildMod=true`（需先关游戏） |
+| 模组**进游戏实跑**（客户端） | ✅ 已跑通（本机 tML 1.4.4.9 / 2026.8.3.0） | 见下 |
 | 模组**专用服务器实跑**（无头） | ✅ 装载 / 自检 / 原生库加载全通；`mode=Native` | 见下 |
 | 服务器侧 tick 数据 | ❌ 未取得 | 无玩家连接时服务器不跑世界更新循环（引擎行为），见 issue |
 
@@ -208,6 +208,35 @@ tick 驱动因此从 MonoMod 钩子改为官方 `ModSystem`（不依赖内部方
 并补了两条可观测性日志（首次采样确认、`GameUpdateCount` 恒定时告警）——
 没有这类日志，「装好了但不动」只能靠猜。服务器侧的 tick 数据留 issue 跟踪，等有玩家连接再验。
 
+### 真机实跑记录（2026-10-29，客户端 + 游戏内 Build + Reload）
+
+带全套大模组（Calamity / Thorium / Fargowiltas / HEROsMod …）进游戏实测，日志实证整条链路：
+
+```
+[trit] 已从模组包取出原生内核：...\TritRuntime\native\b32c030ac9ff813d\trit_rt.dll
+[trit] 运行时装配完成 mode=Native abi=3 caps=0xBFF arbitration=Majority
+[trit] 自检 snapshot=1 commit(applied=1,seq=1) ... => PASS
+[trit] 钩子安装完成：3/3（tick 驱动由 ModSystem 提供，不占钩子名额）
+[trit] 世界投影开始采样，game_tick=1
+[trit] 快照 #23 id=26 tick=6900 log_seq=1957772 applied=549
+[trit] 统计 tick=6600 mode=Native counters[...] net_total=2202
+```
+
+即：随包原生库取出落盘 → 装载期自检 PASS → 采样/提交/快照/统计全程无一条 `Guarded` 报错。
+
+这一轮顺带查掉的四个真问题：
+
+| # | 现象（日志原文） | 根因 | 处理 |
+|---|---|---|---|
+| 1 | 游戏内 `Build` 报 **70 条 CS8632 警告**，本地 `dotnet build` 却是 0 警告 | tML 游戏内编译**不读** csproj 的 `<Nullable>`，源码里所有 `?` 注解被静默忽略 | 每个 `.cs` 首行加 `#nullable enable`（csproj 的属性对游戏内编译无效）；CI 加一步逐文件检查防回退 |
+| 2 | `WARN [FNA]: Image loading failed: unknown image type`（打包期） | `icon_small.png` 最初按 80×80 出的，规格要求 **30×30**；但换成正经 30×30、甚至换成 `icon_workshop.png` 的内容仍然报——**与文件内容无关，是按文件名触发的**（tML 2026.8.3.0 自身行为；其它模组根本不带这个文件，所以只有我们会撞上） | 图标仍按规格出（icon 80×80 / icon_small 30×30 / icon_workshop 512×512），警告定性为 tML 侧噪声，记录在案 |
+| 3 | `WARN: Failed to load icon_small.png. Reason: does not exist` | 同上，缺文件时人人都报（Calamity / Thorium / HEROsMod 全在报） | 已补文件，本模组不再报这条 |
+| 4 | `TritRuntimeMod AssemblyLoadContext still using memory`（卸载后） | 与别的模组那条 `mod class still using memory` 不同，是 ALC 级；模组侧无 Timer/后台线程/静态事件注册，**定位需要 heap dump** | 已知未修：只影响开发期热重载，功能与内存均无影响（内核与钩子在 `Unload` 里都已释放） |
+
+另外日志里出现过一次 `KeyNotFoundException: CalamityMod.NPCs.CalamityGlobalNPC`，
+栈顶有 `TritRuntimeMod.TritHooks`——**不是本模组的问题**：异常来自 `CalamityMod...AresBody.AI()`，
+只是我们的钩子先调 `orig` 所以出现在栈上；tML 以「静默捕获异常」处理掉了，未影响游戏。
+
 ## 落地顺序对照
 
 | 步骤 | 状态 |
@@ -253,6 +282,13 @@ tick 驱动因此从 MonoMod 钩子改为官方 `ModSystem`（不依赖内部方
    `JOB_POLL` 支持按 `owner` 过滤，且**只出队真正返回的那几条**——
    其他 owner 的结果留在队列里。过滤与截断的顺序是「先过滤再截断」，
    否则队头被别人的任务占满时，该 owner 的结果会被挤掉。
+7. **tML 游戏内编译不读 csproj 的 `<Nullable>`**：本地 `dotnet build` 0 警告，
+   游戏内 `Build + Reload` 却能报出 70 条 CS8632——因为 tML 用自己的编译参数编源码，
+   csproj 里的可空上下文没带过去，源码里所有 `?` 注解被当成无效注解忽略。
+   要两边都干净，只能在**每个 `.cs` 文件里**写 `#nullable enable`。
+8. **`icon_small.png` 必须 30×30**（bestiary 过滤图标，与 80×80 的 `icon.png` 不同规格）；
+   tML 打包时会为它打一条 `Image loading failed: unknown image type`——实测与文件内容无关
+   （换成任何合法 PNG 都报），属 tML 侧噪声，不影响打包结果。
 
 
 ## 不做什么

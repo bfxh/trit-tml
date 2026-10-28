@@ -1,3 +1,5 @@
+#nullable enable
+
 using Terraria;
 using Terraria.ModLoader;
 
