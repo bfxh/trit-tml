@@ -335,7 +335,11 @@ public static class Wire
         }
 
         var length = BinaryPrimitives.ReadUInt32LittleEndian(framed);
-        if (framed.Length < 4 + length)
+        // 必须用 long 做加法：`4` 是 int 常量、会被隐式提升为 uint 参与运算，
+        // 于是 `4 + 0xFFFF_FFFF` 在 uint 下回绕成 3，越界检查被绕过，
+        // 接着 `(int)length = -1` 喂给 Slice 抛 ArgumentOutOfRangeException。
+        // 坏帧的约定是「返回 null」，绝不能让参数异常穿透到调用方。
+        if (framed.Length < 4L + length)
         {
             return null;
         }
@@ -538,7 +542,10 @@ public sealed class WireReader
     {
         // 负数也要拦：条数算成负数是「载荷非法」的一种（例如 count + 4 溢出回绕），
         // 不拦的话会走到 Slice/Span 上抛 ArgumentOutOfRangeException 而不是 WireException。
-        if (count < 0 || position + count > buffer.Length)
+        // position + count 同样必须提升到 long：position 已推进、count 给 int.MaxValue 时
+        // 两者相加在 int 下回绕成负数，`负数 > buffer.Length` 为假，闸门被绕过，
+        // 随后 Slice 抛 ArgumentOutOfRangeException 穿透——与 Unframe 是同一类缺陷。
+        if (count < 0 || (long)position + count > buffer.Length)
         {
             throw new WireException($"需要 {count} 字节，只剩 {Remaining}");
         }

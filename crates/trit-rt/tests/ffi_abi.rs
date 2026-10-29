@@ -86,7 +86,14 @@ fn create_capabilities_and_destroy() {
         assert_eq!(tt_rt_version(), 0x00_01_00_00);
         let caps = tt_rt_capabilities(handle);
         assert!(caps & (1 << 0) != 0, "ROUTER 能力位应置起");
-        assert!(caps & (1 << 8) != 0, "AI 能力位应置起（默认 feature）");
+        // AI 位随 `ai-voting` feature 有无而定（默认 feature 含它）。
+        // CI 会跑 `--no-default-features`，那时这条必须反过来断言「未置起」，
+        // 否则矩阵里那一格永远红——但产品行为是对的。
+        assert_eq!(
+            caps & (1 << 8) != 0,
+            cfg!(feature = "ai-voting"),
+            "AI 能力位应与 ai-voting feature 一致"
+        );
         assert!(caps & (1 << 9) != 0, "PARALLEL 能力位应置起");
         assert!(caps & (1 << 11) != 0, "BUDGET 能力位应置起");
         assert!(

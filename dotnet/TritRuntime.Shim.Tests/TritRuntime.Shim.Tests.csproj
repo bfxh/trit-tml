@@ -25,11 +25,25 @@
     <ProjectReference Include="..\TritRuntime.Shim\TritRuntime.Shim.csproj" />
   </ItemGroup>
 
-  <!-- 原生内核 DLL：对拍测试需要。缺失时相关测试自动跳过而不是误报失败。 -->
+  <!--
+    原生内核产物：对拍测试需要。按平台复制对应文件；缺失时相关测试自动跳过而不是误报失败。
+    跨平台 CI 先构建 release 版 trit-rt（cargo build -p trit-rt 加 release 开关），产物落在 target/release/ 下：
+      Windows → trit_rt.dll    Linux → libtrit_rt.so    macOS → libtrit_rt.dylib
+    测试定位器 NativeLibraryLocator 会逐级上溯找 target/release，或用 TRIT_RT_LIBRARY 显式指定，
+    这里的 CopyToOutputDirectory 只是让「产物与测试程序同目录」这一常见布局也命中。
+  -->
   <ItemGroup>
     <None Include="$(MSBuildThisFileDirectory)..\..\target\release\trit_rt.dll"
-          Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\release\trit_rt.dll')"
+          Condition="$([MSBuild]::IsOSPlatform('Windows')) And Exists('$(MSBuildThisFileDirectory)..\..\target\release\trit_rt.dll')"
           Link="trit_rt.dll"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.so"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) And Exists('$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.so')"
+          Link="libtrit_rt.so"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.dylib"
+          Condition="$([MSBuild]::IsOSPlatform('OSX')) And Exists('$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.dylib')"
+          Link="libtrit_rt.dylib"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

@@ -13,9 +13,33 @@ namespace TritRuntime.Shim.Tests;
 /// </summary>
 internal static class NativeLibraryLocator
 {
-    /// <summary>找 trit_rt.dll；找不到返回 null。</summary>
+    /// <summary>按当前平台给出原生库文件名（与 NativeBindings 的兜底候选同口径）。</summary>
+    private static string[] FileNames()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return new[] { "trit_rt.dll" };
+        }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            return new[] { "libtrit_rt.dylib", "trit_rt.dylib" };
+        }
+
+        return new[] { "libtrit_rt.so", "trit_rt.so" };
+    }
+
+    /// <summary>按当前平台找原生库；找不到返回 null（parity 测试据此跳过）。</summary>
     public static string? Find()
     {
+        // 显式环境变量优先级最高：跨平台 CI 可以直接把编译产物路径喂进来，
+        // 覆盖掉下面所有探测路径。存在但文件缺失时仍继续走自动探测。
+        var fromEnvironment = Environment.GetEnvironmentVariable(RuntimeHost.LibraryPathEnvironmentVariable);
+        if (!string.IsNullOrEmpty(fromEnvironment) && File.Exists(fromEnvironment))
+        {
+            return fromEnvironment;
+        }
+
         var candidates = new List<string>();
         void Add(string? path)
         {
@@ -25,16 +49,26 @@ internal static class NativeLibraryLocator
             }
         }
 
-        // 仓库约定：target/release/trit_rt.dll（相对测试程序目录逐级上溯）。
+        var names = FileNames();
+
+        // 仓库约定：target/release/<平台库名>（相对测试程序目录逐级上溯）。
+        // CI 上先 `cargo build --release` 再 `dotnet test`，产物就在这一层。
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         for (var depth = 0; depth < 8 && directory is not null; depth++)
         {
-            Add(Path.Combine(directory.FullName, "target", "release", "trit_rt.dll"));
+            foreach (var name in names)
+            {
+                Add(Path.Combine(directory.FullName, "target", "release", name));
+            }
+
             directory = directory.Parent;
         }
 
-        Add(Path.Combine(AppContext.BaseDirectory, "trit_rt.dll"));
-        Add(Environment.GetEnvironmentVariable(RuntimeHost.LibraryPathEnvironmentVariable));
+        // 测试输出目录（csproj 按平台 CopyToOutputDirectory 的那份）。
+        foreach (var name in names)
+        {
+            Add(Path.Combine(AppContext.BaseDirectory, name));
+        }
 
         foreach (var candidate in candidates)
         {

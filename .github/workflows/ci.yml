@@ -8,14 +8,24 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
   DOTNET_NOLOGO: true
   DOTNET_CLI_TELEMETRY_OPTOUT: true
+  # MSRV：workspace rust-version = 1.88。写死版本而不是 stable，
+  # 保证"最低支持版本"这件事真的被持续验证，而不是随工具链升级悄悄漂移。
+  MSRV: "1.88.0"
 
 jobs:
-  # 三进制内核：格式、静态检查、测试、产出原生库
-  rust:
-    name: rust (windows)
-    runs-on: windows-latest
+  # ────────────────────────────────────────────────────────────────────────
+  # 1) 静态检查：格式 + clippy。把 lint 从测试里拆出来，失败时能一眼定位是
+  #    "代码风格/静态缺陷" 还是 "运行期行为"，不用去翻测试矩阵某一格的日志。
+  #    用 Ubuntu（最快、最便宜），clippy 覆盖三种 feature 组合——尤其
+  #    --all-features 会把 gpu 分支编译进来，那个分支在默认构建里根本碰不到，
+  #    确实曾经悄悄坏过一次。
+  # ────────────────────────────────────────────────────────────────────────
+  lint:
+    name: lint (fmt + clippy ×3)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -26,37 +36,239 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: fmt
         run: cargo fmt --all --check
 
-      - name: clippy
-        # 带 gpu feature 一起查：否则 gpu 分支的代码在 CI 里根本编译不到，
-        # 改坏了也发现不了（这个分支确实坏过一次）。
-        run: cargo clippy -p trit-rt --all-targets --features gpu -- -D warnings
+      - name: clippy · 默认特性
+        run: cargo clippy -p trit-rt --all-targets -- -D warnings
+
+      - name: clippy · 无默认特性
+        # no-default-features 关掉 ai-voting，代码里的 cfg 分支要走另一套——
+        # 能力位断言曾经在这里硬编码"AI 必开"，导致该组合永远红。
+        run: cargo clippy -p trit-rt --all-targets --no-default-features -- -D warnings
+
+      - name: clippy · 全特性（含 gpu）
+        run: cargo clippy -p trit-rt --all-targets --all-features -- -D warnings
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 2) Rust 测试矩阵：OS × feature × profile。
+  #    - OS：三平台都要，原生库按平台产出，语义不能只在 Windows 上成立。
+  #    - feature：default / no-default / all，覆盖三条编译路径。
+  #    - profile：debug 能抓到整数溢出 panic（release 会静默回绕），
+  #      release 才是发布形态。两者都要，不能用其中一个代替另一个。
+  #    用 exclude 砍掉重复组合（all-features 只在 release 跑，节省 CI 时间）。
+  # ────────────────────────────────────────────────────────────────────────
+  rust-test:
+    name: rust ${{ matrix.os }} / ${{ matrix.features }} / ${{ matrix.profile }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        features: [default, no-default, all]
+        profile: [debug, release]
+        exclude:
+          # all-features 编译 wgpu 很慢，只在 release 跑一次即可；
+          # debug 的溢出捕获价值已在 default/no-default 两格拿到。
+          - features: all
+            profile: debug
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}-${{ matrix.profile }}
+
+      - name: 组装 cargo 参数
+        id: flags
+        shell: bash
+        run: |
+          case "${{ matrix.features }}" in
+            default)     FEAT="" ;;
+            no-default)  FEAT="--no-default-features" ;;
+            all)         FEAT="--all-features" ;;
+          esac
+          case "${{ matrix.profile }}" in
+            debug)   PROF="" ;;
+            release) PROF="--release" ;;
+          esac
+          echo "value=$PROF $FEAT" >> "$GITHUB_OUTPUT"
 
       - name: test
+        run: cargo test -p trit-rt ${{ steps.flags.outputs.value }}
+
+      - name: build（--all-targets 覆盖 benches/examples）
+        # `cargo test -p` 只编译测试目标；benches / examples 若存在不会被碰到。
+        # --all-targets --no-run 把它们也编一遍（不执行），防止新加的 bench
+        # 在某一 feature 组合下编译失败却无人发现。workspace 目前只有 trit-rt
+        # 一个 member，所以与上一格不重复：上一格跑测试，这一格只编译其余目标。
+        run: cargo build --workspace --all-targets ${{ steps.flags.outputs.value }}
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 3) MSRV：最低 Rust 版本。--locked 保证用仓库钉住的 Cargo.lock，
+  #    避免"依赖自动升级后其实需要更高版本"被悄悄放过。
+  # ────────────────────────────────────────────────────────────────────────
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.ver.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链
         run: |
-          cargo test -p trit-rt --release
-          cargo test -p trit-rt --release --features gpu
+          rustup toolchain install "$MSRV" --profile minimal
+          rustup default "$MSRV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: 记录版本
+        id: ver
+        run: echo "value=$(rustc --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: check · 默认特性
+        run: cargo check -p trit-rt --locked
+
+      - name: check · 全特性
+        run: cargo check -p trit-rt --locked --all-features
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 4) GPU：单独一格跑到「测试」级别而不只是 clippy。
+  #    必须带 --no-default-features：default 只有 ai-voting，所以 `--features gpu`
+  #    （保留 default）实际就等于 --all-features，与 rust-test 的 all/release 格
+  #    完全重复、白跑一遍 wgpu 编译。这里关掉 ai-voting 只留 gpu，才是一个其他
+  #    格子都没覆盖的编译路径——钉死「gpu 分支不能偷偷依赖 ai-voting」。
+  #    CI 无显卡，CPU 镜像 / 探测回退路径必须照常工作：没 GPU 也不能炸。
+  # ────────────────────────────────────────────────────────────────────────
+  gpu:
+    name: gpu feature (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpu
+
+      - name: test --no-default-features --features gpu
+        run: cargo test -p trit-rt --release --no-default-features --features gpu
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 5) 覆盖率：cargo-llvm-cov。失败不阻塞合并（覆盖率工具本身偶发与新版
+  #    rustc/llvm 不兼容），但结果会作为制品留档，长期看趋势。
+  # ────────────────────────────────────────────────────────────────────────
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: 生成覆盖率
+        run: cargo llvm-cov -p trit-rt --all-features --lcov --output-path lcov.info
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 6) 三平台原生库制品。发布用库**不带** gpu feature：运行时对 n=1 的窗口
+  #    扫描一律走 CPU（实测 GPU 慢 58 倍且会 panic），带 wgpu 只是白涨体积。
+  #    需要排查 GPU 时用 --features gpu 单独出包（见上面的 gpu job）。
+  # ────────────────────────────────────────────────────────────────────────
+  native:
+    name: native lib (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            lib: libtrit_rt.so
+          - os: windows-latest
+            lib: trit_rt.dll
+          - os: macos-latest
+            lib: libtrit_rt.dylib
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-${{ matrix.os }}
 
       - name: build cdylib
-        # 发布用的 DLL **不带** gpu feature：运行时对 n=1 的窗口扫描一律走 CPU
-        # （实测 GPU 慢 58 倍且会 panic，见 crates/trit-rt/src/gpu.rs），
-        # 带 wgpu 只是白涨体积；需要排查 GPU 时用 --features gpu 单独出包。
         run: cargo build --release -p trit-rt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: trit-rt-windows
-          path: target/release/trit_rt.dll
+          name: trit-rt-${{ matrix.os }}
+          path: target/release/${{ matrix.lib }}
           if-no-files-found: error
 
-  # C# 兼容壳：含原生 vs 托管逐字节对拍，所以必须在能编译出原生库的机器上跑。
-  # 注意：这三步（rust / dotnet / 对拍）是本仓库的核心门禁，必须全绿。
+  # ────────────────────────────────────────────────────────────────────────
+  # 7) dotnet parity：三平台各自编译原生库，再跑「原生 vs 托管逐字节对拍」。
+  #    不 needs native、也不下载它的制品：下载产物在 Linux 上没有可执行位、
+  #    macOS 上带 quarantine 属性，dlopen 会失败；本格自己编译最可靠，
+  #    三格与 native 并行跑，反馈更快。native 格只负责产出可下载的发布制品。
+  #
+  #    **关键护栏**：库缺失时 ParityTests.Pair() 返回 null，用例直接 return，
+  #    xunit 仍记为「通过」——"全绿但根本没对拍"。所以这里先硬断言库文件
+  #    存在、再用 TRIT_RT_LIBRARY 显式指路，缺一个都当场失败，绝不放过空跑。
+  # ────────────────────────────────────────────────────────────────────────
   dotnet:
-    name: dotnet (windows)
-    runs-on: windows-latest
-    needs: rust
+    name: dotnet parity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            lib: libtrit_rt.so
+          - os: windows-latest
+            lib: trit_rt.dll
+          - os: macos-latest
+            lib: libtrit_rt.dylib
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,27 +278,59 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
-      - name: 工具链 + 原生库
+      - name: 工具链
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          cargo build --release -p trit-rt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dotnet-${{ matrix.os }}
+
+      - name: 编译原生库
+        run: cargo build --release -p trit-rt
+
+      - name: 断言原生库确实产出（防止 parity 静默跳过）
+        shell: bash
+        run: |
+          test -f "target/release/${{ matrix.lib }}" || {
+            echo "原生库缺失：target/release/${{ matrix.lib }}";
+            echo "parity 用例会在库缺失时静默跳过，dotnet test 照样显示全绿——必须在这里拦下";
+            exit 1;
+          }
 
       - name: 构建兼容壳
         run: dotnet build dotnet/TritRuntime.Shim/TritRuntime.Shim.csproj -c Release --nologo
 
       - name: 测试（含原生 vs 托管对拍）
+        env:
+          # 显式指路，绕开工作目录差异；定位器会优先用这个。
+          TRIT_RT_LIBRARY: ${{ github.workspace }}/target/release/${{ matrix.lib }}
         run: dotnet test dotnet/TritRuntime.Shim.Tests/TritRuntime.Shim.Tests.csproj -c Release --nologo
 
-      # tML 在**游戏内**编译模组源码时不读 csproj 的 <Nullable>（实测：70 条 CS8632 警告，
-      # 等于所有 `?` 注解在游戏内构建里被静默忽略）。只有文件内的 `#nullable enable` 有效，
-      # 所以这里逐文件检查，防止有人新加文件时漏掉——漏了本地编译仍然是 0 警告，看不出来。
-      #
-      # 范围是全仓 C# 源码而不只是模组：兼容壳与测试目前都由自己的 csproj 构建、
-      # 走的是正确的可空上下文，但"依赖工程级设置"正是这次踩坑的根因——
-      # 一旦有人换了构建管线（发布脚本、游戏内构建、被别的工程当源码引入），
-      # 注解就会在同一份代码上静默失效。写进文件里，任何管线都吃同一套语义。
-      - name: C# 源码可空上下文
+  # ────────────────────────────────────────────────────────────────────────
+  # 8) C# 可空上下文门禁。tML 在游戏内编译模组源码时**不读** csproj 的
+  #    <Nullable>（实测 70 条 CS8632 警告，等于所有 `?` 注解被静默忽略）。
+  #    只有文件内的 `#nullable enable` 有效。这里两道检查：
+  #      a) 每个 .cs 文件前三行必须有 `#nullable enable`（防新文件漏写）；
+  #      b) 强制 Nullable=disable 全量重编，若还有 CS8632 说明注解白写了。
+  #    静态扫描覆盖全仓 C# 源码（含模组）；编译验证只覆盖 dotnet 工程——模组依赖
+  #    本机 tModLoader，按文件末尾说明不进 CI。依赖工程级设置正是踩坑根因，
+  #    换构建管线就会静默失效，必须把 #nullable enable 写进文件里。
+  # ────────────────────────────────────────────────────────────────────────
+  csharp-nullable:
+    name: C# nullable gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: 每个 C# 源文件都要有 #nullable enable
         shell: bash
         run: |
           missing=0
@@ -97,12 +341,12 @@ jobs:
           done
           exit $missing
 
-      # 上一条是"逐文件有指令"，这一条是"指令真的生效"：
-      # 强制 Nullable=disable 构建，若还有 CS8632，说明某个文件的 `?` 注解白写了。
-      # （全局属性会同时作用到被引用工程，正好把兼容壳也一起验了。）
       - name: 任意可空设置下都不出 CS8632
         shell: bash
         run: |
+          # 显式开 pipefail：GitHub 的 bash 默认带，但写死在这里，防止有人把 shell
+          # 改成 sh（sh 没有 pipefail）后「build 失败但没 CS8632」被误判成通过。
+          set -o pipefail
           dotnet build dotnet/TritRuntime.Shim.Tests/TritRuntime.Shim.Tests.csproj \
             -c Release --nologo -p:Nullable=disable 2>&1 | tee /tmp/nullable.log
           n=$(grep -c 'CS8632' /tmp/nullable.log || true)
@@ -110,7 +354,7 @@ jobs:
           [ "$n" -eq 0 ]
 
 # 模组工程（mod/TritRuntimeMod）的编译与 .tmod 打包刻意不进 CI：
-# 它依赖本机安装的 tModLoader（tMLMod.targets、tModLoader.dll、Libraries/**），
+# 它依赖本机安装的 tModLoader（tModLoader.dll、Libraries/**、tMLMod.targets），
 # 而 tML 走 Steam 分发，在 CI 上拉一份完整安装既不稳定也不符合许可。
 # 模组的验证方式：本地 `dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj`，
 # 打包 `-p:BuildMod=true`，详见 mod/TritRuntimeMod/README.md 与根 README 的「验证状态」。

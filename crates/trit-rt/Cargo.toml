@@ -34,7 +34,8 @@ thiserror.workspace = true
 default = ["ai-voting"]
 # 三值权重网络（{-1,0,+1}）做 AI 决策投票：确定/弃权两态输出。
 ai-voting = ["dep:trit-net"]
-# GPU 后端：拉起 wgpu，编译变慢、产物变大，所以默认不开（发布构建带这个 feature）。
+# GPU 后端：拉起 wgpu，编译变慢、产物变大，所以默认不开；发布构建同样不带——
+# 真机实测 n=1 窗口扫描 GPU 比 CPU 位并行慢 58 倍（见 src/gpu.rs），带 wgpu 只是白涨体积。
 # 关掉时 CPU 位并行镜像照常工作，GPU 状态恒为"不可用"并给出原因——玩家侧无感回退。
 gpu = ["trit-gpu/gpu"]
 
