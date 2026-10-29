@@ -25,6 +25,28 @@ const TRITS_PER_WORD: usize = 32;
 /// 单侧矩阵缓冲区的上限；超过就别建 A 矩阵了，直接 CPU 分块扫。
 const MAX_PACKED_BYTES: usize = 64 << 20;
 
+/// 分块窗口大小（`try_gpu_pattern` 与闸门共用）。
+const WINDOW_BLOCK: usize = 1 << 15;
+
+/// GPU pattern 路径的一次性分配闸门：返回本块窗口大小，超预算返回 `None`。
+///
+/// 量的是**真正会同时握在手里**的东西：scores 一份、正负两条展开导轨各一份、
+/// 两条 scratch 各一份，合计封顶 `MAX_PACKED_BYTES`。旧闸门只量 `total × words`，
+/// 与实际申请量差 `WINDOW_BLOCK / total` 倍——`total=1`、`words=3_125_000` 时
+/// 旧公式看到 12.5MB 放行，实际按 `WINDOW_BLOCK` 满额申请就是几百 GB，
+/// `with_capacity` 失败是 alloc error → 进程 abort（`catch_unwind` 拦不住）。
+/// 这里把「闸门」与「容量按实际块大小申请」绑在一起，避免以后改一处漏一处。
+fn gpu_pattern_block(total: usize, words: usize) -> Option<usize> {
+    let block = total.min(WINDOW_BLOCK);
+    let scores = total.saturating_mul(size_of::<u32>());
+    let rails = block.saturating_mul(words).saturating_mul(size_of::<u32>());
+    let scratch = words.saturating_mul(size_of::<u32>());
+    let wanted = scores
+        .saturating_add(rails.saturating_mul(2))
+        .saturating_add(scratch.saturating_mul(2));
+    (wanted <= MAX_PACKED_BYTES).then_some(block)
+}
+
 /// 扫描种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanKind {
@@ -816,10 +838,11 @@ impl ScanJob {
             return false;
         }
         let words = self.pattern.len().div_ceil(TRITS_PER_WORD);
-        // A 矩阵两条导轨：先算字节数，超限就不建（宁可慢，不能把内存吃穿）。
-        if total.saturating_mul(words).saturating_mul(4) > MAX_PACKED_BYTES {
+        // 闸门量的是实际申请量（见 `gpu_pattern_block`）；下面申请容量时也必须按
+        // 返回的 `block` 来要，不能按 `WINDOW_BLOCK` 满额要。
+        let Some(block) = gpu_pattern_block(total, words) else {
             return false;
-        }
+        };
         let trits = total.saturating_mul(self.pattern.len());
         {
             let backend = self
@@ -854,10 +877,11 @@ impl ScanJob {
         // （4M 窗口 × 2 字 = 32MB），既吃内存又把 CPU 缓存全冲掉，还会顶到
         // 上游的 dispatch 网格上限。按块展开后峰值只剩 `block × words`（几百 KB），
         // 而且每块单独 dispatch，永远不会越界。
-        const WINDOW_BLOCK: usize = 1 << 15;
+        // 容量按**实际块大小** `min(total, WINDOW_BLOCK)` 申请：按 `WINDOW_BLOCK` 满额申请
+        // 会在 `total` 很小、`words` 很大时白要几百 GB（闸门已在函数开头量过一遍）。
         let mut scores = Vec::with_capacity(total);
-        let mut block_pos: Vec<u32> = Vec::with_capacity(WINDOW_BLOCK * words);
-        let mut block_neg: Vec<u32> = Vec::with_capacity(WINDOW_BLOCK * words);
+        let mut block_pos: Vec<u32> = Vec::with_capacity(block * words);
+        let mut block_neg: Vec<u32> = Vec::with_capacity(block * words);
         self.scratch_pos.resize(words, 0);
         self.scratch_neg.resize(words, 0);
 
@@ -1097,6 +1121,33 @@ mod tests {
             gpu(),
         );
         (job, sink)
+    }
+
+    /// 回归：GPU pattern 闸门量的是实际申请量，不是 `total × words` 这个相关量。
+    ///
+    /// 反向对照直接写在断言里：下面这组输入在**旧公式**下是放行的
+    /// （`32768 × 300 × 4 = 37.5MB < 64MB`），但实际五份缓冲合计约 75MB，
+    /// 新闸门必须拒绝。谁把闸门改回旧公式，这组断言就会红。
+    #[test]
+    fn gpu_pattern_gate_measures_the_real_allocation() {
+        let total = WINDOW_BLOCK;
+        let words = 300usize;
+        let old_formula = total.saturating_mul(words).saturating_mul(4);
+        assert!(
+            old_formula <= MAX_PACKED_BYTES,
+            "旧公式在这组输入下会放行，是反向验证的前置条件"
+        );
+        assert!(
+            gpu_pattern_block(total, words).is_none(),
+            "实际五份缓冲合计超过 64MB，闸门必须拒绝"
+        );
+
+        // 正常小输入仍放行，返回值是本块窗口大小。
+        assert_eq!(gpu_pattern_block(100, 2), Some(100));
+
+        // 原 bug 场景：total=1 时容量按实际块大小（1）申请，不再按 WINDOW_BLOCK
+        // 满额要几百 GB；此时闸门应放行。
+        assert_eq!(gpu_pattern_block(1, 3_125_000), Some(1));
     }
 
     #[test]

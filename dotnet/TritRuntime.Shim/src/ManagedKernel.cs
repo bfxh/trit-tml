@@ -4,6 +4,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -553,6 +554,18 @@ internal sealed class Txn
 /// <summary>事务表：未关闭事务 + 状态机校验。</summary>
 internal sealed class TxnTable
 {
+    /// <summary>
+    /// 已关闭事务的保留条数；与 Rust 侧 <c>CLOSED_TXN_RETAIN</c> 同值同语义。
+    /// </summary>
+    /// <remarks>
+    /// 保留它们只是为了「重复提交 / 重复回滚」能报出状态错误而不是「事务不存在」
+    /// （诊断友好）。但绝不能全留：模组每个 tick 开一个事务，全留会让事务表随 tick
+    /// 无界增长，而且 <c>max_open</c> 的额度被历史事务占满——原生侧实测跑到 4096 tick
+    /// 之后 <c>begin</c> 永久失败、**整个旁路写入路径就此停摆**。
+    /// 托管回退内核必须同口径：回退不是换一套表现，是换一条实现。
+    /// </remarks>
+    private const int ClosedRetain = 1024;
+
     private readonly SortedDictionary<ulong, Txn> txns = new();
     private readonly int maxOpen;
     private ulong nextId;
@@ -565,15 +578,40 @@ internal sealed class TxnTable
         this.maxOpen = maxOpen;
     }
 
-    /// <summary>未关闭事务数。</summary>
-    public int OpenCount => txns.Count;
+    /// <summary>
+    /// 未关闭事务数。
+    /// </summary>
+    /// <remarks>
+    /// <b>只数还在打开中的</b>：已提交 / 已回滚的不算并发。用条目总数当并发数，
+    /// 会让一张只增不减的表把容量额度吃光。
+    /// </remarks>
+    public int OpenCount => txns.Values.Count(txn => txn.State == TxnState.Open);
 
     /// <summary>开事务。</summary>
     public ulong Begin(ulong tick)
     {
-        if (txns.Count >= maxOpen)
+        // 上限只约束「真正打开中」的事务；已关闭的不算并发。
+        int open = OpenCount;
+        if (open >= maxOpen)
         {
-            throw new RtException(Status.Capacity, $"容量超限：并发事务数达到上限 {maxOpen}");
+            throw new RtException(Status.Capacity, $"并发事务数达到上限 {maxOpen}");
+        }
+
+        // 已关闭事务留最近 ClosedRetain 条即可。键是自增 id，SortedDictionary 的
+        // 序即开启顺序，取前若干个就是最旧的。
+        int closed = txns.Count - open;
+        if (closed > ClosedRetain)
+        {
+            int drop = closed - ClosedRetain;
+            var stale = txns
+                .Values.Where(txn => txn.State != TxnState.Open)
+                .Take(drop)
+                .Select(txn => txn.Id)
+                .ToList();
+            foreach (ulong staleId in stale)
+            {
+                txns.Remove(staleId);
+            }
         }
 
         nextId += 1;
@@ -777,8 +815,18 @@ public sealed class ManagedKernel : ITritKernel
     /// <summary>影子签名滚动窗口大小。</summary>
     public const int ShadowWindow = 64;
 
-    /// <summary>事件载荷缓存上限。</summary>
+    /// <summary>事件载荷缓存上限（条数）。</summary>
     public const int MaxEventPayloads = 4096;
+
+    /// <summary>
+    /// 事件载荷缓存上限（trit 总数）；与 Rust 侧 <c>MAX_EVENT_PAYLOAD_TRITS</c> 同值。
+    /// </summary>
+    /// <remarks>
+    /// 两道闸缺一不可，理由原生侧写在 <c>op_publish</c> 上：条数闸挡「很多个小事件」，
+    /// 字节闸挡「少量超大事件」。只有条数闸时，4096 条 × 每条 100 万 trit = 4 GB 常驻，
+    /// 一次坏调用就能把进程顶到系统拒绝分配——而调用方只是「发布了一个大事件」，看不出错。
+    /// </remarks>
+    public const int MaxEventPayloadTrits = 8 << 20;
 
     /// <summary>单次 PRNG 抽样上限。</summary>
     public const int MaxPrngCount = 1 << 16;
@@ -793,6 +841,9 @@ public sealed class ManagedKernel : ITritKernel
     private readonly SortedDictionary<uint, TritDelta> world = new();
     private readonly SortedDictionary<ulong, SnapshotRecord> snapshots = new();
     private readonly SortedDictionary<uint, TritDelta[]> eventPayloads = new();
+
+    /// <summary>当前缓存的事件载荷 trit 总数（字节闸门的判据）。</summary>
+    private int eventPayloadTrits;
     private DeterministicPrng prng;
     private readonly ShadowLog shadow = new();
     private readonly Stats stats = new();
@@ -1031,6 +1082,12 @@ public sealed class ManagedKernel : ITritKernel
     /// <summary>记录影子差分。</summary>
     public ulong ShadowRecord(byte[] signature)
     {
+        // 特意**不**在这里做越界收敛：`ShadowRecord(byte[])` 是给调用方用的诊断入口，
+        // 真机踩过的坑正是「把任意二进制字节当签名传进来」，静默收敛成一个合法 trit
+        // 就会把一串垃圾记成「发现了一个分歧」。越界必须**响亮地报错**
+        // （由下面的打包阶段抛 WireException → Status.Decode），与原生同口径。
+        // 越界收敛只用于**线格式解码**路径（见 `Wire.TritDecoder`），那里必须与
+        // 原生 `trit_from_byte` 一致，否则仲裁结果会分叉。
         var trits = Array.ConvertAll(signature, value => (TritDelta)value);
         var response = Submit(Opcode.ShadowRecord, Requests.ShadowRecord(trits));
         return KernelResponseMapper.ToU64(response, lastError);
@@ -1129,6 +1186,7 @@ public sealed class ManagedKernel : ITritKernel
             world.Clear();
             snapshots.Clear();
             eventPayloads.Clear();
+            eventPayloadTrits = 0;
             completedJobs.Clear();
             nextSnapshotId = 0;
             tick = 0;
@@ -1855,8 +1913,20 @@ public sealed class ManagedKernel : ITritKernel
         var modId = reader.U32();
         var eventId = reader.U32();
         var priority = reader.I32();
-        var depCount = checked((int)reader.U32());
-        var deps = new uint[Math.Min(depCount, 4096)];
+        var depCount = reader.Count32();
+        // 与原生 op_subscribe 同口径：声明多少条就读多少条，载荷不够报 Decode。
+        // 旧写法把上限夹成 4096 后照常返回成功——「声明 4097 条依赖、载荷只给 4096 条」
+        // 会在托管侧静默建成一张少了边的订阅图，原生侧则报 Decode：状态码与图都分叉。
+        // 先按剩余字节夹一道，避免拿 int.MaxValue 去跑循环（同样报 Decode）。
+        const int headerBytes = 16;
+        var available = Math.Max(0, (payload.Length - headerBytes) / sizeof(uint));
+        if (depCount > available)
+        {
+            throw new WireException(
+                $"订阅载荷声明 {depCount} 条依赖，实际只有 {available} 条的空间");
+        }
+
+        var deps = new uint[depCount];
         for (var i = 0; i < deps.Length; i++)
         {
             deps[i] = reader.U32();
@@ -1879,19 +1949,74 @@ public sealed class ManagedKernel : ITritKernel
         var eventId = reader.U32();
         var trits = reader.Trits();
         stats.EventsPublished += 1;
-        if (eventPayloads.Count >= MaxEventPayloads)
+
+        // 覆盖同 id 的旧载荷前必须先扣掉旧长度：只加不减会让计数器虚增
+        // （同一 id 发布 N 次就报 N×size），而它正是字节闸门的判据——虚增会让淘汰
+        // 误判超预算，把**别人**的载荷当受害者提前淘汰，表现为读别人的事件时拿到空数组。
+        // 这是静默丢数据，比内存涨更难查。
+        if (eventPayloads.TryGetValue(eventId, out var previous))
         {
-            // 滚动淘汰：清掉最早插入的一批（SortedDictionary 序即事件 ID 序）。
-            var oldest = eventPayloads.Keys.Take(1024).ToArray();
-            foreach (var key in oldest)
-            {
-                eventPayloads.Remove(key);
-            }
+            eventPayloadTrits -= previous.Length;
         }
 
+        eventPayloadTrits += trits.Length;
         eventPayloads[eventId] = trits;
+        EvictEventPayloads(eventId);
+
         var dirty = router.Publish(eventId);
         return new WireWriter().U32((uint)dirty).ToArray();
+    }
+
+    /// <summary>
+    /// 按条数 + trit 总数双预算淘汰最旧的事件载荷，**绝不淘汰刚发布的那条**；
+    /// 与原生 <c>evict_event_payloads</c> 逐行为一致。
+    /// </summary>
+    /// <remarks>
+    /// 刚发布的那条若自身就超预算，就留它一个：淘汰它等于让 <c>publish</c> 什么都不做，
+    /// 调用方会拿到「成功」但监听者读不到载荷，这种静默失败比拒绝更难查。
+    /// 事件 ID 递增是既有假设（SortedDictionary 序即 ID 序），所以最旧的恒为最小键。
+    /// </remarks>
+    private void EvictEventPayloads(uint keep)
+    {
+        while (true)
+        {
+            bool overCount = eventPayloads.Count > MaxEventPayloads;
+            bool overBytes = eventPayloadTrits > MaxEventPayloadTrits;
+            if (!overCount && !overBytes)
+            {
+                return;
+            }
+
+            // 取最旧的一个键；若它就是刚发布的那条，退一步取第二旧的。
+            uint victim;
+            using (var keys = eventPayloads.Keys.GetEnumerator())
+            {
+                if (!keys.MoveNext())
+                {
+                    return;
+                }
+
+                uint first = keys.Current;
+                if (first != keep)
+                {
+                    victim = first;
+                }
+                else if (keys.MoveNext())
+                {
+                    victim = keys.Current;
+                }
+                else
+                {
+                    // 只剩刚发布的那条：预算再超也只能留着（见上面的取舍说明）。
+                    return;
+                }
+            }
+
+            if (eventPayloads.Remove(victim, out var dropped))
+            {
+                eventPayloadTrits -= dropped.Length;
+            }
+        }
     }
 
     private byte[] OpTxnBegin(byte[] payload)
@@ -1906,7 +2031,7 @@ public sealed class ManagedKernel : ITritKernel
         var reader = new WireReader(payload);
         var txnId = reader.U64();
         var key = reader.U32();
-        var delta = (TritDelta)reader.U8();
+        var delta = TritDecoder.FromByte(reader.U8());
         var intent = new WriteIntent(txnId, key, delta);
         if (txnId == 0)
         {
@@ -1929,7 +2054,7 @@ public sealed class ManagedKernel : ITritKernel
         var intents = new WriteIntent[count];
         for (int i = 0; i < count; i++)
         {
-            intents[i] = new WriteIntent(txnId, reader.U32(), (TritDelta)reader.U8());
+            intents[i] = new WriteIntent(txnId, reader.U32(), TritDecoder.FromByte(reader.U8()));
         }
 
         if (intents.Length == 0)
@@ -1975,7 +2100,7 @@ public sealed class ManagedKernel : ITritKernel
         var intents = new WriteIntent[count];
         for (int i = 0; i < count; i++)
         {
-            intents[i] = new WriteIntent(0, reader.U32(), (TritDelta)reader.U8());
+            intents[i] = new WriteIntent(0, reader.U32(), TritDecoder.FromByte(reader.U8()));
         }
 
         if (intents.Length == 0)
@@ -2025,11 +2150,11 @@ public sealed class ManagedKernel : ITritKernel
     private byte[] OpArbitrate(byte[] payload)
     {
         var reader = new WireReader(payload);
-        var count = checked((int)reader.U32());
+        var count = reader.Count32();
         var intents = new List<WriteIntent>(Math.Min(count, 4096));
         for (var i = 0; i < count; i++)
         {
-            intents.Add(new WriteIntent(reader.U64(), reader.U32(), (TritDelta)reader.U8()));
+            intents.Add(new WriteIntent(reader.U64(), reader.U32(), TritDecoder.FromByte(reader.U8())));
         }
 
         stats.Arbitrations += 1;
@@ -2184,7 +2309,7 @@ public sealed class ManagedKernel : ITritKernel
     private byte[] OpPrngNext(byte[] payload)
     {
         var reader = new WireReader(payload);
-        var count = checked((int)reader.U32());
+        var count = reader.Count32();
         if (count > MaxPrngCount)
         {
             throw new RtException(

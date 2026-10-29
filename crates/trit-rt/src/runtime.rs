@@ -411,6 +411,13 @@ impl TritRuntime {
         // 两道闸，缺一不可：条数闸挡「很多个小事件」，字节闸挡「少量超大事件」。
         // 只有条数闸时，4096 条 × 每条 100 万个 trit = 4GB 常驻，一次坏调用
         // 就能把进程顶到系统拒绝分配——而调用方只是「发布了一个大事件」，看不出错。
+        // 覆盖同 id 的旧载荷前**必须先减掉旧长度**：只加不减会让计数器虚增
+        // （同一 id 发布 N 次就报 N×size），而它正是字节闸门的判据——
+        // 虚增会让 `evict_event_payloads` 误判超预算，把**别人**的载荷当受害者提前淘汰，
+        // 表现为 `QUERY` 读别人的事件时拿到空数组。这是静默丢数据，比内存涨更难查。
+        if let Some(previous) = self.event_payloads.get(&event_id) {
+            self.event_payload_trits = self.event_payload_trits.saturating_sub(previous.len());
+        }
         self.event_payload_trits += trits.len();
         self.event_payloads.insert(event_id, trits);
         self.evict_event_payloads(event_id);
@@ -1444,6 +1451,37 @@ mod tests {
         );
         // 最新的一条必须在：淘汰它等于让 publish 静默无效。
         assert!(rt.event_payloads.contains_key(&40));
+    }
+
+    /// 回归：重复发布同一 event_id，不能把字节预算的计数器撑大。
+    ///
+    /// 计数器只加不减时，同一 id 发布 N 次就报 N×size；而它正是字节闸门的判据，
+    /// 虚增会让淘汰误判超预算，把**别人**的载荷当受害者提前淘汰——
+    /// 表现为读别人的事件时拿到空数组（静默丢数据，比内存涨更难查）。
+    #[test]
+    fn republishing_an_event_does_not_inflate_the_byte_budget() {
+        let mut rt = TritRuntime::new(RuntimeConfig::default());
+        let publish = |rt: &mut TritRuntime, event_id: u32, size: usize| {
+            let big = vec![Ternary::True; size];
+            let mut w = Writer::new();
+            w.u32(event_id).trits(&big);
+            rt.dispatch(op::PUBLISH, &w.into_vec()).unwrap();
+        };
+
+        publish(&mut rt, 1, 4 << 20);
+        publish(&mut rt, 2, 16);
+        let after_two = rt.event_payload_trits;
+        // 覆盖式重发 1：内容不变，计数器应当原地不动。
+        publish(&mut rt, 1, 4 << 20);
+        assert_eq!(
+            rt.event_payload_trits, after_two,
+            "覆盖同 id 的载荷后，计数器不应变化"
+        );
+        // 关键：2 号事件不能被误判超预算淘汰掉（8 MiB 闸门下 4M+4M 才该触发）。
+        assert!(
+            rt.event_payloads.contains_key(&2),
+            "重复发布不能把别人的载荷挤掉"
+        );
     }
 
     /// 回归：调用方**从不落快照**时，提交也必须能持续（自保快照兜底）。

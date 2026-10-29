@@ -240,7 +240,8 @@ public sealed class RuntimeShim : IDisposable
     /// <remarks>
     /// 只服务一个判断：值为 0 时 <c>PollJobs</c> 必定空手，那一趟 FFI 与两次缓冲分配
     /// 就可以整趟省掉。计数偏大只会多轮询几次，不会漏结果；偏小才是缺陷，
-    /// 所以取与取消都按「能减多少减多少、越界夹到 0」处理。
+    /// 所以只在 <see cref="PollJobs"/> 真的取走记录时递减，<b>取消不减</b>：
+    /// 取消只置协作标志，之后仍会产出一条 <c>cancelled</c> 记录等待取走。
     /// </remarks>
     public int JobsInflight => System.Threading.Volatile.Read(ref jobsInflight);
 
@@ -265,30 +266,20 @@ public sealed class RuntimeShim : IDisposable
     }
 
     /// <summary>协作式取消单个任务。</summary>
-    public int CancelJob(ulong jobId)
-    {
-        int canceled = host.Kernel.CancelJob(jobId);
-        if (canceled > 0)
-        {
-            System.Threading.Interlocked.Add(ref jobsInflight, -canceled);
-            ClampJobsInflight();
-        }
-
-        return canceled;
-    }
+    /// <remarks>
+    /// <b>取消不减在飞计数</b>：取消只是置一个协作标志，任务仍会在下一个步骤边界
+    /// 照常产出一条 <c>cancelled</c> 记录（原生内核 <c>JobPool::cancel_job</c> 的语义，
+    /// 有测试钉死）。也就是说「取消成功」之后**还有一条结果等着被取走**。
+    /// 若在这里就把计数减掉，调用方（模组每 tick 的轮询）会认为没有在飞任务而整趟
+    /// 跳过 <see cref="PollJobs"/>，那条 <c>cancelled</c> 记录就永远留在内核队列里。
+    /// 计数只在 <see cref="PollJobs"/> 真的取走记录时递减，这才是它该表达的含义：
+    /// 「还没被取走的结果条数」。
+    /// </remarks>
+    public int CancelJob(ulong jobId) => host.Kernel.CancelJob(jobId);
 
     /// <summary>协作式取消指定 owner 的任务。</summary>
-    public int CancelOwner(string owner)
-    {
-        int canceled = host.Kernel.CancelOwner(owner);
-        if (canceled > 0)
-        {
-            System.Threading.Interlocked.Add(ref jobsInflight, -canceled);
-            ClampJobsInflight();
-        }
-
-        return canceled;
-    }
+    /// <remarks>计数不在这里递减，理由见 <see cref="CancelJob"/>。</remarks>
+    public int CancelOwner(string owner) => host.Kernel.CancelOwner(owner);
 
     private void ClampJobsInflight()
     {
@@ -397,7 +388,19 @@ public sealed class RuntimeShim : IDisposable
 
             case "tritruntime.submit":
                 Expect(args, 2, normalized);
-                return host.Kernel.Submit(Args.UInt32(args[0], "opcode", normalized), Args.Bytes(args[1], "payload", normalized)).Payload;
+                var rawOpcode = Args.UInt32(args[0], "opcode", normalized);
+                var rawPayload = Args.Bytes(args[1], "payload", normalized);
+                var rawResponse = host.Kernel.Submit(rawOpcode, rawPayload);
+                if (rawOpcode == Opcode.ScanSubmit && rawResponse.Status == Status.Ok)
+                {
+                    // 裸 Submit 也要走在飞计数：否则外部模组用这个入口提交扫描任务后，
+                    // 调用方的「计数为 0 就跳过轮询」会把结果永久留在内核队列里。
+                    // 这里无法解析载荷去判断到底有没有真的产出任务，所以取「偏大」
+                    // ——多轮询几趟不会漏结果，偏小才会。
+                    System.Threading.Interlocked.Increment(ref jobsInflight);
+                }
+
+                return rawResponse.Payload;
 
             case "tritruntime.query":
                 Expect(args, 1, 2, normalized);

@@ -661,4 +661,115 @@ public sealed class ManagedKernelTests : IDisposable
         var payload = kernel.Submit(Opcode.Query, Requests.Query(queryId)).Payload;
         return new WireReader(payload).U64();
     }
+
+    // ---- 回归：表与闸门不能随调用次数停摆 ----
+
+    /// <summary>
+    /// 事务表必须能被反复开闭，次数超过 <c>max_open_txns</c> 也不许停摆。
+    /// </summary>
+    /// <remarks>
+    /// 原生侧早在 <c>txn.rs</c> 就修过一次（<c>CLOSED_TXN_RETAIN</c>）：事务表只增不减，
+    /// 而容量闸门又拿<b>条目总数</b>当「并发数」，于是跑到 4096 tick 之后
+    /// <c>begin</c> 永久失败、整个旁路写入路径停摆。托管回退内核当时漏掉了同一个修复。
+    /// 这条把「闸门只数打开中的」和「已关闭的会被引退」两件事一起钉死。
+    /// </remarks>
+    [Fact]
+    public void TransactionsKeepWorkingPastTheOpenLimit()
+    {
+        int limit = new ManagedConfig().MaxOpenTxns;
+        var kernel = new ManagedKernel();
+
+        for (int i = 0; i < limit + 64; i++)
+        {
+            ulong txn = kernel.BeginTransaction();
+            kernel.SubmitIntent(txn, 1, TritDelta.Pos);
+            kernel.Commit(txn);
+        }
+
+        // 全部已提交：打开中的必须是 0，下一笔事务必须还能开出来。
+        Assert.Equal(0u, QueryU32Of(kernel, QueryId.OpenTxnCount));
+        ulong after = kernel.BeginTransaction();
+        Assert.True(after > 0);
+    }
+
+    private static uint QueryU32Of(ManagedKernel kernel, uint queryId)
+    {
+        var payload = kernel.Submit(Opcode.Query, Requests.Query(queryId)).Payload;
+        return new WireReader(payload).U32();
+    }
+
+    /// <summary>
+    /// 线格式里越界的 trit 字节必须收敛成「弃权」，而不是被当成一条真实驱动。
+    /// </summary>
+    /// <remarks>
+    /// 原生侧是 <c>Ternary::from_index(byte)</c>：0/1/2 之外一律落回 <c>Unknown</c>
+    /// （索引 1，也就是总线高阻），在仲裁里<b>不参与投票</b>。
+    /// 托管侧若直接 <c>(TritDelta)7</c>，它就是一个不等于 <c>Zero</c> 的非法枚举值，
+    /// 于是被算成一条驱动：多数模式下凭空多出一条车道并<b>真的写进世界</b>。
+    /// 两条路径对同一份载荷必须给出同一个世界。
+    /// </remarks>
+    [Theory]
+    [InlineData(3)]
+    [InlineData(7)]
+    [InlineData(255)]
+    public void AnOutOfRangeDeltaByteAbstainsInsteadOfDrivingTheLane(byte raw)
+    {
+        using var kernel = new ManagedKernel();
+
+        // 裸载荷：[u64 txn_id][u32 key][u8 delta]，txn_id=0 走自动提交。
+        var payload = new WireWriter().U64(0).U32(42).U8(raw).ToArray();
+        var response = kernel.Submit(Opcode.TxnSubmit, payload);
+
+        Assert.Equal(Status.Ok, response.Status);
+        var worldBytes = kernel.Submit(Opcode.Query, Requests.Query(QueryId.WorldSize)).Payload;
+        Assert.Equal(0u, new WireReader(worldBytes).U32());
+    }
+
+    /// <summary>
+    /// 载荷里声明的条数超过 <see cref="int"/> 可表示范围时，必须是「解码失败」，
+    /// 不能让 <see cref="OverflowException"/> 冒出托管内核。
+    /// </summary>
+    /// <remarks>
+    /// <c>WireReader</c> 原来写的是 <c>checked((int)U32())</c>。托管内核只捕
+    /// <c>RtException</c>/<c>WireException</c>/<c>JsonException</c>，溢出异常会一路
+    /// 穿透到调用方模组的 <c>Mod.Call</c>；而原生是 <c>u32 as usize</c> 再边读边解，
+    /// 报的是 <c>Decode</c>。这条锁住「同一份坏载荷 → 同一个状态码」。
+    /// </remarks>
+    [Theory]
+    [InlineData(0x8000_0000u)]
+    [InlineData(0xFFFF_FFFFu)]
+    public void ATritCountBeyondIntRangeIsReportedAsDecodeNotAnOverflow(uint count)
+    {
+        using var kernel = new ManagedKernel();
+
+        // [u32 event_id][u32 count][打包体]
+        var payload = new WireWriter().U32(1).U32(count).ToArray();
+        Assert.Equal(Status.Decode, kernel.Submit(Opcode.Publish, payload).Status);
+    }
+
+    /// <summary>
+    /// 重复发布同一个事件 id，不能把字节预算的计数器撑大，更不能因此淘汰别人的载荷。
+    /// </summary>
+    /// <remarks>
+    /// 计数器只加不减时，同一 id 发布 N 次就报 N×size；而它正是字节闸门的判据，
+    /// 虚增会让淘汰误判超预算，把<b>别人</b>的载荷当受害者提前淘汰——
+    /// 表现为读别人的事件时拿到空数组。这是静默丢数据，比内存涨更难查。
+    /// 这里让「正确计数 = 4.5M + 10」远低于闸门、「错误计数 = 9M」越过闸门，
+    /// 用「事件 2 的载荷还在不在」来分辨两种实现。
+    /// </remarks>
+    [Fact]
+    public void RepublishingAnEventDoesNotEvictSomeoneElsesPayload()
+    {
+        using var kernel = new ManagedKernel();
+
+        var big = new TritDelta[4_500_000];
+        var small = new TritDelta[10];
+        kernel.Publish(1, big);
+        kernel.Publish(2, small);
+        // 覆盖式重发：内容相同，计数器应该原地不动。
+        kernel.Publish(1, big);
+
+        var payload = kernel.Submit(Opcode.Query, Requests.Query(QueryId.EventPayload, 2)).Payload;
+        Assert.Equal(small.Length, new WireReader(payload).Trits().Length);
+    }
 }

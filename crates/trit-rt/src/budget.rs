@@ -56,6 +56,9 @@ pub struct ModUsage {
 }
 
 /// 全局预算账本。
+/// 分 owner 账本最多记多少个 owner（见 [`GlobalBudget::usage_mut`]）。
+const MAX_TRACKED_OWNERS: usize = 1024;
+
 #[derive(Debug, Clone, Default)]
 pub struct GlobalBudget {
     per_mod_inflight: usize,
@@ -108,6 +111,26 @@ impl GlobalBudget {
         Resources::new(inflight, inflight)
     }
 
+    /// 分 owner 的账本条目。
+    ///
+    /// owner 是调用方在请求里随便给的字符串，而本仓所有别的集合（`txns` 有
+    /// `CLOSED_TXN_RETAIN`、快照有 `max_snapshots`、结果队列有 `MAX_PENDING_RESULTS`、
+    /// 事件载荷有条数 + 字节双闸）**都有回收闸门，只有这张表是裸的**。
+    /// 一个每 tick 换一个 owner 名字的调用就能让它只增不减，而它同时是 `BUDGET`
+    /// 响应体里 `mods` 数组的来源——数组变长又会推高调用方每次解析的成本。
+    fn usage_mut(&mut self, owner: &str) -> Option<&mut ModUsage> {
+        if self.mods.contains_key(owner) {
+            return self.mods.get_mut(owner);
+        }
+        if self.mods.len() >= MAX_TRACKED_OWNERS {
+            // 账本满了：不再为新 owner 建条目（总量照记，只是没有分账）。
+            // 选「不建」而不是「淘汰一个旧的」，是因为淘汰哪个都要引入顺序依赖；
+            // 而「先到先得」对同一串调用序列是**确定的**——BUDGET 的输出必须可复现。
+            return None;
+        }
+        Some(self.mods.entry(owner.to_string()).or_default())
+    }
+
     /// 记录一次**提交**（提交数 +1）。
     ///
     /// 提交数在**受理请求时**就记，而不是等任务真正派发——否则：
@@ -118,7 +141,9 @@ impl GlobalBudget {
     /// 托管回退内核在 `OpScanSubmit` 里就是**先记提交、再执行**，与这里同口径。
     pub fn on_submit(&mut self, owner: &str) {
         self.totals.submitted += 1;
-        self.mods.entry(owner.to_string()).or_default().submitted += 1;
+        if let Some(usage) = self.usage_mut(owner) {
+            usage.submitted += 1;
+        }
     }
 
     /// 记录一次准入（**只在跑数 +1**）。
@@ -126,13 +151,17 @@ impl GlobalBudget {
     /// 提交数由 [`Self::on_submit`] 在受理时记过了，这里不再重复计。
     pub fn on_admit(&mut self, owner: &str) {
         self.totals.inflight += 1;
-        self.mods.entry(owner.to_string()).or_default().inflight += 1;
+        if let Some(usage) = self.usage_mut(owner) {
+            usage.inflight += 1;
+        }
     }
 
     /// 记录一次拒绝（不占资源，只记账）。
     pub fn on_reject(&mut self, owner: &str) {
         self.totals.rejected += 1;
-        self.mods.entry(owner.to_string()).or_default().rejected += 1;
+        if let Some(usage) = self.usage_mut(owner) {
+            usage.rejected += 1;
+        }
     }
 
     /// 任务结束：在跑数 -1，按结局记账并累加 step。
@@ -145,13 +174,14 @@ impl GlobalBudget {
         } else if completed {
             totals.completed += 1;
         }
-        let usage = self.mods.entry(owner.to_string()).or_default();
-        usage.inflight = usage.inflight.saturating_sub(1);
-        usage.steps = usage.steps.saturating_add(steps);
-        if cancelled {
-            usage.cancelled += 1;
-        } else if completed {
-            usage.completed += 1;
+        if let Some(usage) = self.usage_mut(owner) {
+            usage.inflight = usage.inflight.saturating_sub(1);
+            usage.steps = usage.steps.saturating_add(steps);
+            if cancelled {
+                usage.cancelled += 1;
+            } else if completed {
+                usage.completed += 1;
+            }
         }
     }
 
@@ -166,7 +196,9 @@ impl GlobalBudget {
     /// 累加一个排队任务。
     pub fn add_queued(&mut self, owner: &str) {
         self.totals.queued += 1;
-        self.mods.entry(owner.to_string()).or_default().queued += 1;
+        if let Some(usage) = self.usage_mut(owner) {
+            usage.queued += 1;
+        }
     }
 
     /// 累计总量。
@@ -336,5 +368,39 @@ mod tests {
     fn per_mod_inflight_of_zero_is_treated_as_one() {
         let budget = GlobalBudget::new(0);
         assert_eq!(budget.per_mod_inflight(), 1);
+    }
+
+    /// 回归：owner 账本必须有上界。
+    ///
+    /// owner 是调用方在请求里随便给的字符串，而本仓其它集合都有回收闸门，
+    /// 只有这张表原来没有。一个每次换个 owner 名字的调用就能让它只增不减，
+    /// 而它同时是 `BUDGET` 响应体里 `mods` 数组的来源。
+    #[test]
+    fn the_owner_ledger_is_capped() {
+        let mut budget = GlobalBudget::new(4);
+        // 先占满：这批 owner 会被记账。
+        for index in 0..MAX_TRACKED_OWNERS {
+            budget.on_submit(&format!("owner{index}"));
+        }
+        // 再来一批新的：账本已满，它们只进总量，不再建分账条目。
+        for index in 0..64 {
+            budget.on_submit(&format!("late{index}"));
+        }
+        assert_eq!(budget.mod_usages().len(), MAX_TRACKED_OWNERS);
+        // 总量照记：闸门只砍分账，不能把提交数一起吞掉。
+        assert_eq!(
+            budget.totals().submitted,
+            (MAX_TRACKED_OWNERS + 64) as u64,
+            "总量必须包含所有提交"
+        );
+        // 已在账本里的 owner 仍然正常累加（不是「满了就全不记」）。
+        budget.on_submit("owner0");
+        let usage = budget
+            .mod_usages()
+            .into_iter()
+            .find(|(owner, _)| owner == "owner0")
+            .expect("owner0 仍在账本里")
+            .1;
+        assert_eq!(usage.submitted, 2);
     }
 }

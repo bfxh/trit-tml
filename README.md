@@ -115,7 +115,7 @@ third_party/trit/        三进制库子模块 —— 只调用，不修改
 cargo test -p trit-rt --release
 cargo build --release -p trit-rt          # 产物 target/release/trit_rt.dll
 
-# 2. C# 兼容壳 + 测试（143 个）
+# 2. C# 兼容壳 + 测试（163 个）
 dotnet test dotnet/TritRuntime.Shim.Tests/TritRuntime.Shim.Tests.csproj
 
 # 3. tModLoader 模组
@@ -129,9 +129,9 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 
 | 项 | 状态 | 依据 |
 |---|---|---|
-| Rust 内核测试 | ✅ 130/130（98 单测 + 5 确定性 + 16 FFI + 11 运行时） | `cargo test -p trit-rt --release` |
+| Rust 内核测试 | ✅ 135/135（103 单测 + 5 确定性 + 16 FFI + 11 运行时） | `cargo test -p trit-rt --release` |
 | Rust clippy / fmt | ✅ 0 警告 / 干净 | `cargo clippy --all-targets`、`cargo fmt --check` |
-| C# 兼容壳测试 | ✅ 152/152 | `dotnet test`，含原生 vs 托管逐字节对拍 |
+| C# 兼容壳测试 | ✅ 163/163 | `dotnet test`，含原生 vs 托管逐字节对拍 |
 | 原生 / 托管语义等价 | ✅ 快照字节、统计、PRNG 流、冲突诊断全部对拍 | `ParityTests` |
 | 原生 / 托管**扫描结果逐字节等价** | ✅ 4 合法 + 5 非法 + 4 容错载荷，两侧 `JOB_POLL` 记录逐字节相同 | `ParallelApiTests.ManagedAndNativeScanResultsAgreeWhenV2NativeIsAvailable` |
 | 非法请求语义统一 | ✅ 非法 trit / 未知 kind / 缺 pattern / 超容量两侧都产生 `failed` 任务，`error` 文案逐字一致、无前缀 | `ParallelApiTests` + `crates/trit-rt` 测试 |
@@ -344,6 +344,36 @@ Free 了也不会改善，只会引入悬垂函数指针的风险。剩下的是
 10. **设置里"采样上限"必须两头都夹**：`WorldBridge` 按 `new EntityState[MaxNpcs]` 开定长数组，
     装载期一次性分配。只夹负数、不夹上界的话，设置文件里一个 `2000000000` 就是 80 GB 的分配请求，
     表现为"模组本次会话不提供服务"——根因却只是一个数字打错。
+11. **闸门必须对着"真正要分配的东西"量**：`try_gpu_pattern` 曾查 `total × words` 超限与否，
+    实际申请的是 `min(total, WINDOW_BLOCK) × words`。`total` 远小于 `WINDOW_BLOCK` 时两者相差
+    `WINDOW_BLOCK / total` 倍——`total=1`、`words=3_125_000` 时闸门看到 12.5 MB 放行，
+    实际去申请 410 GB，而且是 `Vec::with_capacity` 的一次性申请：这不是能捕获的
+    capacity overflow，是 alloc failure → **进程 abort**（`catch_unwind` 拦不住）。
+12. **"改一个修复"要在两条路径上同时改**：`txn.rs` 早就修了「事务表不淘汰已关闭事务」
+    （`CLOSED_TXN_RETAIN`），托管回退内核漏掉了同一个修复——于是跑到 4096 笔事务后
+    `BeginTransaction()` 永久返回 `Capacity`。托管回退不是"另一套表现"，是"另一条实现"。
+13. **取消任务不等于"没有结果要取"**：`JobPool::cancel_*` 只是置协作标志，任务仍会产出
+    一条 `cancelled` 记录。所以在"取消"里递减「在飞任务数」是错的——
+    调用方看到计数归零就不再轮询，那条 `cancelled` 记录**永远留在内核队列里**。
+    计数只在真的取走记录时递减。
+14. **越界 trit 字节必须收敛成"弃权"，不能留成非法枚举值**：线格式里 0/1/2 之外的字节，
+    原生侧 `Ternary::from_index` 一律落回 `Unknown`（不参与投票），托管侧若直接
+    `(TritDelta)7`，它就不等于 `Zero`，于是被当成一条真实驱动——多数模式下凭空多出一条
+    车道并真的写进世界。状态码两边可能都是 `Ok`，**世界状态却已经分叉**。
+
+## 已知未修（不藏着）
+
+| 问题 | 为什么这一轮不动 |
+|---|---|
+| `SCAN_SUBMIT` 的载荷预算按 **1 字节/trit** 记账，而 `ScanJob` 实际持有 `Vec<i32>`（4 字节/trit） | 标称 512 MiB 的在飞预算实际允许约 2 GiB。要修得同时改 `payload_bytes()` 与两条路径的容量语义，会动到既有 parity 用例，单开一轮 |
+| `ScanJob::push` 绕过结果队列上限（`MAX_PENDING_RESULTS`） | 默认 resumable 任务全走这条，调用方长期不轮询时队列无界增长。修它要顺带定「淘汰哪一条」，与第 15 条的顺序依赖一起处理 |
+| 结果队列的**输出顺序**依赖线程调度 | 多任务并发完成时原生侧顺序不定，与托管侧 FIFO 对拍会偶发分歧。最小修法是 `peek_filtered` 按 `record.id` 升序输出，未做 |
+| `commit_intents` 会把**其它未关闭事务**的意图一并落地却不从源事务摘除 | 造成二次落地 + `applied` 虚高 + 日志重复。两条路径行为一致（所以 parity 是绿的），但它违反 `TXN_APPLY` 文档里「不做跨事务仲裁」的承诺，改语义需要两边同步 + 更新既有用例 |
+| `OpMetrics` 输出与原生 `to_prometheus()` 不是一回事 | 原生 9 个指标 × 3 行（含 `# HELP`/`# TYPE`），托管只有 5 个裸值行。要逐行复刻原生格式，单开一轮 |
+| `OpBudget` 的 `workers` / `cpu_capacity` / `memory_capacity` / `last_metrics` 是硬编码 | 托管内核没有真正的任务池，填的是常量；与原生实时值不同。要么让托管也读配置，要么明确"预算类字段不进 parity 比对" |
+| `OpSnapshot` 不调 `compact_log()` | 日志逼近上限后托管返回 `Capacity`（写操作静默停止）、原生继续压缩并成功。`ManagedConfig` 注释里承认是刻意的，但没有 parity 用例钉住这个边界 |
+| `ManagedKernel` 除扫描外的状态全部无锁 | `reset_session` 在锁内换 `log`/`txns`，而 `OpSnapshot`/`OpTxnBegin` 等读的是无锁字段。换存档与并发提交竞争时可能抛 `InvalidOperationException`（不在 catch 列表里） |
+| `gpu.rs` 的形状门槛排在策略判断之前，`On` 策略同样被挡 | 连带后果是 `try_gpu_pattern` 传的列数恒为 1 < `MIN_GPU_COLUMNS`，**pattern 扫描永远上不了 GPU**。当前两侧 `backend` 都报 `"cpu"` 所以 parity 是绿的——一旦修好这条就要同时处理 `backend` 字段的分歧 |
 
 
 ## 不做什么

@@ -473,6 +473,99 @@ public sealed class ParityTests
         }
     }
 
+    /// <summary>
+    /// 线格式里越界的 trit 字节，两条路径都必须当成「弃权」——不能一边当成驱动。
+    /// </summary>
+    /// <remarks>
+    /// 原生是 <c>Ternary::from_index(byte)</c>：0/1/2 之外一律落回 <c>Unknown</c>
+    /// （索引 1，总线高阻），仲裁里<b>不参与投票</b>。托管侧原先把字节直接转成
+    /// <c>TritDelta</c>，于是 7 变成一个不等于 <c>Zero</c> 的非法枚举值被算成一条驱动：
+    /// 多数模式下凭空多出一条车道并真的写进世界。状态码也许都是 <c>Ok</c>，
+    /// 但世界状态已经分叉——所以这里比的是<b>提交之后的世界大小</b>，不是状态码。
+    /// </remarks>
+    [Theory]
+    [InlineData((byte)3)]
+    [InlineData((byte)7)]
+    [InlineData((byte)255)]
+    public void BothKernelsTreatAnOutOfRangeDeltaByteAsAnAbstention(byte raw)
+    {
+        var pair = Pair();
+        if (pair is null)
+        {
+            return;
+        }
+
+        var (native, managed, _) = pair.Value;
+        try
+        {
+            // [u64 txn_id][u32 key][u8 delta]，txn_id = 0 走自动提交。
+            var bad = new WireWriter().U64(0).U32(42).U8(raw).ToArray();
+            Assert.Equal(Status.Ok, native.Submit(Opcode.TxnSubmit, bad).Status);
+            Assert.Equal(Status.Ok, managed.Submit(Opcode.TxnSubmit, bad).Status);
+
+            uint nativeWorld = WorldSize(native);
+            Assert.True(
+                nativeWorld == WorldSize(managed),
+                $"越界字节不能成为一条驱动：两边世界大小必须相同（原生 {nativeWorld}）");
+            Assert.Equal(0u, nativeWorld);
+        }
+        finally
+        {
+            native.Dispose();
+            managed.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 订阅载荷声明的依赖条数超过实际载荷时，两条路径都必须报 <c>Decode</c>。
+    /// </summary>
+    /// <remarks>
+    /// 原生 <c>op_subscribe</c> 按声明条数逐个读，读不到就 <c>Decode</c>；托管侧原先
+    /// 把上限夹到 4096 后照常返回成功——声明 4097 条、实际给 4096 条时会静默建成
+    /// 一张少了边的订阅图，而原生报 <c>Decode</c>：状态码与依赖图同时分叉。
+    /// 静默成功比报错更难查，所以这里按状态码对拍，并额外断言托管侧确实是 <c>Decode</c>。
+    /// </remarks>
+    [Fact]
+    public void BothKernelsRejectATruncatedSubscriptionDependencyList()
+    {
+        var pair = Pair();
+        if (pair is null)
+        {
+            return;
+        }
+
+        var (native, managed, _) = pair.Value;
+        try
+        {
+            var writer = new WireWriter(16 + 4096 * sizeof(uint));
+            writer.U32(1); // mod_id
+            writer.U32(2); // event_id
+            writer.I32(0); // priority
+            writer.U32(4097); // 声称 4097 条依赖，实际只给 4096 条
+            for (var i = 0; i < 4096; i++)
+            {
+                writer.U32((uint)(i + 100));
+            }
+
+            var bad = writer.ToArray();
+            var nativeStatus = native.Submit(Opcode.Subscribe, bad).Status;
+            var managedStatus = managed.Submit(Opcode.Subscribe, bad).Status;
+            Assert.Equal(nativeStatus, managedStatus);
+            Assert.Equal(Status.Decode, managedStatus);
+        }
+        finally
+        {
+            native.Dispose();
+            managed.Dispose();
+        }
+    }
+
+    private static uint WorldSize(ITritKernel kernel)
+    {
+        var payload = kernel.Submit(Opcode.Query, Requests.Query(QueryId.WorldSize)).Payload;
+        return new WireReader(payload).U32();
+    }
+
     private static TxnCommitResult CommitThreeStep(
         ITritKernel kernel,
         IReadOnlyList<uint> keys,

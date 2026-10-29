@@ -365,6 +365,9 @@ impl JobPool {
             Some(tx) => {
                 if tx.send(job).is_err() {
                     // 通道关了 = worker 已退出：把刚占住的预算退回去，别留下假占用。
+                    // 取消标志也要一并摘掉：worker 已经不在了，没人会再走那条清理路径，
+                    // 留下来就是一条**永不删除**的条目（此后每次提交都泄漏一条）。
+                    self.forget(id);
                     release_payload(&self.resident, bytes);
                     return Err(RtError::InvalidInput("任务池已关闭".to_string()));
                 }
@@ -372,6 +375,8 @@ impl JobPool {
             None => {
                 // worker 没起来（线程创建失败）：退化成同步执行，保证调用方仍拿到结果。
                 self.run_inline(job);
+                // run_inline 不走 worker 的收尾循环，取消标志得在这里摘。
+                self.forget(id);
             }
         }
         Ok(id)
@@ -384,18 +389,34 @@ impl JobPool {
     /// 被取消的任务仍会照常产出 `cancelled` 记录，但队列在复位时已经清空了。
     pub fn reset_session(&self) {
         {
-            let flags = self
+            let mut flags = self
                 .flags
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             for (_, cancel) in flags.values() {
                 cancel.store(true, Ordering::Release);
             }
+            // 全部都置了取消位，之后 worker 收尾时还会再 remove 一遍（幂等，无副作用）；
+            // 但这里必须**当场清空**：这些任务的取消标志已经没有接收者了，
+            // 留着只会让 `cancel_owner` 每次迭代一堆积压条目，也让这张表只增不减。
+            flags.clear();
         }
         self.results
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+    }
+
+    /// 摘掉一个任务的取消标志。
+    ///
+    /// `flags` 只在两处维护：提交时插入、worker 收尾时删除。**任何**不经过 worker
+    /// 收尾的终态路径都必须自己调一次，否则那条条目永远不会被删——
+    /// 表随提交次数无界增长，`cancel_owner` 每次调用都要遍历它。
+    fn forget(&self, id: u64) {
+        self.flags
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
     }
 
     /// 取出已完成的任务结果（取出即出队）。
@@ -714,6 +735,7 @@ fn worker_loop(
             &mut pending,
             &budget,
             &results,
+            &flags,
             capacity,
             config.resolved_max_batch(),
             &resident,
@@ -860,6 +882,7 @@ fn take_batch(
     pending: &mut VecDeque<QueuedJob>,
     budget: &Arc<Mutex<GlobalBudget>>,
     sink: &Arc<Mutex<Vec<JobRecord>>>,
+    flags: &JobFlags,
     capacity: Resources,
     max_batch: usize,
     resident: &Arc<AtomicU64>,
@@ -894,6 +917,12 @@ fn take_batch(
             job.slots.set(JobState::Failed, 0);
             push_record(sink, record);
             let job = pending.remove(index).expect("下标在界内");
+            // 这条任务不进返回值，就不会经过 worker 的收尾循环，
+            // 取消标志得在这里摘掉，否则又是一条永不删除的条目。
+            flags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&job.id);
             // 判失败出队 = 载荷永远跑不到，立刻归还它占的预算，否则预算会被死任务吃掉。
             release_payload(resident, job.bytes);
             let mut budget_guard = budget
@@ -1052,6 +1081,69 @@ mod tests {
         assert!(
             records.iter().any(|record| record.state == "cancelled"),
             "至少应有一个任务被取消：{records:?}"
+        );
+    }
+
+    /// 回归：任务跑完之后，`flags` 里不能留下条目。
+    ///
+    /// `flags` 只在两处维护：提交时插入、worker 收尾时删除。任何不经 worker 收尾的
+    /// 终态路径（`tx.send` 失败、`run_inline`、`take_batch` 判失败）都必须自己摘掉，
+    /// 否则那条条目永远不会被删——表随提交次数无界增长，`cancel_owner` 每次都遍历它。
+    #[test]
+    fn finished_jobs_leave_no_cancel_flag_behind() {
+        let pool = pool(2, 2);
+        for index in 0..8 {
+            let _ = pool
+                .submit(request(
+                    &format!("m{}", index % 3),
+                    ScanKind::Histogram,
+                    vec![0, 1, 2],
+                ))
+                .unwrap();
+        }
+        let records = poll_until(&pool, 8, Duration::from_secs(10));
+        assert_eq!(records.len(), 8);
+
+        // 结果由扫描任务自己 push，取消标志则由 worker 收尾循环摘——两者不在同一时刻，
+        // 所以要等一下，不能拿到 8 条结果就立刻断言。
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline
+            && !pool
+                .flags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        assert!(
+            pool.flags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "任务全部结束后 flags 必须为空"
+        );
+    }
+
+    /// 回归：会话复位也要把 `flags` 清空。
+    ///
+    /// 复位时所有任务都已经置了取消位，之后 worker 收尾还会再 remove 一遍（幂等），
+    /// 但当场清空才能避免这张表在跨存档时只增不减。
+    #[test]
+    fn reset_session_clears_the_cancel_flags() {
+        let pool = pool(1, 1);
+        let data = vec![1u8; 200_000];
+        for _ in 0..3 {
+            let _ = pool.submit(request("victim", ScanKind::Density, data.clone()));
+        }
+        pool.reset_session();
+        assert!(
+            pool.flags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "会话复位后 flags 必须为空"
         );
     }
 

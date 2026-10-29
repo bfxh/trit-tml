@@ -18,6 +18,27 @@ public enum TritDelta
     Pos = 2,
 }
 
+/// <summary>
+/// 把一个裸字节解释成 trit 值；与 Rust 侧 <c>wire::trit_from_byte</c> 同语义。
+/// </summary>
+/// <remarks>
+/// <b>越界字节收敛成 <see cref="TritDelta.Zero"/>，而不是留成一个非法枚举值。</b>
+/// 原生侧是 <c>Ternary::from_index(byte)</c>：<c>0/1/2</c> 之外一律落回
+/// <c>Unknown</c>（索引 1，也就是「弃权 / 总线高阻」）。在仲裁里
+/// <c>Unknown</c> 不参与投票——它不是驱动。
+///
+/// 托管侧若直接 <c>(TritDelta)reader.U8()</c>，字节 7 会变成一个不等于
+/// <see cref="TritDelta.Zero"/> 的非法枚举值，于是**被当成一条真实驱动**参与仲裁：
+/// 多数模式下凭空多出一条车道、严格模式下真的往世界里写一笔，
+/// 两边对同一份载荷给出完全不同的结果（状态码 + 世界状态 + 快照字节三处分叉）。
+/// </remarks>
+public static class TritDecoder
+{
+    /// <summary>裸字节 → trit 值；0/1/2 之外一律 <see cref="TritDelta.Zero"/>（弃权）。</summary>
+    public static TritDelta FromByte(byte value) =>
+        value <= (byte)TritDelta.Pos ? (TritDelta)value : TritDelta.Zero;
+}
+
 /// <summary>opcode 表，必须与 Rust 侧 <c>trit_rt::wire::op</c> 逐项对齐。</summary>
 public static class Opcode
 {
@@ -481,10 +502,33 @@ public sealed class WireReader
         return value;
     }
 
+    /// <summary>
+    /// 读一个「条数 / 长度」型的 u32，并收敛成非负 <see cref="int"/>。
+    /// </summary>
+    /// <remarks>
+    /// <b>不能写成 <c>checked((int)U32())</c></b>：载荷里的 u32 最大能到 <c>0xFFFFFFFF</c>，
+    /// 直接转型会抛 <see cref="OverflowException"/>——那不是调用方约定的异常类型
+    /// （约定是 <see cref="WireException"/> → <c>Status.Decode</c>），而且托管内核的
+    /// <c>Submit</c> 只捕 <c>RtException</c>/<c>WireException</c>/<c>JsonException</c>，
+    /// 溢出异常会一路穿透到调用方模组的 <c>Mod.Call</c>。
+    /// 原生侧是 <c>u32 as usize</c>（64 位，不溢出）再边读边解，读不动就报 Decode——
+    /// 所以这里也必须报 Decode，两条路径对同一份坏载荷必须给同一个状态码。
+    /// </remarks>
+    public int Count32()
+    {
+        uint raw = U32();
+        if (raw > int.MaxValue)
+        {
+            throw new WireException($"条数 {raw} 超出可表示范围（上限 {int.MaxValue}）");
+        }
+
+        return (int)raw;
+    }
+
     /// <summary>读 u32 个数 + 打包体，还原成 trit 序列。</summary>
     public TritDelta[] Trits()
     {
-        var count = checked((int)U32());
+        var count = Count32();
         var byteLength = (count + Wire.TritsPerByte - 1) / Wire.TritsPerByte;
         var bytes = Bytes(byteLength);
         return Wire.UnpackTrits(bytes, count);
@@ -492,7 +536,9 @@ public sealed class WireReader
 
     private void Ensure(int count)
     {
-        if (position + count > buffer.Length)
+        // 负数也要拦：条数算成负数是「载荷非法」的一种（例如 count + 4 溢出回绕），
+        // 不拦的话会走到 Slice/Span 上抛 ArgumentOutOfRangeException 而不是 WireException。
+        if (count < 0 || position + count > buffer.Length)
         {
             throw new WireException($"需要 {count} 字节，只剩 {Remaining}");
         }
