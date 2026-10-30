@@ -463,4 +463,251 @@ mod tests {
         assert!(backend.matmul(1, 0, 1, one, empty).is_none());
         assert!(backend.matmul(1, 1, 0, one, empty).is_none());
     }
+
+    // ---- 策略真值表 ----
+
+    #[test]
+    fn enabled_requires_available_and_not_off() {
+        let mut backend = GpuBackend::new(GpuConfig::default());
+        // 未探测时 available=false：三种策略都不 enabled。
+        for policy in [GpuPolicy::Auto, GpuPolicy::Off, GpuPolicy::On] {
+            backend.set_policy(policy);
+            assert!(!backend.enabled(), "{policy:?} 未探测时不应 enabled");
+        }
+        // 置 available=true：Auto/On enabled，Off 不 enabled。
+        backend.status.available = true;
+        backend.set_policy(GpuPolicy::Auto);
+        assert!(backend.enabled());
+        backend.set_policy(GpuPolicy::On);
+        assert!(backend.enabled());
+        backend.set_policy(GpuPolicy::Off);
+        assert!(!backend.enabled());
+    }
+
+    #[test]
+    fn should_use_combines_policy_threshold_and_availability() {
+        let mut backend = GpuBackend::new(GpuConfig::default());
+        backend.status.available = true;
+        // Auto：低于门槛不用，达到/超过门槛才用。
+        assert!(!backend.should_use(DEFAULT_MIN_TRITS - 1));
+        assert!(backend.should_use(DEFAULT_MIN_TRITS));
+        assert!(backend.should_use(DEFAULT_MIN_TRITS + 1));
+        // On：忽略门槛。
+        backend.set_policy(GpuPolicy::On);
+        assert!(backend.should_use(0));
+        assert!(backend.should_use(1));
+        // Off：一律不用。
+        backend.set_policy(GpuPolicy::Off);
+        assert!(!backend.should_use(usize::MAX));
+        // 不可用：即便 On 也不该用（enabled 前置）。
+        backend.set_policy(GpuPolicy::On);
+        backend.status.available = false;
+        assert!(!backend.should_use(DEFAULT_MIN_TRITS));
+    }
+
+    #[test]
+    fn min_trits_zero_is_floored_to_one() {
+        // min_trits=0 时用 max(1) 兜底，避免 trits=0 也被判「值得上 GPU」。
+        let mut backend = GpuBackend::new(GpuConfig {
+            policy: GpuPolicy::Auto,
+            min_trits: 0,
+        });
+        backend.status.available = true;
+        assert!(!backend.should_use(0));
+        assert!(backend.should_use(1));
+    }
+
+    #[test]
+    fn set_min_trits_changes_the_threshold_dynamically() {
+        let mut backend = GpuBackend::new(GpuConfig::default());
+        backend.status.available = true;
+        backend.set_min_trits(64);
+        assert!(!backend.should_use(63));
+        assert!(backend.should_use(64));
+        backend.set_min_trits(DEFAULT_MIN_TRITS);
+        assert!(!backend.should_use(1024));
+    }
+
+    #[test]
+    fn setting_non_off_policy_without_probe_records_a_reason() {
+        let mut backend = GpuBackend::new(GpuConfig::default());
+        backend.set_policy(GpuPolicy::Off);
+        // 再切回 Auto：available 仍 false，reason 应非空（带 gpu: 尚未探测；
+        // 不带 gpu: 构建未启用）。两种构建下都不应是空串。
+        backend.set_policy(GpuPolicy::Auto);
+        assert!(
+            !backend.status().reason.is_empty(),
+            "非 off 策略且不可用时应给出原因"
+        );
+    }
+
+    // ---- note_fallback 计数与永久关闭 ----
+
+    #[test]
+    fn transient_fallbacks_accumulate_without_disabling() {
+        let mut backend = GpuBackend::new(GpuConfig::default());
+        backend.status.available = true;
+        backend.note_fallback("设备忙", false);
+        backend.note_fallback("超时", false);
+        assert_eq!(backend.status().fallbacks, 2);
+        assert!(backend.enabled());
+        assert_eq!(backend.status().reason, "超时");
+    }
+
+    #[test]
+    fn permanent_fallback_disables_and_clears_availability() {
+        let mut backend = GpuBackend::new(GpuConfig::default());
+        backend.status.available = true;
+        backend.note_fallback("算错了", true);
+        assert!(!backend.status().available);
+        assert!(!backend.enabled());
+        // 即便策略切到 On 也无法恢复（disabled 永久）。
+        backend.set_policy(GpuPolicy::On);
+        assert!(!backend.enabled());
+    }
+
+    // ---- matmul 闸门：一律返回 None 且不记 fallback ----
+    // 这些闸门全部在 cfg(feature="gpu") 块之前返回，三种特性构建下都安全、
+    // 不依赖真实 GPU 设备。
+
+    #[test]
+    fn matmul_narrow_columns_bypass_without_fallback() {
+        let mut backend = GpuBackend::new(GpuConfig {
+            policy: GpuPolicy::On,
+            ..GpuConfig::default()
+        });
+        backend.status.available = true;
+        let rail = DualRail {
+            pos: &[1],
+            neg: &[0],
+        };
+        // n=1 < MIN_GPU_COLUMNS(8)：列数闸门（实测单列 GPU 慢 58 倍）。
+        let out = backend.matmul(1, 1, 1, rail, rail);
+        assert!(out.is_none(), "窄列必须走 CPU（返回 None）");
+        assert_eq!(backend.status().jobs, 1);
+        assert_eq!(backend.status().fallbacks, 0, "形状闸门不是故障，不记回退");
+    }
+
+    #[test]
+    fn matmul_oversized_rows_bypass_without_fallback() {
+        let mut backend = GpuBackend::new(GpuConfig {
+            policy: GpuPolicy::On,
+            ..GpuConfig::default()
+        });
+        backend.status.available = true;
+        let rail = DualRail {
+            pos: &[1],
+            neg: &[0],
+        };
+        // m > MAX_GPU_ROWS(65532)：行数闸门，避免上游 dispatch 网格 validation panic。
+        let out = backend.matmul(MAX_GPU_ROWS + 1, MIN_GPU_COLUMNS, 1, rail, rail);
+        assert!(out.is_none());
+        assert_eq!(backend.status().jobs, 1);
+        assert_eq!(backend.status().fallbacks, 0);
+    }
+
+    #[test]
+    fn matmul_oversized_buffer_bypasses_without_fallback() {
+        let mut backend = GpuBackend::new(GpuConfig {
+            policy: GpuPolicy::On,
+            ..GpuConfig::default()
+        });
+        backend.status.available = true;
+        let rail = DualRail {
+            pos: &[1],
+            neg: &[0],
+        };
+        // 通过列数/行数/规模闸门，但 m*words*4 = 17*1e6*4 = 68e6 > 64MiB：缓冲区闸门。
+        let out = backend.matmul(17, MIN_GPU_COLUMNS, 1_000_000, rail, rail);
+        assert!(out.is_none());
+        assert_eq!(backend.status().jobs, 1);
+        assert_eq!(
+            backend.status().fallbacks,
+            0,
+            "缓冲区上限不是故障，不记回退"
+        );
+    }
+
+    #[test]
+    fn matmul_empty_shapes_return_before_counting_jobs() {
+        let mut backend = GpuBackend::new(GpuConfig::default());
+        backend.status.available = true;
+        let rail = DualRail { pos: &[], neg: &[] };
+        let one = DualRail {
+            pos: &[0],
+            neg: &[0],
+        };
+        assert!(backend.matmul(0, 8, 1, rail, one).is_none());
+        assert!(backend.matmul(1, 0, 1, one, rail).is_none());
+        assert!(backend.matmul(1, 8, 0, one, rail).is_none());
+        // 空形状在第一个闸门就返回，jobs 不增长。
+        assert_eq!(backend.status().jobs, 0);
+    }
+
+    #[test]
+    fn matmul_off_policy_bypasses_everything() {
+        let mut backend = GpuBackend::new(GpuConfig {
+            policy: GpuPolicy::Off,
+            ..GpuConfig::default()
+        });
+        backend.status.available = true;
+        let rail = DualRail {
+            pos: &[1],
+            neg: &[0],
+        };
+        assert!(backend.matmul(1, MIN_GPU_COLUMNS, 1, rail, rail).is_none());
+        // off 时 should_use=false，在规模闸门返回；jobs 仍 +1（已进入 matmul）。
+        assert_eq!(backend.status().jobs, 1);
+        assert_eq!(backend.status().fallbacks, 0);
+    }
+
+    // ---- 状态快照与构建标志 ----
+
+    #[test]
+    fn status_snapshot_reflects_live_enabled_flag() {
+        let mut backend = GpuBackend::new(GpuConfig::default());
+        assert!(!backend.status().enabled);
+        backend.status.available = true;
+        assert!(backend.status().enabled, "status().enabled 应实时计算");
+        backend.note_fallback("x", true);
+        assert!(!backend.status().enabled);
+    }
+
+    #[test]
+    fn built_with_gpu_flag_matches_feature() {
+        let backend = GpuBackend::new(GpuConfig::default());
+        assert_eq!(backend.status().built_with_gpu, cfg!(feature = "gpu"));
+        let status = GpuStatus::default();
+        assert_eq!(status.built_with_gpu, cfg!(feature = "gpu"));
+    }
+
+    // ---- serde 配置反序列化 ----
+
+    #[test]
+    fn gpu_config_deserializes_lowercase_policies() {
+        for (json, expected) in [
+            (r#"{"policy":"auto"}"#, GpuPolicy::Auto),
+            (r#"{"policy":"off"}"#, GpuPolicy::Off),
+            (r#"{"policy":"on"}"#, GpuPolicy::On),
+        ] {
+            let config: GpuConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(config.policy, expected);
+            // 缺失的 min_trits 走容器级 #[serde(default)]。
+            assert_eq!(config.min_trits, DEFAULT_MIN_TRITS);
+        }
+    }
+
+    #[test]
+    fn gpu_config_empty_json_uses_defaults() {
+        let config: GpuConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.policy, GpuPolicy::Auto);
+        assert_eq!(config.min_trits, DEFAULT_MIN_TRITS);
+    }
+
+    #[test]
+    fn gpu_policy_serde_is_lowercase() {
+        assert_eq!(serde_json::to_string(&GpuPolicy::Auto).unwrap(), "\"auto\"");
+        assert_eq!(serde_json::to_string(&GpuPolicy::Off).unwrap(), "\"off\"");
+        assert_eq!(serde_json::to_string(&GpuPolicy::On).unwrap(), "\"on\"");
+    }
 }
