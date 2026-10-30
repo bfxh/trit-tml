@@ -295,7 +295,7 @@ pub unsafe extern "C" fn tt_rt_destroy(handle: u64) -> i32 {
 /// - 绝大多数 opcode：本次执行的结果已被缓存，原样返回，**不会二次执行**
 ///   ——否则 `PRNG_NEXT` 会多消耗一段随机序列，`SUBSCRIBE`/`TXN_BEGIN` 会重复创建资源。
 /// - `JOB_POLL`：**不进缓存**，走「窥视 → 交付成功才出队」的两阶段流程
-///   （见 [`submit_job_poll`]）。它是流式语义，缓存重放会返回陈旧数据；
+///   （见 `submit_job_poll`）。它是流式语义，缓存重放会返回陈旧数据；
 ///   而直接出队又会在扩容重试时把结果丢掉。
 ///
 /// # Safety

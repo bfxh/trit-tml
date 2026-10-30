@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 同一 ref（分支 / PR）上只保留最新一次运行：旧的运行若还在排队或跑着就取消，
+# 省 CI 分钟、避免「push 连发导致矩阵积压、最后合的是一个早就被推翻的状态」。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -104,7 +110,9 @@ jobs:
           echo "value=$PROF $FEAT" >> "$GITHUB_OUTPUT"
 
       - name: test
-        run: cargo test -p trit-rt ${{ steps.flags.outputs.value }}
+        # --locked 用仓库钉住的 Cargo.lock，防止"依赖自动升级后某个 dev-dep 行为变了"
+        # 被悄悄放过——测试矩阵必须跑在可复现的依赖图上。
+        run: cargo test -p trit-rt --locked ${{ steps.flags.outputs.value }}
 
       - name: build（--all-targets 覆盖 benches/examples）
         # `cargo test -p` 只编译测试目标；benches / examples 若存在不会被碰到。
@@ -173,6 +181,70 @@ jobs:
 
       - name: test --no-default-features --features gpu
         run: cargo test -p trit-rt --release --no-default-features --features gpu
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 4b) 文档门禁：RUSTDOCFLAGS=-D warnings 强制 `cargo doc` 零警告。
+  #     公开 API 的文档注释（///）里的破损链接、未解析的 intra-doc 引用、
+  #     缺失的 doc 都会在这里被拦下——这些是「编译通过但文档在骗人」的典型。
+  #     --no-deps 不拉第三方 crate 的文档，避免被上游文档问题误伤。
+  # ────────────────────────────────────────────────────────────────────────
+  rustdoc:
+    name: rustdoc (zero warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rustdoc
+
+      - name: 文档零警告
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc -p trit-rt --no-deps --all-features
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 4c) 示例冒烟：examples 目录里的可运行 demo 也必须进 CI 实跑，而不是只编译。
+  #     它们演示真实使用路径（FFI 调用、扫描、压力、内存回收），且历史上某次
+  #     重构让 scan_bench 在 release 下静默 panic——只 --build 发现不了。
+  #     gpu_matmul_bench 需真实 GPU 后端且慢 58×、会 panic，按设计排除。
+  #     每个示例都用极小规模参数，保证 CI 几秒内跑完、不超时。
+  # ────────────────────────────────────────────────────────────────────────
+  examples-smoke:
+    name: examples smoke (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: examples
+
+      - name: ffi_smoke（无参数）
+        run: cargo run -q --release -p trit-rt --example ffi_smoke
+
+      - name: scan_bench（极小窗口）
+        run: cargo run -q --release -p trit-rt --example scan_bench -- --len 2000
+
+      - name: mem_bench（200 ticks）
+        run: cargo run -q --release -p trit-rt --example mem_bench -- --ticks 200
+
+      - name: stress_bench（极小实体规模）
+        run: cargo run -q --release -p trit-rt --example stress_bench -- --npcs 50 --projectiles 30 --players 10 --changes 100 --ticks 100
 
   # ────────────────────────────────────────────────────────────────────────
   # 5) 覆盖率：cargo-llvm-cov。失败不阻塞合并（覆盖率工具本身偶发与新版
@@ -352,6 +424,49 @@ jobs:
           n=$(grep -c 'CS8632' /tmp/nullable.log || true)
           echo "CS8632 条数：$n"
           [ "$n" -eq 0 ]
+
+  # ────────────────────────────────────────────────────────────────────────
+  # 9) 汇总 gate：所有「必须过」的 job 都绿，它才绿；branch protection 只勾这
+  #    一个，不用逐个勾 10 个 job 名。coverage 是软失败（continue-on-error），
+  #    不进 needs——它挂了不影响门禁，但制品仍留档。
+  # ────────────────────────────────────────────────────────────────────────
+  ci-ok:
+    name: ci-ok
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - lint
+      - rust-test
+      - msrv
+      - gpu
+      - rustdoc
+      - examples-smoke
+      - native
+      - dotnet
+      - csharp-nullable
+    steps:
+      - name: 汇总判定
+        run: |
+          echo "lint       = ${{ needs.lint.result }}"
+          echo "rust-test  = ${{ needs.rust-test.result }}"
+          echo "msrv       = ${{ needs.msrv.result }}"
+          echo "gpu        = ${{ needs.gpu.result }}"
+          echo "rustdoc    = ${{ needs.rustdoc.result }}"
+          echo "examples   = ${{ needs.examples-smoke.result }}"
+          echo "native     = ${{ needs.native.result }}"
+          echo "dotnet     = ${{ needs.dotnet.result }}"
+          echo "nullable   = ${{ needs.csharp-nullable.result }}"
+          for r in "${{ needs.lint.result }}" "${{ needs.rust-test.result }}" \
+                   "${{ needs.msrv.result }}" "${{ needs.gpu.result }}" \
+                   "${{ needs.rustdoc.result }}" "${{ needs.examples-smoke.result }}" \
+                   "${{ needs.native.result }}" "${{ needs.dotnet.result }}" \
+                   "${{ needs.csharp-nullable.result }}"; do
+            if [ "$r" != "success" ]; then
+              echo "有 job 未通过：$r"
+              exit 1
+            fi
+          done
+          echo "全部必过 job 均为 success ✅"
 
 # 模组工程（mod/TritRuntimeMod）的编译与 .tmod 打包刻意不进 CI：
 # 它依赖本机安装的 tModLoader（tModLoader.dll、Libraries/**、tMLMod.targets），

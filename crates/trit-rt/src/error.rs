@@ -80,3 +80,110 @@ impl RtError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arbiter::LaneDispute;
+    use crate::ffi;
+
+    fn dispute(key: u32, txn: u64) -> LaneDispute {
+        LaneDispute {
+            key,
+            drivers: vec![(txn, trit_core::value::Ternary::True)],
+        }
+    }
+
+    /// 覆盖 `RtError` 全部 9 个变体，避免新增变体时漏配状态码。
+    fn all_variants() -> Vec<RtError> {
+        vec![
+            RtError::BadHandle(7),
+            RtError::Capacity("满".into()),
+            RtError::Decode("坏".into()),
+            RtError::TxnNotFound(1),
+            RtError::SnapshotNotFound(2),
+            RtError::SubNotFound(3),
+            RtError::TxnState("已关".into()),
+            RtError::Conflict {
+                count: 0,
+                disputes: vec![],
+            },
+            RtError::InvalidInput("环".into()),
+        ]
+    }
+
+    #[test]
+    fn every_variant_maps_to_a_defined_status_code() {
+        let expected = [
+            ffi::TT_ERR_BAD_HANDLE,
+            ffi::TT_ERR_CAPACITY,
+            ffi::TT_ERR_DECODE,
+            ffi::TT_ERR_NOT_FOUND,
+            ffi::TT_ERR_NOT_FOUND,
+            ffi::TT_ERR_NOT_FOUND,
+            ffi::TT_ERR_STATE,
+            ffi::TT_ERR_CONFLICT,
+            ffi::TT_ERR_ARG,
+        ];
+        for (err, code) in all_variants().into_iter().zip(expected) {
+            assert_eq!(err.status_code(), code, "{err:?} 状态码映射错误");
+            // 状态码必须落在健壮性矩阵约定的 [-10, 0] 集合内，且不是 PANIC。
+            assert!((-10..=0).contains(&code));
+            assert_ne!(code, ffi::TT_ERR_PANIC);
+        }
+    }
+
+    #[test]
+    fn three_not_found_variants_share_one_code() {
+        // TxN/Snapshot/Sub 三类「找不到」都折叠成 NOT_FOUND，供 C# 统一处理。
+        for err in [
+            RtError::TxnNotFound(1),
+            RtError::SnapshotNotFound(2),
+            RtError::SubNotFound(3),
+        ] {
+            assert_eq!(err.status_code(), ffi::TT_ERR_NOT_FOUND);
+        }
+    }
+
+    #[test]
+    fn reason_strips_display_prefix_for_free_text_variants() {
+        // Display 带「解码失败：」这类前缀，但 reason() 必须返回裸原因——
+        // 影子差分逐字节比对任务记录里的 error 字段，前缀差一字符就一直报假分歧。
+        let cases = [
+            (RtError::Capacity("订阅超限".into()), "订阅超限"),
+            (RtError::Decode("长度不足".into()), "长度不足"),
+            (RtError::TxnState("重复提交".into()), "重复提交"),
+            (RtError::InvalidInput("依赖成环".into()), "依赖成环"),
+        ];
+        for (err, bare) in cases {
+            assert_ne!(err.reason(), err.to_string(), "{err:?} 应去掉前缀");
+            assert_eq!(err.reason(), bare);
+        }
+    }
+
+    #[test]
+    fn reason_keeps_full_display_for_structured_variants() {
+        // 结构化变体没有「带前缀的裸原因」概念，reason 直接等于 Display。
+        for err in [
+            RtError::BadHandle(7),
+            RtError::TxnNotFound(1),
+            RtError::SnapshotNotFound(2),
+            RtError::SubNotFound(3),
+        ] {
+            assert_eq!(err.reason(), err.to_string(), "{err:?} 应保留完整 Display");
+        }
+    }
+
+    #[test]
+    fn conflict_reason_reports_dispute_count_and_is_clone_eq() {
+        let err = RtError::Conflict {
+            count: 2,
+            disputes: vec![dispute(10, 1), dispute(20, 2)],
+        };
+        assert_eq!(err.status_code(), ffi::TT_ERR_CONFLICT);
+        assert!(err.to_string().contains('2'), "冲突文案应含争议车道数");
+        assert_eq!(err.reason(), err.to_string());
+        // Clone + PartialEq：parity 对拍会克隆错误做比对。
+        assert_eq!(err.clone(), err);
+    }
+}

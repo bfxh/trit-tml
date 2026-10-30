@@ -336,4 +336,111 @@ mod tests {
         assert!(r.u64().is_err());
         assert!(r.trits().is_err());
     }
+
+    // ── 装框 / 拆框 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn frame_unframe_round_trip_across_lengths() {
+        for payload in [
+            vec![],
+            vec![0x2A],
+            (0u8..64).collect::<Vec<_>>(),
+            vec![0xAB; 4096],
+            vec![0u8; 1 << 16],
+        ] {
+            let framed = frame_response(&payload);
+            assert_eq!(framed.len(), 4 + payload.len());
+            assert_eq!(&framed[..4], &(payload.len() as u32).to_le_bytes());
+            assert_eq!(unframe_response(&framed).unwrap(), payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn unframe_ignores_trailing_bytes_beyond_declared_length() {
+        // 声明长度 3、实际后面还挂了垃圾：只取声明的那一段，多出的字节不算错误。
+        let mut framed = frame_response(&[1, 2, 3]);
+        framed.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+        assert_eq!(unframe_response(&framed).unwrap(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn unframe_rejects_short_and_oversized_declared_length() {
+        // 头部都不足 4 字节。
+        for short in [vec![], vec![0], vec![0, 0], vec![0, 0, 0]] {
+            assert!(
+                unframe_response(&short).is_none(),
+                "短缓冲应被拒：{short:?}"
+            );
+        }
+        // 声明 100 字节，实际只给了 2 字节。
+        let mut truncated = 100u32.to_le_bytes().to_vec();
+        truncated.extend_from_slice(&[1, 2]);
+        assert!(unframe_response(&truncated).is_none());
+
+        // 声明长度 = u32::MAX：Rust 侧用 usize 算 4 + len，在 64 位上不会回绕成
+        // 一个小正数（这正是 C# 侧曾经踩过、需提升到 long 修复的同类边界）。
+        // 因此必须老老实实判「缓冲不够」返回 None，绝不能切出非法切片。
+        let mut huge = u32::MAX.to_le_bytes().to_vec();
+        huge.extend_from_slice(&[1, 2, 3]);
+        assert!(unframe_response(&huge).is_none());
+    }
+
+    // ── trit 字节映射 ────────────────────────────────────────────────────
+
+    #[test]
+    fn trit_byte_round_trips_all_three_values() {
+        for value in [Ternary::False, Ternary::Unknown, Ternary::True] {
+            let byte = trit_byte(value);
+            assert!(byte <= 2);
+            assert_eq!(trit_from_byte(byte), value);
+        }
+    }
+
+    #[test]
+    fn trit_from_byte_converges_every_out_of_range_value_to_abstain() {
+        // 线格式里 0/1/2 之外的字节必须收敛成 Unknown（弃权），不能留成非法枚举，
+        // 否则多数投票会凭空多出一条车道并写进世界（原生/托管两侧都会分叉）。
+        for byte in 3u8..=255 {
+            assert_eq!(
+                trit_from_byte(byte),
+                Ternary::Unknown,
+                "越界字节 {byte} 未收敛成弃权"
+            );
+        }
+    }
+
+    // ── 解码器边界 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn reader_huge_trit_count_fails_fast_without_allocating() {
+        // 头 4 字节谎报 u32::MAX 个 trit，byte_len = div_ceil(5) ≈ 858MB。
+        // `take` 必须先用长度比对拒绝，绝不能真的去分配这段缓冲。
+        let mut w = Writer::new();
+        w.u32(u32::MAX);
+        let buf = w.into_vec();
+        let mut r = Reader::new(&buf);
+        assert!(r.trits().is_err(), "巨大 count 应快速返回 Decode 错误");
+    }
+
+    #[test]
+    fn reader_huge_length_overflows_to_decode_error_not_panic() {
+        // pos > 0 时 pos + usize::MAX 会溢出 checked_add，必须回 Decode 而非 panic。
+        let mut r = Reader::new(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            r.u64().unwrap(),
+            u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        assert!(r.bytes(usize::MAX).is_err(), "长度溢出应回 Decode 错误");
+    }
+
+    #[test]
+    fn writer_len_and_empty_track_writes() {
+        let mut w = Writer::new();
+        assert!(w.is_empty());
+        assert_eq!(w.len(), 0);
+        w.u8(1).u32(2).i32(-3).u64(4);
+        assert_eq!(w.len(), 1 + 4 + 4 + 8);
+        assert!(!w.is_empty());
+        assert_eq!(w.clone().into_vec().len(), w.len());
+    }
 }
