@@ -562,19 +562,35 @@ fn snapshot_diff_rollback_over_ffi() {
     }
 }
 
-/// 轮询直到拿到一条结果（超时即失败，不死锁）。
-unsafe fn poll_until(handle: u64, limit: usize, tries: usize) -> Vec<u8> {
+/// 轮询直到**累计**拿到 `expected` 条结果（超时即失败，不死锁），返回组装后的
+/// `{"jobs":[...]}` 字节。
+///
+/// 与内核层 `runtime_ops::poll_until` 同一口径：`JOB_POLL` 是流式消费语义，
+/// 每次调用都会把已完成结果出队。若「拿到 >0 就返回」，在结果分批到达时
+/// （慢 runner / 任务陆续完成）只会拿到头几条，预期的 `expected` 条永远凑不齐。
+/// 必须跨多次轮询累积，达标后再组装成同构响应返回。
+unsafe fn poll_until(handle: u64, limit: usize, expected: usize, tries: usize) -> Vec<u8> {
     let payload = format!("{{\"limit\":{limit}}}");
+    let mut collected: Vec<serde_json::Value> = Vec::new();
+    let mut last_value = serde_json::Value::Null;
     for _ in 0..tries {
         let (status, response) = unsafe { submit(handle, op::JOB_POLL, payload.as_bytes()) };
         assert_eq!(status, TT_OK);
         let value: serde_json::Value = serde_json::from_slice(&response).unwrap();
-        if value["jobs"].as_array().map(Vec::len).unwrap_or(0) > 0 {
-            return response;
+        if let Some(jobs) = value["jobs"].as_array() {
+            collected.extend(jobs.iter().cloned());
+        }
+        last_value = value;
+        if collected.len() >= expected {
+            return serde_json::to_vec(&serde_json::json!({ "jobs": collected }))
+                .expect("组装累计响应");
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    Vec::new()
+    panic!(
+        "超时：期望 {expected} 条结果，实际累计 {} 条，最后一次响应：{last_value}",
+        collected.len()
+    );
 }
 
 #[test]
@@ -592,7 +608,7 @@ fn scan_submit_poll_and_budget_over_ffi() {
         let job = submitted["job"].as_u64().expect("应返回 job id");
         assert!(job >= 1);
 
-        let response = poll_until(handle, 4, 400);
+        let response = poll_until(handle, 4, 1, 400);
         let polled: serde_json::Value = serde_json::from_slice(&response).unwrap();
         let jobs = polled["jobs"].as_array().expect("jobs 是数组");
         assert_eq!(jobs.len(), 1);
@@ -652,7 +668,7 @@ fn illegal_scan_requests_become_failed_jobs_over_ffi() {
         assert_eq!(status, TT_OK, "缺 pattern 不该让 opcode 失败");
 
         // 三条都应该在 JOB_POLL 里以 failed 状态回来，并带上失败原因。
-        let response = poll_until(handle, 4, 400);
+        let response = poll_until(handle, 4, 3, 400);
         let polled: serde_json::Value = serde_json::from_slice(&response).unwrap();
         let jobs = polled["jobs"].as_array().expect("jobs 是数组");
         assert_eq!(jobs.len(), 3);

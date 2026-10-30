@@ -129,10 +129,10 @@ dotnet build mod/TritRuntimeMod/TritRuntimeMod.csproj -p:BuildMod=true       # �
 
 | 项 | 状态 | 依据 |
 |---|---|---|
-| Rust 内核测试 | ✅ 286/286（165 lib 单测 [txn/snapshot/router/prng/arbiter/budget/wire/error/gpu 纯逻辑，gpu +17] + 20 opcode 语义 [DIFF/ARBITRATE/UNSUBSCRIBE/GPU_STATUS/CAPABILITIES/TXN_SUBMIT_BATCH/STATS] + 7 并发 FFI + 16 FFI ABI + 36 健壮性 + 11 运行时 + 16 语义 + 5 确定性 + 5 PRNG 黄金向量 + 5 wire 模糊往返）。三特性组合 default/no-default/all 各全绿 | `cargo test -p trit-rt` |
+| Rust 内核测试 | ✅ 286/286（165 lib 单测 [txn/snapshot/router/prng/arbiter/budget/wire/error/gpu 纯逻辑，gpu +17] + 20 opcode 语义 [DIFF/ARBITRATE/UNSUBSCRIBE/GPU_STATUS/CAPABILITIES/TXN_SUBMIT_BATCH/STATS] + 7 并发 FFI + 16 FFI ABI + 36 健壮性 + 11 运行时 + 16 语义 + 5 确定性 + 5 PRNG 黄金向量 + 5 wire 模糊往返）。三特性组合 default/no-default/all 各全绿 | `cargo test -p trit-rt`。已修复 `JOB_POLL` 测试辅助的累积语义缺陷：`JOB_POLL` 是流式消费（每次取走出队），慢 runner 上任务陆续完成时须跨多次轮询**累积**，原先「单次凑齐」的写法在 macOS debug 上必现 10s 超时 |
 | Rust clippy / fmt / doc | ✅ 0 警告 / 干净 / `RUSTDOCFLAGS=-D warnings` 文档零警告 | `cargo clippy --all-targets`、`cargo fmt --check`、`cargo doc --no-deps` |
 | CI 多矩阵流水线 | ✅ 11 job：lint×3 特性 / rust-test 15 格（已加 `--locked`）/ MSRV 1.88 / GPU / rustdoc 门禁 / examples 冒烟（4 示例实跑）/ 覆盖率 / 三平台原生制品 / 三平台 parity / C# 可空门禁 / `ci-ok` 汇总 gate；含 `concurrency` 取消旧运行 | `.github/workflows/ci.yml` |
-| C# 兼容壳测试 | ✅ 790/790（较上轮 782 新增 8：DeterministicPrng 属性测试 8，与 Rust prng.rs 单元测试镜像；含零种子/重置/可复现/trit 映射/分布/计数） | `dotnet test`，含原生 vs 托管逐字节对拍 + 576 组畸形载荷矩阵 + 6000+ 模糊往返迭代 |
+| C# 兼容壳测试 | ✅ 792/792（较上轮 790 新增 2：`AllowDefaultProbing=false` 时环境变量也被屏蔽的回归验证——修复了 CI 注入 `TRIT_RT_LIBRARY` 导致「库缺失」用例错误加载原生库的产品缺陷） | `dotnet test`，含原生 vs 托管逐字节对拍 + 576 组畸形载荷矩阵 + 6000+ 模糊往返迭代；已在设置 `TRIT_RT_LIBRARY` 的 CI 等价环境下复验 |
 | 原生 / 托管语义等价 | ✅ 快照字节、统计、PRNG 流、冲突诊断全部对拍 | `ParityTests` |
 | 原生 / 托管**扫描结果逐字节等价** | ✅ 4 合法 + 5 非法 + 4 容错载荷，两侧 `JOB_POLL` 记录逐字节相同 | `ParallelApiTests.ManagedAndNativeScanResultsAgreeWhenV2NativeIsAvailable` |
 | 非法请求语义统一 | ✅ 非法 trit / 未知 kind / 缺 pattern / 超容量两侧都产生 `failed` 任务，`error` 文案逐字一致、无前缀 | `ParallelApiTests` + `crates/trit-rt` 测试 |

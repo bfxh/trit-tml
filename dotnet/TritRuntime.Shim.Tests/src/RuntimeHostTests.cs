@@ -38,6 +38,51 @@ public sealed class RuntimeHostTests
     }
 
     [Fact]
+    public void DisablingDefaultProbingExcludesEnvironmentVariable()
+    {
+        // 只读环境变量、不修改进程状态 → 与其它并行测试零串扰。
+        // 在 CI（dotnet job 会注入 TRIT_RT_LIBRARY）里这条断言能真正验证：
+        // 禁用默认探测后，环境变量这条隐式来源必须一并被屏蔽；否则上面那个
+        // 「库缺失 → 回退托管」用例在 CI 里会错误地加载到原生库。
+        var fromEnvironment =
+            Environment.GetEnvironmentVariable(RuntimeHost.LibraryPathEnvironmentVariable);
+
+        var restricted = RuntimeHost.CandidatePaths(
+            new RuntimeHostOptions { AllowDefaultProbing = false });
+        Assert.Empty(restricted); // 未给任何显式路径 → 候选必须为空
+        if (!string.IsNullOrEmpty(fromEnvironment))
+        {
+            Assert.DoesNotContain(fromEnvironment, restricted);
+        }
+
+        // 反向确认：默认探测开启时，环境变量仍然是有效的候选来源（没把正常路径改坏）。
+        var permitted = RuntimeHost.CandidatePaths(
+            new RuntimeHostOptions { AllowDefaultProbing = true });
+        if (!string.IsNullOrEmpty(fromEnvironment))
+        {
+            Assert.Contains(fromEnvironment, permitted);
+        }
+    }
+
+    [Fact]
+    public void DisabledProbingHonorsOnlyExplicitPaths()
+    {
+        // 候选列表必须严格等于「显式 LibraryPath + SearchDirectories」，不含任何隐式项。
+        var explicitPath = Path.Combine(Path.GetTempPath(), "explicit-trit-rt.dll");
+        var searchDir = Path.Combine(Path.GetTempPath(), "probe-dir");
+        var candidates = RuntimeHost.CandidatePaths(new RuntimeHostOptions
+        {
+            LibraryPath = explicitPath,
+            SearchDirectories = new[] { searchDir },
+            AllowDefaultProbing = false,
+        });
+
+        Assert.Equal(
+            new[] { explicitPath, Path.Combine(searchDir, RuntimeHost.LibraryFileName) },
+            candidates);
+    }
+
+    [Fact]
     public void ExplicitNativeLibraryIsUsedWhenPresent()
     {
         var path = NativeLibraryLocator.Find();

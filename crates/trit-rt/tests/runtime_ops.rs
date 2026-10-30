@@ -12,22 +12,37 @@ fn runtime(config_json: &str) -> TritRuntime {
     TritRuntime::new(config)
 }
 
-/// 轮询直到拿到 `count` 条结果。
+/// 轮询直到**累计**拿到 `count` 条结果，返回与单次响应同构的 `{"jobs":[...]}` 字节。
+///
+/// 关键：`JOB_POLL` 是流式消费语义——每次调用都会把已完成的结果出队
+/// （`op_job_poll` = 窥视 + commit）。任务在慢速 runner 上**陆续**完成时，单次
+/// 轮询常常只拿到 1~2 条就被取走，若以「单次 `jobs.len() >= count`」判定，结果被
+/// 逐次取空，永远凑不满单次的 `count`——macOS debug 实测 10s 超时、最后一次
+/// `{"jobs":[]}`。所以这里必须跨多次轮询**累积**，达标后再组装成同构响应返回。
+/// 与下面 `poll_until_by_owner` 的 `collected.extend` 保持同一口径。
 fn poll_until(runtime: &mut TritRuntime, count: usize, timeout: Duration) -> Vec<u8> {
     let deadline = Instant::now() + timeout;
-    loop {
+    let mut collected: Vec<serde_json::Value> = Vec::new();
+    while collected.len() < count {
         let response = runtime
-            .dispatch(op::JOB_POLL, br#"{"limit":16}"#)
+            .dispatch(op::JOB_POLL, br#"{"limit":64}"#)
             .expect("JOB_POLL 成功");
         let value: serde_json::Value = serde_json::from_slice(&response).unwrap();
-        if value["jobs"].as_array().map(Vec::len).unwrap_or(0) >= count {
-            return response;
+        if let Some(jobs) = value["jobs"].as_array() {
+            collected.extend(jobs.iter().cloned());
+        }
+        if collected.len() >= count {
+            break;
         }
         if Instant::now() > deadline {
-            panic!("超时未拿到 {count} 条结果，最后一次响应：{value}");
+            panic!(
+                "超时未拿到 {count} 条结果（已累计 {} 条），最后一次响应：{value}",
+                collected.len()
+            );
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    serde_json::to_vec(&serde_json::json!({ "jobs": collected })).expect("组装累计响应")
 }
 
 #[test]

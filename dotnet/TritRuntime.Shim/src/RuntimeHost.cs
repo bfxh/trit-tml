@@ -28,9 +28,12 @@ public sealed class RuntimeHostOptions
     public bool ShadowMode { get; init; }
 
     /// <summary>
-    /// 是否允许默认探测（兼容壳自身目录、进程入口目录、系统搜索路径）。
+    /// 是否允许默认探测（<c>TRIT_RT_LIBRARY</c> 环境变量、兼容壳自身目录、
+    /// 进程入口目录、系统搜索路径）。
     /// 置 false 时只认 <see cref="LibraryPath"/> 与 <see cref="SearchDirectories"/>——
     /// 嵌入方需要精确控制 DLL 来源时使用，也让回退路径可确定性地测试。
+    /// 注意：环境变量也算默认来源，会被一并屏蔽；这正是「库缺失」用例在 CI
+    ///（会注入 TRIT_RT_LIBRARY）里也能确定性触发托管回退的前提。
     /// </summary>
     public bool AllowDefaultProbing { get; init; } = true;
 }
@@ -224,10 +227,17 @@ public sealed class RuntimeHost : IDisposable
             candidates.Add(options.LibraryPath);
         }
 
-        var fromEnvironment = Environment.GetEnvironmentVariable(LibraryPathEnvironmentVariable);
-        if (!string.IsNullOrEmpty(fromEnvironment))
+        // 环境变量属于「默认来源」：嵌入方一旦用 AllowDefaultProbing=false 要求精确
+        // 控制 DLL 来源，就必须连 TRIT_RT_LIBRARY 一起屏蔽。否则在注入了环境变量的环境
+        //（典型如 CI 把编译产物路径喂进来）里，显式给一个不存在的 LibraryPath 也仍会从
+        // 环境变量加载到原生库，「库缺失 → 回退托管」这条路径永远无法被确定性触发。
+        if (options.AllowDefaultProbing)
         {
-            candidates.Add(fromEnvironment);
+            var fromEnvironment = Environment.GetEnvironmentVariable(LibraryPathEnvironmentVariable);
+            if (!string.IsNullOrEmpty(fromEnvironment))
+            {
+                candidates.Add(fromEnvironment);
+            }
         }
 
         foreach (var directory in options.SearchDirectories)
