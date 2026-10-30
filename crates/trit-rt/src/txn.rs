@@ -386,4 +386,155 @@ mod tests {
         assert_eq!(log.replay_from(first.seq).count(), 1);
         assert_eq!(log.replay_from(0).count(), 2);
     }
+
+    #[test]
+    fn begin_enforces_max_open() {
+        let mut table = TxnTable::new(2);
+        assert!(table.begin(1).is_ok());
+        assert!(table.begin(2).is_ok());
+        assert!(matches!(table.begin(3), Err(RtError::Capacity(_))));
+    }
+
+    #[test]
+    fn open_rejects_unknown_and_closed() {
+        let mut table = TxnTable::new(8);
+        assert!(matches!(table.open(999), Err(RtError::TxnNotFound(999))));
+        let id = table.begin(1).unwrap();
+        table.finish_commit(id).unwrap();
+        assert!(matches!(table.open(id), Err(RtError::TxnState(_))));
+    }
+
+    #[test]
+    fn push_intent_rejects_when_not_open() {
+        let mut table = TxnTable::new(8);
+        let id = table.begin(1).unwrap();
+        table.finish_rollback(id).unwrap();
+        assert!(matches!(
+            table.push_intent(id, intent(id, 1, Ternary::True)),
+            Err(RtError::TxnState(_))
+        ));
+        assert!(matches!(
+            table.push_intent(404, intent(404, 1, Ternary::True)),
+            Err(RtError::TxnNotFound(404))
+        ));
+    }
+
+    #[test]
+    fn clone_intents_copies_only_open() {
+        let mut table = TxnTable::new(8);
+        let id = table.begin(1).unwrap();
+        table.push_intent(id, intent(id, 5, Ternary::True)).unwrap();
+        table
+            .push_intent(id, intent(id, 6, Ternary::False))
+            .unwrap();
+        let copied = table.clone_intents(id).unwrap();
+        assert_eq!(copied.len(), 2);
+        // 关闭后 clone 报错。
+        table.finish_commit(id).unwrap();
+        assert!(table.clone_intents(id).is_err());
+    }
+
+    #[test]
+    fn pending_intents_excludes_self() {
+        let mut table = TxnTable::new(8);
+        let a = table.begin(1).unwrap();
+        let b = table.begin(2).unwrap();
+        table.push_intent(a, intent(a, 1, Ternary::True)).unwrap();
+        table.push_intent(b, intent(b, 2, Ternary::False)).unwrap();
+        let pending = table.pending_intents(a);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].key, 2);
+    }
+
+    #[test]
+    fn open_count_counts_only_open() {
+        let mut table = TxnTable::new(8);
+        let a = table.begin(1).unwrap();
+        let b = table.begin(2).unwrap();
+        let c = table.begin(3).unwrap();
+        assert_eq!(table.open_count(), 3);
+        table.finish_commit(a).unwrap();
+        table.finish_rollback(b).unwrap();
+        assert_eq!(table.open_count(), 1);
+        assert_eq!(table.open(c).unwrap().id, c);
+    }
+
+    #[test]
+    fn committed_and_rolled_back_counters() {
+        let mut table = TxnTable::new(8);
+        let a = table.begin(1).unwrap();
+        let b = table.begin(2).unwrap();
+        table.finish_commit(a).unwrap();
+        table.finish_rollback(b).unwrap();
+        assert_eq!(table.committed(), 1);
+        assert_eq!(table.rolled_back(), 1);
+    }
+
+    #[test]
+    fn txn_log_start_after_boundaries() {
+        let mut log = TxnLog::new();
+        log.append(&ResolvedIntent {
+            key: 1,
+            delta: Ternary::True,
+        });
+        log.append(&ResolvedIntent {
+            key: 2,
+            delta: Ternary::False,
+        });
+        // seq <= base_seq(0) ⇒ 从头。
+        assert_eq!(log.start_after(0), 0);
+        // 中间值映射到下一条。
+        assert_eq!(log.start_after(1), 1);
+        // 超界 clamp 到 len。
+        assert_eq!(log.start_after(99), 2);
+    }
+
+    #[test]
+    fn txn_log_truncate_preserves_seq_and_replay() {
+        let mut log = TxnLog::new();
+        for k in 1..=5u32 {
+            log.append(&ResolvedIntent {
+                key: k,
+                delta: Ternary::True,
+            });
+        }
+        let seq_before = log.seq();
+        log.truncate_before(3);
+        // seq 单调不回退。
+        assert_eq!(log.seq(), seq_before);
+        assert_eq!(log.len(), 2);
+        let entries: Vec<u32> = log.replay_from(0).map(|e| e.key).collect();
+        assert_eq!(entries, vec![4, 5]);
+    }
+
+    #[test]
+    fn txn_log_truncate_below_base_is_noop() {
+        let mut log = TxnLog::new();
+        log.append(&ResolvedIntent {
+            key: 1,
+            delta: Ternary::True,
+        });
+        log.truncate_before(0);
+        assert_eq!(log.len(), 1);
+    }
+
+    #[test]
+    fn closed_transaction_retention_caps_table_size() {
+        // 顺序开/关大量事务：历史 closed 超过 CLOSED_TXN_RETAIN 后被回收，
+        // 不会让表无界增长，也不会占满 max_open 导致后续 begin 永久失败。
+        let mut table = TxnTable::new(8);
+        for t in 1..=2000u64 {
+            let id = table.begin(t).unwrap();
+            table
+                .push_intent(id, intent(id, t as u32, Ternary::True))
+                .unwrap();
+            table.finish_commit(id).unwrap();
+        }
+        // 最早的事务已滚出保留窗口。
+        assert!(matches!(table.open(1), Err(RtError::TxnNotFound(_))));
+        // 最近的事务仍在保留窗口内。
+        assert!(matches!(table.open(2000), Err(RtError::TxnState(_))));
+        // 仍可继续开新事务。
+        assert!(table.begin(2001).is_ok());
+    }
 }

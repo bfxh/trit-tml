@@ -98,4 +98,65 @@ mod tests {
             assert!((9_000..11_000).contains(&count), "分布偏离：{counts:?}");
         }
     }
+
+    #[test]
+    fn zero_seed_does_not_degenerate() {
+        // 零种子 (0,0) 不应一路输出 0。
+        let mut prng = DeterministicPrng::new(0);
+        prng.reseed(0, 0);
+        assert_ne!(prng.next_u64(), 0);
+        // 同一零种子两次独立构造序列一致。
+        let mut a = DeterministicPrng::new(0);
+        let mut b = DeterministicPrng::new(0);
+        a.reseed(0, 0);
+        b.reseed(0, 0);
+        assert_eq!(a.next_u64(), b.next_u64());
+    }
+
+    #[test]
+    fn reseed_restarts_same_sequence() {
+        let mut prng = DeterministicPrng::new(7);
+        prng.reseed(123, 4);
+        let first: Vec<u64> = (0..8).map(|_| prng.next_u64()).collect();
+        prng.reseed(123, 4);
+        let second: Vec<u64> = (0..8).map(|_| prng.next_u64()).collect();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn next_u64_is_reproducible() {
+        let mut prng = DeterministicPrng::new(11);
+        prng.reseed(11, 1);
+        let a: Vec<u64> = (0..16).map(|_| prng.next_u64()).collect();
+        let mut prng2 = DeterministicPrng::new(11);
+        prng2.reseed(11, 1);
+        let b: Vec<u64> = (0..16).map(|_| prng2.next_u64()).collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fill_trits_zero_returns_empty() {
+        let mut prng = DeterministicPrng::new(1);
+        prng.reseed(1, 1);
+        assert!(prng.fill_trits(0).is_empty());
+    }
+
+    #[test]
+    fn draws_counter_increments() {
+        let mut prng = DeterministicPrng::new(1);
+        prng.reseed(1, 1);
+        assert_eq!(prng.draws(), 0);
+        let _ = prng.next_u64();
+        let _ = prng.next_u64();
+        assert_eq!(prng.draws(), 2);
+    }
+
+    #[test]
+    fn adjacent_seeds_diverge_immediately() {
+        let mut a = DeterministicPrng::new(0);
+        let mut b = DeterministicPrng::new(1);
+        a.reseed(0, 1);
+        b.reseed(1, 1);
+        assert_ne!(a.next_u64(), b.next_u64());
+    }
 }

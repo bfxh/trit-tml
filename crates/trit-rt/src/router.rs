@@ -322,4 +322,84 @@ mod tests {
         router.unsubscribe(a).unwrap();
         assert!(router.take_dispatch().is_empty());
     }
+
+    #[test]
+    fn subscribe_enforces_capacity() {
+        let mut router = EventRouter::new(2);
+        router.subscribe(1, 100, 0, vec![]).unwrap();
+        router.subscribe(2, 101, 0, vec![]).unwrap();
+        assert!(matches!(
+            router.subscribe(3, 102, 0, vec![]),
+            Err(RtError::Capacity(_))
+        ));
+    }
+
+    #[test]
+    fn subscribe_rejects_self_dependency() {
+        // 订阅者不能依赖自己订阅的事件。
+        let mut router = EventRouter::new(8);
+        assert!(matches!(
+            router.subscribe(1, 100, 0, vec![100]),
+            Err(RtError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn unsubscribe_unknown_is_sub_not_found() {
+        let mut router = EventRouter::new(8);
+        assert!(matches!(
+            router.unsubscribe(404),
+            Err(RtError::SubNotFound(404))
+        ));
+    }
+
+    #[test]
+    fn publish_is_idempotent_for_dirty_count() {
+        let mut router = EventRouter::new(8);
+        router.subscribe(1, 100, 0, vec![]).unwrap();
+        assert_eq!(router.publish(100), 1);
+        // 重复发布同一事件，不重复计入脏集合。
+        assert_eq!(router.publish(100), 0);
+        assert_eq!(router.dirty_count(), 1);
+    }
+
+    #[test]
+    fn take_dispatch_clears_dirty_set() {
+        let mut router = EventRouter::new(8);
+        router.subscribe(1, 100, 0, vec![]).unwrap();
+        router.publish(100);
+        assert!(router.dirty_count() > 0);
+        let dispatch = router.take_dispatch();
+        assert_eq!(dispatch.len(), 1);
+        assert_eq!(router.dirty_count(), 0);
+    }
+
+    #[test]
+    fn empty_router_publish_is_noop() {
+        let mut router = EventRouter::new(8);
+        assert_eq!(router.publish(1), 0);
+        assert!(router.take_dispatch().is_empty());
+    }
+
+    #[test]
+    fn metrics_populated_after_subscribe() {
+        let mut router = EventRouter::new(8);
+        router.subscribe(1, 100, 0, vec![]).unwrap();
+        let m = router.metrics();
+        // 单订阅无依赖：makespan / critical_path 至少反映 1 个任务。
+        assert!(m.makespan >= 1);
+        assert!(m.critical_path >= 1);
+    }
+
+    #[test]
+    fn publish_does_not_dirty_predecessors() {
+        // b 依赖 a：发布 b 的事件只标脏 b，不标脏 a（方向正确）。
+        let mut router = EventRouter::new(8);
+        let a = router.subscribe(1, 100, 0, vec![]).unwrap();
+        let b = router.subscribe(2, 101, 0, vec![100]).unwrap();
+        router.publish(101);
+        let dispatch = router.take_dispatch();
+        assert!(dispatch.contains(&b));
+        assert!(!dispatch.contains(&a));
+    }
 }

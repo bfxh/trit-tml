@@ -241,4 +241,99 @@ mod tests {
         let bytes = encode_diff(&entries);
         assert_eq!(decode_diff(&bytes).unwrap(), entries);
     }
+
+    #[test]
+    fn decode_rejects_mismatched_key_value_counts() {
+        // 声明 1 个车道但写入 2 个值：解码必须报错，而非把值错位到别的车道。
+        let mut writer = Writer::new();
+        writer.u8(SNAPSHOT_VERSION);
+        writer.u64(0);
+        writer.u64(0);
+        writer.u32(1u32);
+        writer.u32(42);
+        let vals = vec![Ternary::True, Ternary::True];
+        writer.trits(&vals);
+        let bytes = writer.into_vec();
+        assert!(decode_world(&bytes).is_err());
+    }
+
+    #[test]
+    fn diff_is_empty_when_worlds_equal() {
+        let w = world(&[(1, Ternary::True), (2, Ternary::False)]);
+        assert!(diff_worlds(&w, &w).is_empty());
+    }
+
+    #[test]
+    fn diff_sorts_entries_by_key() {
+        let before = world(&[(3, Ternary::Unknown), (1, Ternary::Unknown)]);
+        let after = world(&[(3, Ternary::True), (1, Ternary::False)]);
+        let entries = diff_worlds(&before, &after);
+        let keys: Vec<u32> = entries.iter().map(|e| e.key).collect();
+        assert_eq!(keys, vec![1, 3]);
+    }
+
+    #[test]
+    fn diff_reports_removed_lanes_with_unknown_new() {
+        let before = world(&[(1, Ternary::True), (2, Ternary::False)]);
+        let after = world(&[(1, Ternary::True)]);
+        let entries = diff_worlds(&before, &after);
+        assert_eq!(
+            entries,
+            vec![DiffEntry {
+                key: 2,
+                old: Ternary::False,
+                new: Ternary::Unknown
+            }]
+        );
+    }
+
+    #[test]
+    fn encode_decode_diff_with_unknown_values() {
+        let entries = vec![
+            DiffEntry {
+                key: 9,
+                old: Ternary::Unknown,
+                new: Ternary::True,
+            },
+            DiffEntry {
+                key: 3,
+                old: Ternary::False,
+                new: Ternary::Unknown,
+            },
+        ];
+        let bytes = encode_diff(&entries);
+        assert_eq!(decode_diff(&bytes).unwrap(), entries);
+    }
+
+    #[test]
+    fn large_sparse_world_round_trips() {
+        let pairs = [
+            (1u32, Ternary::True),
+            (100, Ternary::False),
+            (4096, Ternary::Unknown),
+            (1_000_000, Ternary::True),
+            (4_194_303, Ternary::False),
+        ];
+        let original = world(&pairs);
+        let bytes = encode_world(&original, 555, 777);
+        let (tick, log_seq, decoded) = decode_world(&bytes).unwrap();
+        assert_eq!(tick, 555);
+        assert_eq!(log_seq, 777);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn diff_handles_unknown_default_before() {
+        let before: BTreeMap<u32, Ternary> = BTreeMap::new();
+        let after = world(&[(5, Ternary::True)]);
+        let entries = diff_worlds(&before, &after);
+        assert_eq!(
+            entries,
+            vec![DiffEntry {
+                key: 5,
+                old: Ternary::Unknown,
+                new: Ternary::True
+            }]
+        );
+    }
 }
