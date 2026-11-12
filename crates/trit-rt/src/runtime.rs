@@ -77,8 +77,31 @@ pub struct RuntimeConfig {
     pub gpu: GpuConfig,
 }
 
-impl Default for RuntimeConfig {
-    fn default() -> Self {
+impl RuntimeConfig {
+    /// 默认 profile（`Default::default`）。
+    ///
+    /// Android 构建 → Mobile（小内存/单线程）。
+    /// 其他构建 → DesktopHigh（大内存/多线程）。
+    #[cfg(target_os = "android")]
+    fn default_profile() -> crate::pool::Profile {
+        crate::pool::Profile::Mobile
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn default_profile() -> crate::pool::Profile {
+        crate::pool::Profile::DesktopHigh
+    }
+
+    /// 按 profile 生成默认配置。
+    pub fn for_profile(profile: crate::pool::Profile) -> Self {
+        match profile {
+            crate::pool::Profile::DesktopHigh => Self::desktop_high(),
+            crate::pool::Profile::DesktopLow => Self::desktop_low(),
+            crate::pool::Profile::Mobile => Self::mobile(),
+        }
+    }
+
+    fn desktop_high() -> Self {
         Self {
             seed: 0x5EED_1234,
             max_subscribers: 65_536,
@@ -87,9 +110,50 @@ impl Default for RuntimeConfig {
             max_log_entries: 1 << 20,
             arbitration: ArbitrationModeSerde::Majority,
             shadow: true,
-            parallel: ParallelConfig::default(),
+            parallel: ParallelConfig::desktop_high(),
             gpu: GpuConfig::default(),
         }
+    }
+
+    fn desktop_low() -> Self {
+        Self {
+            seed: 0x5EED_1234,
+            max_subscribers: 32_768,
+            max_open_txns: 2_048,
+            max_snapshots: 32,
+            max_log_entries: 1 << 19,
+            arbitration: ArbitrationModeSerde::Majority,
+            shadow: true,
+            parallel: ParallelConfig::desktop_low(),
+            gpu: GpuConfig::default(),
+        }
+    }
+
+    /// 低配 Android 默认值：砍掉影子签名、把日志/快照/订阅容量全缩 4-16x。
+    fn mobile() -> Self {
+        Self {
+            seed: 0x5EED_1234,
+            max_subscribers: 8_192,
+            max_open_txns: 256,
+            max_snapshots: 8,
+            max_log_entries: 1 << 16,
+            arbitration: ArbitrationModeSerde::Majority,
+            shadow: false,
+            parallel: ParallelConfig::mobile(),
+            gpu: GpuConfig::default(),
+        }
+    }
+}
+
+impl Default for RuntimeConfig {
+    /// **按构建 target 自动选 profile**。
+    ///
+    /// - `target_os = "android"` → Mobile（单线程 / 32 MiB / 无影子签名）
+    /// - 其他 → DesktopHigh（保持现有默认值，测试行为不变）
+    ///
+    /// 显式传入 JSON 仍可 override 任何字段。
+    fn default() -> Self {
+        Self::for_profile(Self::default_profile())
     }
 }
 
