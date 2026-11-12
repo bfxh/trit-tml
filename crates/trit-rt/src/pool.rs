@@ -90,8 +90,20 @@ pub struct ParallelConfig {
     pub max_batch: usize,
 }
 
-impl Default for ParallelConfig {
-    fn default() -> Self {
+/// 目标 profile：决定默认内存/CPU/worker 预算。
+///
+/// `DesktopHigh` 是 `Default::default()`，桌面/服务器构建保持不变。
+/// `Mobile` 是给低配 Android 的，自动在 `target_os = "android"` 时选中。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    DesktopHigh,
+    DesktopLow,
+    Mobile,
+}
+
+impl ParallelConfig {
+    /// Desktop 高性能默认值（与 `Default::default()` 一致）。
+    pub fn desktop_high() -> Self {
         Self {
             workers: 0,
             cpu_capacity: 0,
@@ -100,6 +112,53 @@ impl Default for ParallelConfig {
             scan_chunk: 4096,
             max_batch: 8,
         }
+    }
+
+    /// 桌面省电默认值。
+    pub fn desktop_low() -> Self {
+        Self {
+            workers: 2,
+            cpu_capacity: 2,
+            memory_capacity: 128,
+            per_mod_inflight: 1,
+            scan_chunk: 2048,
+            max_batch: 4,
+        }
+    }
+
+    /// 低配 Android 默认值：单线程，内存预算 32 MiB。
+    ///
+    /// 典型 Android（2GB RAM / 4 核 A53）上 tModLoader 本体 + 泰拉瑞亚
+    /// 已经吃掉 300-400MB；旁路层不能再抢。scan_chunk 从 4096 降到 512
+    /// 换更细粒度的 yield（老手机不能长时间占 CPU）。
+    pub fn mobile() -> Self {
+        Self {
+            workers: 1,
+            cpu_capacity: 1,
+            memory_capacity: 32,
+            per_mod_inflight: 1,
+            scan_chunk: 512,
+            max_batch: 2,
+        }
+    }
+
+    /// 按 profile 选默认值。
+    pub fn for_profile(profile: Profile) -> Self {
+        match profile {
+            Profile::DesktopHigh => Self::desktop_high(),
+            Profile::DesktopLow => Self::desktop_low(),
+            Profile::Mobile => Self::mobile(),
+        }
+    }
+}
+
+impl Default for ParallelConfig {
+    /// 默认 = DesktopHigh，**桌面构建行为不变**。
+    ///
+    /// Android 构建通过 [`Profile::Mobile`] 自动覆盖——用 `RuntimeConfig::default()`
+    /// 时 cfg(target_os = "android") 会选 Mobile profile，用户显式传 JSON 仍可 override。
+    fn default() -> Self {
+        Self::desktop_high()
     }
 }
 

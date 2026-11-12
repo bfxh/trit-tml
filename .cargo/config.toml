@@ -1,0 +1,26 @@
+# trit-tml cargo config
+# Workspace 级：所有 crate 共享
+
+[build]
+# 并行构建线程数（默认 CPU 核数）
+jobs = 8
+
+# ---- release profile：桌面/服务器（性能优先）----
+[profile.release]
+opt-level = 3          # 极致速度，trit-scan 是纯计算瓶颈
+lto = "thin"           # ThinLTO 跨 crate 内联，体积 ↓ 10-15%，编译仅 +10%
+strip = "symbols"      # 裁剪调试符号，体积 ↓ 30-40%；发布时不建议 full
+# 注意：**不要 panic = "abort"**
+# ffi.rs 里 10+ 处用 catch_unwind 防止 panic 穿透 FFI 边界；
+# panic_abort 让 catch_unwind 失效，任何上游 panic（如 wgpu validation）
+# 都会直接 abort 宿主进程。
+
+# ---- release-mobile profile：低配 Android（体积优先）----
+# cargo build -p trit-rt --profile release-mobile --target aarch64-linux-android
+[profile.release-mobile]
+inherits = "release"
+opt-level = "z"        # 最小体积策略，scan 纯计算降 ~15-20% 可接受
+codegen-units = 1      # 更多跨模块优化，体积 ↓ 5-10%，编译更慢
+strip = "symbols"
+lto = "fat"            # fat LTO 比 thin 再减 5-10%，编译 +30%
+# 仍然保留 panic_unwind——Android 宿主进程不能被 abort
