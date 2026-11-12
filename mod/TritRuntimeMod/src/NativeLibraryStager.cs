@@ -2,6 +2,7 @@
 
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using Terraria;
 
@@ -34,13 +35,12 @@ internal static class NativeLibraryStager
     {
         string fileName = FileName();
 
-        // 打包时相对路径的分隔符可能是 '/' 也可能是 '\'，两种都试。
-        string[] candidates =
-        {
-            ResourceDirectory + fileName,
-            ResourceDirectory.Replace('/', '\\') + fileName,
-            fileName, // 兜底：也有人直接把它丢在模组根目录
-        };
+        // 候选路径按优先级排列：
+        //   1. ABI 子目录（android-arm64/ 等）——OS + ProcessArchitecture 精确命中，
+        //      Android 上 Linux 桌面同名 .so 不会被误加载
+        //   2. 平铺 lib/Native/ —— 向后兼容旧模组，桌面三平台都靠这个
+        //   3. 模组根目录兜底
+        string[] candidates = BuildCandidates(fileName);
 
         foreach (string candidate in candidates)
         {
@@ -68,7 +68,55 @@ internal static class NativeLibraryStager
             return WriteToCache(mod, fileName, bytes);
         }
 
+        mod.Logger.Warn($"[trit] 未在 .tmod 内找到原生内核（尝试了 {candidates.Length} 条路径），本次会话使用托管回退内核");
         return null;
+    }
+
+    /// <summary>
+    /// 按当前 OS + ProcessArchitecture 拼装候选路径。
+    /// Android 上按架构命中 <c>android-arm64/</c> 或 <c>android-armeabi/</c> 子目录；
+    /// 桌面三平台直接命中平铺的 <c>lib/Native/</c>；同时带上另一分隔符版本。
+    /// </summary>
+    private static string[] BuildCandidates(string fileName)
+    {
+        bool isAndroid = OperatingSystem.IsAndroid();
+        Architecture arch = RuntimeInformation.ProcessArchitecture;
+        string? abiSubdir = null;
+
+        if (isAndroid)
+        {
+            abiSubdir = arch switch
+            {
+                Architecture.Arm64 => "android-arm64",
+                Architecture.Arm => "android-armeabi",
+                Architecture.X64 => "android-arm64", // 少数模拟器跑 arm64 转译
+                _ => null, // x86 Android (极罕见，不专门打包)
+            };
+        }
+
+        // 先 ABI 子目录（Android 优先命中）
+        if (abiSubdir is not null)
+        {
+            string subPath = ResourceDirectory + abiSubdir + "/" + fileName;
+            string subPathAlt = ResourceDirectory.Replace('/', '\\') + abiSubdir + "\\" + fileName;
+            return
+            [
+                subPath,
+                subPathAlt,
+                // 退化：如果模组没打 ABI 子目录（旧 .tmod），尝试平铺
+                ResourceDirectory + fileName,
+                ResourceDirectory.Replace('/', '\\') + fileName,
+                fileName,
+            ];
+        }
+
+        // 桌面 / 未知平台：平铺优先 + 兜底
+        return
+        [
+            ResourceDirectory + fileName,
+            ResourceDirectory.Replace('/', '\\') + fileName,
+            fileName,
+        ];
     }
 
     /// <summary>按平台取原生库文件名（与 <c>RuntimeHost</c> 的探测名一致）。</summary>

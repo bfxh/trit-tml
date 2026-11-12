@@ -66,22 +66,57 @@
 
   <!-- 原生内核随包分发：dllReferences 只认托管程序集，原生 DLL 只能当资源打包，
        运行时由 NativeLibraryStager 从包内取出落盘再加载。
-       放 lib\Native\ 子目录——AssemblyManager 只按 lib\<名字>.dll 精确加载，不会误当托管程序集。 -->
+       放 lib\Native\ 子目录——AssemblyManager 只按 lib\<名字>.dll 精确加载，不会误当托管程序集。
+
+       目录结构：
+         lib\Native\trit_rt.dll                     ← Windows 桌面（平铺）
+         lib\Native\libtrit_rt.dylib                ← macOS 桌面（平铺）
+         lib\Native\libtrit_rt.so                   ← Linux 桌面（平铺）
+         lib\Native\android-arm64\libtrit_rt.so      ← Android arm64-v8a
+         lib\Native\android-armeabi\libtrit_rt.so    ← Android armeabi-v7a
+
+       Stager 按 OS + ProcessArchitecture 优先命中 ABI 子目录，退化到平铺目录兼容旧模组。 -->
   <Target Name="TritStageNativeLibrary" BeforeTargets="BuildMod">
+    <!-- 桌面三平台（release profile）→ 平铺 lib\Native\ -->
     <ItemGroup>
-      <TritNativeLibrary Include="$(MSBuildThisFileDirectory)..\..\target\release\trit_rt.dll"
+      <TritNativeDesktop Include="$(MSBuildThisFileDirectory)..\..\target\release\trit_rt.dll"
                          Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\release\trit_rt.dll')" />
-      <TritNativeLibrary Include="$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.so"
+      <TritNativeDesktop Include="$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.so"
                          Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.so')" />
-      <TritNativeLibrary Include="$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.dylib"
+      <TritNativeDesktop Include="$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.dylib"
                          Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\release\libtrit_rt.dylib')" />
     </ItemGroup>
+
+    <!-- Android arm64-v8a（release-mobile profile, NDK 链接）→ lib\Native\android-arm64\ -->
+    <ItemGroup>
+      <TritNativeAndroidArm64 Include="$(MSBuildThisFileDirectory)..\..\target\aarch64-linux-android\release-mobile\libtrit_rt.so"
+                              Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\aarch64-linux-android\release-mobile\libtrit_rt.so')" />
+    </ItemGroup>
+
+    <!-- Android armeabi-v7a（release-mobile profile）→ lib\Native\android-armeabi\ -->
+    <ItemGroup>
+      <TritNativeAndroidArmeabi Include="$(MSBuildThisFileDirectory)..\..\target\armv7-linux-androideabi\release-mobile\libtrit_rt.so"
+                                 Condition="Exists('$(MSBuildThisFileDirectory)..\..\target\armv7-linux-androideabi\release-mobile\libtrit_rt.so')" />
+    </ItemGroup>
+
     <MakeDir Directories="$(MSBuildProjectDirectory)\lib\Native" />
-    <Copy SourceFiles="@(TritNativeLibrary)"
+    <MakeDir Directories="$(MSBuildProjectDirectory)\lib\Native\android-arm64"
+             Condition="'@(TritNativeAndroidArm64)' != ''" />
+    <MakeDir Directories="$(MSBuildProjectDirectory)\lib\Native\android-armeabi"
+             Condition="'@(TritNativeAndroidArmeabi)' != ''" />
+
+    <Copy SourceFiles="@(TritNativeDesktop)"
           DestinationFolder="$(MSBuildProjectDirectory)\lib\Native"
           SkipUnchangedFiles="true" />
-    <Warning Condition="'@(TritNativeLibrary)' == ''"
-             Text="未找到原生内核（target\release\trit_rt*.dll|so|dylib）。打包出的模组将只跑托管回退内核：先 cargo build --release -p trit-rt。" />
+    <Copy SourceFiles="@(TritNativeAndroidArm64)"
+          DestinationFolder="$(MSBuildProjectDirectory)\lib\Native\android-arm64"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(TritNativeAndroidArmeabi)"
+          DestinationFolder="$(MSBuildProjectDirectory)\lib\Native\android-armeabi"
+          SkipUnchangedFiles="true" />
+
+    <Warning Condition="'@(TritNativeDesktop)' == '' and '@(TritNativeAndroidArm64)' == '' and '@(TritNativeAndroidArmeabi)' == ''"
+             Text="未找到任何原生内核（target\release\ 或 target\&lt;android-target&gt;\release-mobile\）。打包出的模组将只跑托管回退内核：先 cargo build --release -p trit-rt（桌面）或走 android-native CI job（Android）。" />
   </Target>
 
 </Project>
