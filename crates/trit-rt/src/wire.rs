@@ -249,6 +249,34 @@ impl Writer {
         self
     }
 
+    /// 从迭代器打包 trits，零中间 `Vec<Ternary>` 分配。
+    /// `count` 必须等于迭代器产生的 trit 数。
+    pub fn trits_iter<I>(&mut self, count: usize, values: I) -> &mut Self
+    where
+        I: IntoIterator<Item = Ternary>,
+    {
+        self.u32(count as u32);
+        // 每 5 trits 打 1 byte（3^5 = 243 种组合 < 256）。
+        let mut byte = 0u8;
+        let mut power = 1u8;
+        let mut in_byte = 0usize;
+        for v in values {
+            byte += (v.index() as u8) * power;
+            power = power.saturating_mul(3);
+            in_byte += 1;
+            if in_byte == TRITS_PER_BYTE {
+                self.buf.push(byte);
+                byte = 0;
+                power = 1;
+                in_byte = 0;
+            }
+        }
+        if in_byte > 0 {
+            self.buf.push(byte);
+        }
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.buf.len()
     }

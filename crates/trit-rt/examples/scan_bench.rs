@@ -70,7 +70,7 @@ fn main() {
     let t0 = Instant::now();
     let job = ScanJob::new(
         1,
-        &request,
+        request,
         ScanKind::Pattern,
         4096,
         Arc::new(AtomicBool::new(false)),

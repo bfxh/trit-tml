@@ -32,7 +32,8 @@ public sealed record Divergence(
 public sealed class ShadowDiffer : IDisposable
 {
     /// <summary>保留的最近不一致条数上限。</summary>
-    public const int RecentWindow = 64;
+    /// <remarks>影子差分是调试用的，16 条足够保留上下文，省内存。</remarks>
+    public const int RecentWindow = 16;
 
     private readonly ITritKernel primary;
     private readonly ITritKernel shadow;

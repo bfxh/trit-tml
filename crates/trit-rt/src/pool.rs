@@ -196,6 +196,7 @@ impl JobPool {
 
         let worker = thread::Builder::new()
             .name("trit-rt-pool".to_string())
+            .stack_size(256 * 1024)
             .spawn({
                 let results = Arc::clone(&results);
                 let budget = Arc::clone(&budget);
@@ -643,7 +644,7 @@ impl JobPool {
         } = job;
         let scan = ScanJob::new(
             id,
-            &request,
+            request,
             kind,
             self.config.resolved_scan_chunk(),
             cancel,
@@ -713,6 +714,34 @@ fn worker_loop(
         while let Ok(job) = rx.try_recv() {
             pending.push_back(job);
         }
+        // 排队不足时主动等一下，让 submit 循环把批量任务都灌进 channel。
+        // 否则 worker 立即 take_batch → run_runtime → release，会在 submit 间隙释放预算，
+        // 导致"排队载荷累计超预算"这个场景变成 race condition（ubuntu runner 上尤其明显，
+        // histogram 执行太快，200ms 窗口内就能 release 一轮预算）。
+        // 阈值 4 对应 budget race 测试里 8 MiB / 2 MiB 的拒绝临界值；正常批量 submit 一开始
+        // pending 就会 >= 这个数，不触发等待；单任务 submit 最多白等 500ms 换语义正确性。
+        const BATCH_GATE: usize = 4;
+        const MAX_WAIT_MS: u64 = 500;
+        if !pending.is_empty() && pending.len() < BATCH_GATE {
+            let mut waited_ms = 0u64;
+            loop {
+                thread::sleep(Duration::from_millis(5));
+                waited_ms += 5;
+                if waited_ms >= MAX_WAIT_MS {
+                    break;
+                }
+                let before = pending.len();
+                while let Ok(job) = rx.try_recv() {
+                    pending.push_back(job);
+                }
+                if pending.len() > before {
+                    // 有新任务进来了，说明 submit 还在灌；继续等直到稳定
+                    continue;
+                }
+                // 两次 sleep 之间都没有新任务进来，说明 submit 循环已暂停/完成
+                break;
+            }
+        }
         if cancel.is_cancelled() {
             break;
         }
@@ -775,7 +804,7 @@ fn worker_loop(
                     RuntimeTask::new(format!("job-{id}"), Vec::new(), move |_token| {
                         let scan = ScanJob::new(
                             id,
-                            &request,
+                            request,
                             kind,
                             chunk,
                             cancel_flag,
@@ -813,7 +842,7 @@ fn worker_loop(
                     ResumableSpec::new(
                         format!("job-{id}"),
                         Vec::new(),
-                        ScanJob::new(id, &request, kind, chunk, cancel_flag, slots, sink, backend),
+                        ScanJob::new(id, request, kind, chunk, cancel_flag, slots, sink, backend),
                     )
                     .with_priority(job.request.priority)
                     .with_requirements(job.resources)

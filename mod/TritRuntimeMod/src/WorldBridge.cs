@@ -1,6 +1,7 @@
 #nullable enable
 
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
 using Terraria;
@@ -200,21 +201,15 @@ internal sealed class WorldBridge
 
             // SnapshotBytes 的前 8 字节是快照 ID 前缀，之后才是 WorldCodec 载荷。
             // 老格式万一没有前缀，去掉前缀会解出垃圾——那就退回整体解码。
-            SortedDictionary<uint, TritDelta> world;
-            try
+            byte[]? trits = TryDecodeWorldTrits(raw.AsSpan(SnapshotIdPrefix));
+            if (trits is null)
             {
-                world = WorldCodec.Decode(raw.AsSpan(SnapshotIdPrefix)).World;
-            }
-            catch (WireException)
-            {
-                world = WorldCodec.Decode(raw).World;
+                trits = TryDecodeWorldTrits(raw);
             }
 
-            var trits = new byte[world.Count];
-            int index = 0;
-            foreach (TritDelta value in world.Values)
+            if (trits is null)
             {
-                trits[index++] = (byte)value;
+                return Array.Empty<byte>();
             }
 
             LastCaptureTritCount = trits.Length;
@@ -230,6 +225,70 @@ internal sealed class WorldBridge
 
             return Array.Empty<byte>();
         }
+    }
+
+    /// <summary>
+    /// 从 WorldCodec 编码的世界投影字节里直接解码 trit 值序列，跳过 keys 与 SortedDictionary。
+    /// </summarytool_call>
+    /// <returns>成功返回 trit 值数组（每个元素 0/1/2）；格式不符返回 null。</returns>
+    /// <remarks>
+    /// WorldCodec 布局：<c>[u8 version][u64 tick][u64 log_seq][u32 lane_count][u32 key * lane_count][u32 trit_count][packed trits]</c>。
+    /// CaptureWorldTrits 只需要最后的 packed trits，keys 完全是中间噪音。
+    /// </remarks>
+    private static byte[]? TryDecodeWorldTrits(ReadOnlySpan<byte> payload)
+    {
+        const int HeaderFixed = 1 + 8 + 8 + 4; // version + tick + log_seq + lane_count
+
+        if (payload.Length < HeaderFixed || payload[0] != WorldCodec.Version)
+        {
+            return null;
+        }
+
+        int laneCount = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(17)));
+        if (laneCount < 0 || payload.Length < HeaderFixed + laneCount * 4 + 4)
+        {
+            return null;
+        }
+
+        int tritCountOffset = HeaderFixed + laneCount * 4;
+        int tritCount = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(tritCountOffset)));
+        if (tritCount < 0)
+        {
+            return null;
+        }
+
+        int packedOffset = tritCountOffset + 4;
+        int packedLen = (tritCount + Wire.TritsPerByte - 1) / Wire.TritsPerByte;
+        if (payload.Length < packedOffset + packedLen)
+        {
+            return null;
+        }
+
+        // 直接从 packed bytes 解码成 byte[]，跳过中间 TritDelta[] 分配。
+        var trits = new byte[tritCount];
+        var packed = payload.Slice(packedOffset, packedLen);
+        for (int byteIndex = 0; byteIndex < packedLen; byteIndex++)
+        {
+            if (packed[byteIndex] >= Wire.Combinations)
+            {
+                return null;
+            }
+
+            byte rest = packed[byteIndex];
+            for (int slot = 0; slot < Wire.TritsPerByte; slot++)
+            {
+                int position = byteIndex * Wire.TritsPerByte + slot;
+                if (position >= tritCount)
+                {
+                    break;
+                }
+
+                trits[position] = (byte)(rest % 3);
+                rest = (byte)(rest / 3);
+            }
+        }
+
+        return trits;
     }
 
     /// <summary>最近一次 <see cref="CaptureWorldTrits"/> 拿到的 trit 数（0 = 还没采集过）。</summary>
