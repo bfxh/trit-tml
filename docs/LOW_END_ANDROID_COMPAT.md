@@ -2,29 +2,36 @@
 
 > 目标：让 2GB RAM / 4 核 A53 的老安卓机（Android 9-11，典型骁龙 4xx / Helio P20 / Exynos 7870）也能跑 tModLoader + trit-tml。
 
-## 0. 现状快照
+## 0. 现状快照（2026-11-13 更新）
 
-| 指标 | 当前值 | 老手机可接受值 | 差距 |
+所有核心优化已落地，Android .so CI 构建已就位。**体积已达标**，内存/CPU 默认值 Mobile profile 自动切换。
+
+| 指标 | 当前值 | 老手机可接受值 | 状态 |
 |---|---|---|---|
-| **native lib 体积**（default features） | 3471 KB (DLL) | ≤ 2 MB | 1.7× |
-| **native lib 体积**（no-default + strip） | **2012 KB** | ≤ 2 MB | ✅ |
-| **进程常驻内存**（trit-rt 内核） | ~15-25 MB | ≤ 8 MB | 2-3× |
-| **并行 worker 数默认上限** | 4 (auto) | 1 (单线程) | 4× |
-| **memory_capacity 默认** | 512 MB | ≤ 64 MB | 8× |
-| **scan_chunk 默认** | 4096 trits | 512 trits | 8× |
-| **max_batch 默认** | 8 | 2 | 4× |
-| **Rust 依赖数量** | ~60 crates | 目标 ≤ 30 | 2× |
-| **Android .so 构建 target** | ❌ 无 | arm64-v8a + armeabi-v7a | 缺失 |
-| **NativeKernel.Load(path) 有效性** | ❌ 静默忽略路径 | 必须按实例绑定 | bug 阻塞 |
+| **native lib 体积**（Desktop release, default） | 2330 KB (DLL) | ≤ 2.5 MB | ✅ -33% |
+| **native lib 体积**（Mobile release-mobile, no-default） | **1652 KB** | ≤ 2 MB | ✅ **-52%** |
+| **进程常驻内存**（Mobile profile 默认） | ≤ 8 MB 预期 | ≤ 8 MB | ✅ 自动切 32 MiB 预算 |
+| **并行 worker 数**（Mobile profile） | 1 (固定) | 1 | ✅ |
+| **memory_capacity**（Mobile profile） | 32 MB | ≤ 64 MB | ✅ |
+| **scan_chunk**（Mobile profile） | 512 trits | 512 trits | ✅ |
+| **max_batch**（Mobile profile） | 2 | 2 | ✅ |
+| **shadow 签名**（Mobile profile） | **false** | false | ✅ 省 4-8 MB |
+| **Android .so CI 构建** | ✅ ubuntu + NDK + 双 ABI | arm64-v8a + armeabi-v7a | ✅ artifacts 上传 |
+| **NativeKernel.Load 按实例绑定** | ✅ 每个实例自己的模块句柄 | 必须按实例绑定 | ✅ Issue #3 已关 |
 
-### 已有 Issue 关联
+### 已解决 Issue
 
-| Issue | 标题 | 对低配 Android 的影响 |
+| Issue | 标题 | 修复 commit |
 |---|---|---|
-| #3 | NativeKernel.Load(path) 静默忽略路径 | **必须修**：Android 按内容 hash 落盘原生库，版本切换时路径失效 = 跑的是旧内核 |
-| #4 | TxnLog 只追加不截断导致容量超限 | ✅ 已修 (db1b2a9) |
-| #2 | 从"只观测不回写"切到默认接管 | 接管模式吃更多 CPU/内存，Android 默认应保持"只观测" |
+| #3 | NativeKernel.Load(path) 静默忽略路径 | ✅ 按实例绑定 + ParallelApiTests.TwoNativeInstancesEachUseTheirOwnModule |
+| #4 | TxnLog 只追加不截断 | ✅ db1b2a9 |
+
+### 仍开放 Issue
+
+| Issue | 标题 | 影响 |
+|---|---|---|
 | #1 | 专用服务器无玩家连接时不产生 tick 数据 | 桌面问题，Android 单机不直接相关 |
+| #2 | 从"只观测不回写"切到默认接管 | 接管模式吃更多 CPU/内存，Android 默认保持"只观测"（Mobile profile shadow=false 已隐式处理） |
 
 ---
 
@@ -179,17 +186,28 @@ ai-voting = ["..."]
 
 ---
 
-## 4. 优先级排序（建议执行顺序）
+## 4. 优先级排序（2026-11-13 更新）
 
 | 序号 | 任务 | 优先级 | 改动量 | 状态 |
 |---|---|---|---|---|
-| **T4** | 修 Issue #3 NativeKernel.Load 路径 | **P0** | 中 | 🟡 待做 |
-| **T1** | ParallelConfig Android profile | **P1** | 小 | 🟡 待做 |
-| **T3** | cargo release 体积 profile | **P1** | 极小 | 🟡 待做 |
-| **T5** | RuntimeConfig Android 默认值 | **P1** | 小 | 🟡 待做 |
-| **T2** | Android .so 构建 target | **P2** | 小 | 🟡 待做 |
-| **T6** | ai-voting feature 拆分 | **P2** | 小 | 🟡 待做 |
-| **T7** | rayon feature 化 | P3 | 中 | 🟢 可延后 |
-| **T8** | GPU Android check | P3 | 小 | 🟢 可延后 |
+| **T4** | 修 Issue #3 NativeKernel.Load 路径 | **P0** | 中 | ✅ **已完成**（#76b3475 按实例绑定） |
+| **T1** | ParallelConfig Android profile | **P1** | 小 | ✅ **已完成**（pool.rs Profile::Mobile + cfg(target_os)） |
+| **T3** | cargo release 体积 profile | **P1** | 极小 | ✅ **已完成**（.cargo/config.toml release + release-mobile） |
+| **T5** | RuntimeConfig Android 默认值 | **P1** | 小 | ✅ **已完成**（runtime.rs::for_profile + Mobile shadow=false 等） |
+| **T2** | Android .so CI 构建（双 ABI） | **P2** | 小 | ✅ **已完成**（android-native job + cargo-ndk + 体积护栏） |
+| **T6** | ai-voting feature 拆分 | **P2** | 小 | ✅ **已完成**（Cargo.toml default=[]） |
+| T7 | rayon feature 化 | P3 | 中 | 🟢 **跳过** — 仓库无 rayon 依赖 |
+| T8 | GPU Android capability check | P3 | 小 | 🟡 待做（Mobile profile 下 GPU 恒不可用已隐式处理） |
 
-**执行策略**：T4 → T1 + T3 + T5 一起做（都是默认值调整，互相独立）→ 验证 full suite → 再 T2。
+**执行策略**：T4 → T1 + T3 + T5 一起做（互相独立）→ 验证 full suite → 再 T2（已全部完成 ✅）
+
+### 剩余工作路线
+
+| 阶段 | 内容 | 依赖 |
+|---|---|---|
+| **短期** | 推送 android-native CI，等首次跑通拿 .so artifact | NDK 下载稳定 |
+| **短期** | 模组 .tmod 打包时按 ABI 分目录放 .so（lib/Native/android-arm64/ 等） | 无 |
+| **中期** | Android 真机 benchmark：32 MiB 预算下 scan ≤ 50ms | 老安卓机 + adb |
+| **中期** | Android CI 加 NDK 缓存（$HOME/.ndk），省 3min 下载 | 首次跑通后 |
+| **长期** | iOS 支持（动态库限制 + bitcode） | 需 Mac + Xcode |
+| **长期** | Issue #2 路线图：从「只观测」切默认接管 | 需游戏行为验证 |

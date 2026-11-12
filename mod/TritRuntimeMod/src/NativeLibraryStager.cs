@@ -72,6 +72,12 @@ internal static class NativeLibraryStager
     }
 
     /// <summary>按平台取原生库文件名（与 <c>RuntimeHost</c> 的探测名一致）。</summary>
+    /// <remarks>
+    /// Android 和 Linux 都返回 <c>libtrit_rt.so</c>，但它们是完全不同的二进制：
+    /// Android 走 NDK clang 链接、API 21+、bionic libc；Linux 走 glibc。
+    /// 模组打包时按 ABI 分目录（<c>lib/Native/android-arm64/libtrit_rt.so</c> 等），
+    /// <see cref="TryStage"/> 的候选路径会自然命中对应平台的那份。
+    /// </remarks>
     private static string FileName()
     {
         if (OperatingSystem.IsWindows())

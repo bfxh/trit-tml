@@ -319,6 +319,107 @@ jobs:
           if-no-files-found: error
 
   # ────────────────────────────────────────────────────────────────────────
+  # 6b) Android 原生库：交叉编译 arm64-v8a + armeabi-v7a 两个 ABI。
+  #     用 cargo-ndk 自动下载 NDK、按 target 注入 CC/CXX——避免手动配
+  #     NDK_HOME + 交叉链接器。profile 用 release-mobile（fat LTO + strip
+  #     + opt-level=z + codegen-units=1），--no-default-features 关掉
+  #     ai-voting（trit-net 贡献 ~500 KB 体积，Android 低配机关掉）。
+  #     预期每个 ABI 产物体积 ~1500 KB；超过 3 MB 自动失败护栏。
+  #
+  #     continue-on-error: true —— 首次 CI 跑 NDK 下载慢 ~3min、偶发抖动，
+  #     不堵 CI 主门禁（lint/rust-test/native 都绿就行），但制品照常上传
+  #     便于调试。Android 构建本身不影响桌面 parity 测试，所以不进 ci-ok。
+  # ────────────────────────────────────────────────────────────────────────
+  android-native:
+    name: android native (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+            artifact: trit-rt-android-arm64
+          - target: armv7-linux-androideabi
+            abi: armeabi-v7a
+            artifact: trit-rt-android-armeabi
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链 + Android targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ matrix.target }}
+
+      # taiki-e/install-action 直接拉预编译二进制 (~5s)，比 cargo install
+      # cargo-ndk 省 ~2min 编译时间；coverage job 同一路径。
+      - uses: taiki-e/install-action@cargo-ndk
+
+      - name: build ${{ matrix.abi }}
+        run: |
+          # cargo ndk -t 自动映射 --target，同时按 target 设置 CC_/CXX_ 环境
+          cargo ndk \
+            -t ${{ matrix.target }} \
+            -- \
+            build -p trit-rt \
+            --profile release-mobile \
+            --no-default-features
+
+      - name: llvm-strip + 输出体积
+        shell: bash
+        run: |
+          so="target/${{ matrix.target }}/release-mobile/libtrit_rt.so"
+          test -f "$so" || { echo "❌ 产物缺失：$so"; exit 1; }
+          before=$(stat -c %s "$so")
+          echo "strip 前：$before bytes ($(( before / 1024 )) KB)"
+          # cargo-ndk 默认把 NDK 下载到 $HOME/.ndk，llvm-strip 路径固定
+          strip_bin="$HOME/.ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          if [ -x "$strip_bin" ]; then
+            echo "使用 NDK llvm-strip：$strip_bin"
+            "$strip_bin" --strip-all "$so"
+          else
+            # 兜底：NDK 路径不存在时 find，再找不到就用系统 binutils strip
+            strip_bin=$(find "$HOME/.ndk" -name llvm-strip -type f 2>/dev/null | head -1)
+            if [ -n "$strip_bin" ]; then
+              echo "find 到 NDK llvm-strip：$strip_bin"
+              "$strip_bin" --strip-all "$so"
+            else
+              echo "⚠️ NDK llvm-strip 未找到，回退到系统 strip"
+              strip --strip-all "$so"
+            fi
+          fi
+          after=$(stat -c %s "$so")
+          echo "strip 后：$after bytes ($(( after / 1024 )) KB)"
+
+      - name: 体积护栏（超过 3 MB 即失败）
+        shell: bash
+        run: |
+          so="target/${{ matrix.target }}/release-mobile/libtrit_rt.so"
+          size=$(stat -c %s "$so")
+          limit=$((3 * 1024 * 1024))  # 3 MiB
+          echo "当前体积：$size bytes ($(( size / 1024 )) KB)，上限：3072 KB"
+          if [ "$size" -gt "$limit" ]; then
+            echo "❌ 产物膨胀！期望 ~1500 KB，实际 $(( size / 1024 )) KB"
+            echo "可能原因：默认 feature 未关（--no-default-features 丢了）、panic=abort、LTO 未生效"
+            exit 1
+          fi
+          echo "✅ 体积正常（$(( size / 1024 )) KB）"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release-mobile/libtrit_rt.so
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────────
   # 7) dotnet parity：三平台各自编译原生库，再跑「原生 vs 托管逐字节对拍」。
   #    不 needs native、也不下载它的制品：下载产物在 Linux 上没有可执行位、
   #    macOS 上带 quarantine 属性，dlopen 会失败；本格自己编译最可靠，
