@@ -1029,7 +1029,8 @@ impl ResumableTask for ScanJob {
                 let len = self.trits.len().min(self.pattern_trits.len());
                 let end = (self.cursor + self.chunk).min(len);
                 for index in self.cursor..end {
-                    self.dot += i64::from(to_value(self.trits[index])) * i64::from(to_value(self.pattern_trits[index]));
+                    self.dot += i64::from(to_value(self.trits[index]))
+                        * i64::from(to_value(self.pattern_trits[index]));
                 }
                 self.cursor = end;
                 if self.cursor >= len {
