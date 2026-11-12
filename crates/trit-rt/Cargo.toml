@@ -31,9 +31,15 @@ serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 thiserror.workspace = true
 
 [features]
-default = ["ai-voting"]
+# 默认空：Android / 体积敏感场景直接 `--no-default-features`。
+# 桌面构建想保留 AI 投票能力显式加 `--features ai-voting`（不影响 CI 的默认 `cargo test`）。
+default = []
+
 # 三值权重网络（{-1,0,+1}）做 AI 决策投票：确定/弃权两态输出。
+# Android / 低配机建议关掉：trit-net 贡献 ~500 KB 产物体积 + 运行时推理分配；
+# 关掉时 op::AI_VOTE / op::AI_SET_MODEL opcode 返回 BadOp（托管回退内核走三步仲裁）。
 ai-voting = ["dep:trit-net"]
+
 # GPU 后端：拉起 wgpu，编译变慢、产物变大，所以默认不开；发布构建同样不带——
 # 真机实测 n=1 窗口扫描 GPU 比 CPU 位并行慢 58 倍（见 src/gpu.rs），带 wgpu 只是白涨体积。
 # 关掉时 CPU 位并行镜像照常工作，GPU 状态恒为"不可用"并给出原因——玩家侧无感回退。
