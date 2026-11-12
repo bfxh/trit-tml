@@ -196,6 +196,7 @@ impl JobPool {
 
         let worker = thread::Builder::new()
             .name("trit-rt-pool".to_string())
+            .stack_size(256 * 1024)
             .spawn({
                 let results = Arc::clone(&results);
                 let budget = Arc::clone(&budget);
@@ -643,7 +644,7 @@ impl JobPool {
         } = job;
         let scan = ScanJob::new(
             id,
-            &request,
+            request,
             kind,
             self.config.resolved_scan_chunk(),
             cancel,
@@ -713,6 +714,29 @@ fn worker_loop(
         while let Ok(job) = rx.try_recv() {
             pending.push_back(job);
         }
+        // 只有 1 个时等一下，让 submit 循环来得及把更多任务放进 channel。
+        // 否则 worker 立即 take_batch → run_runtime → release，会在 submit 间隙释放预算，
+        // 导致"排队载荷累计超预算"这个场景变成 race condition。
+        if pending.len() == 1 {
+            let mut waited_ms = 0;
+            loop {
+                thread::sleep(Duration::from_millis(5));
+                waited_ms += 5;
+                if waited_ms >= 200 {
+                    break; // 防止永久等待
+                }
+                let before = pending.len();
+                while let Ok(job) = rx.try_recv() {
+                    pending.push_back(job);
+                }
+                if pending.len() > before {
+                    // 有新任务进来了，继续等直到稳定
+                    continue;
+                }
+                // 没有新任务，说明 submit 循环已经完成或暂停
+                break;
+            }
+        }
         if cancel.is_cancelled() {
             break;
         }
@@ -775,7 +799,7 @@ fn worker_loop(
                     RuntimeTask::new(format!("job-{id}"), Vec::new(), move |_token| {
                         let scan = ScanJob::new(
                             id,
-                            &request,
+                            request,
                             kind,
                             chunk,
                             cancel_flag,
@@ -813,7 +837,7 @@ fn worker_loop(
                     ResumableSpec::new(
                         format!("job-{id}"),
                         Vec::new(),
-                        ScanJob::new(id, &request, kind, chunk, cancel_flag, slots, sink, backend),
+                        ScanJob::new(id, request, kind, chunk, cancel_flag, slots, sink, backend),
                     )
                     .with_priority(job.request.priority)
                     .with_requirements(job.resources)

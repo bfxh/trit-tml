@@ -64,10 +64,9 @@ pub fn encode_world(world: &BTreeMap<u32, Ternary>, tick: u64, log_seq: u64) -> 
     for key in world.keys() {
         writer.u32(*key);
     }
-    // 直接按「键序」把值打包：键与值一一对应，不需要再经 TriVec 往返
-    // （那会多出两份等长的中间 Vec）。
-    let values: Vec<Ternary> = world.values().copied().collect();
-    writer.trits(&values);
+    // 直接从 world.values() 迭代器打包，省掉中间 Vec<Ternary> 分配。
+    let count = world.len();
+    writer.trits_iter(count, world.values().copied());
     writer.into_vec()
 }
 

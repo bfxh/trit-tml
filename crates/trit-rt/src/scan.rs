@@ -586,8 +586,10 @@ pub struct ScanJob {
     id: u64,
     owner: String,
     kind: ScanKind,
-    values: Vec<i32>,
-    pattern: Vec<i32>,
+    /// 原始 trit 字节（0/1/2），从 request 直接 move，零拷贝。
+    trits: Vec<u8>,
+    /// 原始 pattern 字节（0/1/2），从 request 直接 move，零拷贝。
+    pattern_trits: Vec<u8>,
     pattern_packed: Option<(Vec<u32>, Vec<u32>)>,
     packed: Option<(Vec<u32>, Vec<u32>)>,
     threshold: i64,
@@ -618,7 +620,7 @@ impl ScanJob {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
-        request: &ScanRequest,
+        request: ScanRequest,
         kind: ScanKind,
         default_chunk: usize,
         cancel: Arc<AtomicBool>,
@@ -635,10 +637,12 @@ impl ScanJob {
                 .unwrap_or(MAX_SCAN_CHUNK as usize)
                 .clamp(1, MAX_SCAN_CHUNK as usize)
         };
-        let values: Vec<i32> = request.trits.iter().copied().map(to_value).collect();
-        let pattern: Vec<i32> = request.pattern.iter().copied().map(to_value).collect();
+        // 直接 move 原始字节，零拷贝；需要 i32 时在调用点临时转换。
+        let trits = request.trits;
+        let pattern_trits = request.pattern;
         // 满分 = 图案里非零位置的个数：逐元素全等就是这个分数。
-        let full_score = pattern.iter().filter(|value| **value != 0).count() as i64;
+        // u8 里 1 = Zero，非零是 0 和 2。
+        let full_score = pattern_trits.iter().filter(|b| **b != 1).count() as i64;
         let threshold = if request.threshold <= 0 {
             full_score
         } else {
@@ -648,8 +652,8 @@ impl ScanJob {
             id,
             owner: request.owner.clone(),
             kind,
-            values,
-            pattern,
+            trits,
+            pattern_trits,
             pattern_packed: None,
             packed: None,
             threshold,
@@ -682,7 +686,7 @@ impl ScanJob {
             cancel: trit_schedule::CancelToken::new(),
         };
         // 不分步：chunk 直接取全长，一步必完。
-        self.chunk = self.values.len().max(1);
+        self.chunk = self.trits.len().max(1);
         loop {
             if self.cancel.load(Ordering::Relaxed) {
                 let _ = self.finish(JobState::Cancelled, String::new());
@@ -763,7 +767,7 @@ impl ScanJob {
             }),
             ScanKind::Dot => raw_of(&DotResult {
                 dot: self.dot,
-                length: self.values.len().min(self.pattern.len()),
+                length: self.trits.len().min(self.pattern_trits.len()),
             }),
             ScanKind::Density => {
                 let mut ranked: Vec<(usize, u64, f64)> = self
@@ -772,7 +776,7 @@ impl ScanJob {
                     .map(|(block, nonzero)| {
                         let total = self
                             .chunk
-                            .min(self.values.len().saturating_sub(block * self.chunk));
+                            .min(self.trits.len().saturating_sub(block * self.chunk));
                         let density = if total == 0 {
                             0.0
                         } else {
@@ -824,10 +828,10 @@ impl ScanJob {
 
     /// 窗口总数（用于 `scanned`）。
     fn scanned_windows(&self) -> usize {
-        if self.pattern.is_empty() || self.values.len() < self.pattern.len() {
+        if self.pattern_trits.is_empty() || self.trits.len() < self.pattern_trits.len() {
             return 0;
         }
-        self.values.len() - self.pattern.len() + 1
+        self.trits.len() - self.pattern_trits.len() + 1
     }
 
     /// 走一遍 GPU（pattern 专用）；成功返回 true。
@@ -837,13 +841,13 @@ impl ScanJob {
         if total == 0 {
             return false;
         }
-        let words = self.pattern.len().div_ceil(TRITS_PER_WORD);
+        let words = self.pattern_trits.len().div_ceil(TRITS_PER_WORD);
         // 闸门量的是实际申请量（见 `gpu_pattern_block`）；下面申请容量时也必须按
         // 返回的 `block` 来要，不能按 `WINDOW_BLOCK` 满额要。
         let Some(block) = gpu_pattern_block(total, words) else {
             return false;
         };
-        let trits = total.saturating_mul(self.pattern.len());
+        let trits = total.saturating_mul(self.pattern_trits.len());
         {
             let backend = self
                 .gpu
@@ -855,11 +859,14 @@ impl ScanJob {
         }
 
         if self.packed.is_none() {
-            let (pos, neg) = trit_gpu::pack_dual_rail(&self.values);
+            // pack_dual_rail 需要 &[i32]，临时从 u8 字节转换。
+            let values_i32: Vec<i32> = self.trits.iter().copied().map(to_value).collect();
+            let (pos, neg) = trit_gpu::pack_dual_rail(&values_i32);
             self.packed = Some((pos, neg));
         }
         if self.pattern_packed.is_none() {
-            let (pos, neg) = trit_gpu::pack_dual_rail(&self.pattern);
+            let pattern_i32: Vec<i32> = self.pattern_trits.iter().copied().map(to_value).collect();
+            let (pos, neg) = trit_gpu::pack_dual_rail(&pattern_i32);
             self.pattern_packed = Some((pos, neg));
         }
         // 图案很小（也就几个字），直接复制一份交给 GPU 侧；值缓冲有几百 KB 到几 MB，
@@ -895,7 +902,7 @@ impl ScanJob {
                     packed_pos,
                     packed_neg,
                     index,
-                    self.pattern.len(),
+                    self.pattern_trits.len(),
                     &mut self.scratch_pos,
                     &mut self.scratch_neg,
                 );
@@ -949,13 +956,16 @@ impl ScanJob {
             self.cursor = total;
             return;
         }
-        let words = self.pattern.len().div_ceil(TRITS_PER_WORD);
+        let words = self.pattern_trits.len().div_ceil(TRITS_PER_WORD);
         if self.packed.is_none() {
-            let (pos, neg) = trit_gpu::pack_dual_rail(&self.values);
+            // pack_dual_rail 需要 &[i32]，临时从 u8 字节转换。
+            let values_i32: Vec<i32> = self.trits.iter().copied().map(to_value).collect();
+            let (pos, neg) = trit_gpu::pack_dual_rail(&values_i32);
             self.packed = Some((pos, neg));
         }
         if self.pattern_packed.is_none() {
-            let (pos, neg) = trit_gpu::pack_dual_rail(&self.pattern);
+            let pattern_i32: Vec<i32> = self.pattern_trits.iter().copied().map(to_value).collect();
+            let (pos, neg) = trit_gpu::pack_dual_rail(&pattern_i32);
             self.pattern_packed = Some((pos, neg));
         }
         self.scratch_pos.resize(words, 0);
@@ -974,7 +984,7 @@ impl ScanJob {
                     packed_pos,
                     packed_neg,
                     window,
-                    self.pattern.len(),
+                    self.pattern_trits.len(),
                     &mut self.scratch_pos,
                     &mut self.scratch_neg,
                 );
@@ -1002,24 +1012,24 @@ impl ResumableTask for ScanJob {
 
         match self.kind {
             ScanKind::Histogram => {
-                let end = (self.cursor + self.chunk).min(self.values.len());
-                for value in &self.values[self.cursor..end] {
-                    match *value {
-                        -1 => self.hist[0] += 1,
-                        0 => self.hist[1] += 1,
+                let end = (self.cursor + self.chunk).min(self.trits.len());
+                for byte in &self.trits[self.cursor..end] {
+                    match *byte {
+                        0 => self.hist[0] += 1,
+                        1 => self.hist[1] += 1,
                         _ => self.hist[2] += 1,
                     }
                 }
                 self.cursor = end;
-                if self.cursor >= self.values.len() {
+                if self.cursor >= self.trits.len() {
                     return self.finish(JobState::Done, String::new());
                 }
             }
             ScanKind::Dot => {
-                let len = self.values.len().min(self.pattern.len());
+                let len = self.trits.len().min(self.pattern_trits.len());
                 let end = (self.cursor + self.chunk).min(len);
                 for index in self.cursor..end {
-                    self.dot += i64::from(self.values[index]) * i64::from(self.pattern[index]);
+                    self.dot += i64::from(to_value(self.trits[index])) * i64::from(to_value(self.pattern_trits[index]));
                 }
                 self.cursor = end;
                 if self.cursor >= len {
@@ -1027,18 +1037,18 @@ impl ResumableTask for ScanJob {
                 }
             }
             ScanKind::Density => {
-                if self.cursor >= self.values.len() {
+                if self.cursor >= self.trits.len() {
                     return self.finish(JobState::Done, String::new());
                 }
-                let end = (self.cursor + self.chunk).min(self.values.len());
-                let nonzero = self.values[self.cursor..end]
+                let end = (self.cursor + self.chunk).min(self.trits.len());
+                let nonzero = self.trits[self.cursor..end]
                     .iter()
-                    .filter(|value| **value != 0)
+                    .filter(|byte| **byte != 1)
                     .count() as u64;
                 let block = self.blocks.len();
                 self.blocks.push((block, nonzero));
                 self.cursor = end;
-                if self.cursor >= self.values.len() {
+                if self.cursor >= self.trits.len() {
                     return self.finish(JobState::Done, String::new());
                 }
             }
@@ -1112,7 +1122,7 @@ mod tests {
         let kind = req.validate().expect("请求合法");
         let job = ScanJob::new(
             1,
-            &req,
+            req,
             kind,
             4096,
             cancel,
@@ -1475,7 +1485,7 @@ mod tests {
         let kind = req.validate().expect("合法");
         let job = ScanJob::new(
             7,
-            &req,
+            req,
             kind,
             4096,
             cancel,

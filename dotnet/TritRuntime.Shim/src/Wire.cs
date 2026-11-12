@@ -347,7 +347,7 @@ public static class Wire
         return framed.Slice(4, (int)length).ToArray();
     }
 
-    private static int Pow3(int exponent)
+    internal static int Pow3(int exponent)
     {
         var result = 1;
         for (var i = 0; i < exponent; i++)
@@ -372,12 +372,13 @@ public sealed class WireException : Exception
 /// <summary>线格式写入器。</summary>
 public sealed class WireWriter
 {
-    private readonly MemoryStream stream;
+    private byte[] buffer;
+    private int position;
 
     /// <summary>构造写入器（不预分配容量，适合小载荷）。</summary>
     public WireWriter()
     {
-        stream = new MemoryStream();
+        buffer = new byte[64];
     }
 
     /// <summary>
@@ -389,62 +390,104 @@ public sealed class WireWriter
     /// </summary>
     public WireWriter(int capacity)
     {
-        stream = new MemoryStream(capacity);
+        buffer = capacity > 0 ? new byte[capacity] : new byte[64];
+    }
+
+    private void EnsureCapacity(int additional)
+    {
+        int needed = position + additional;
+        if (needed <= buffer.Length)
+        {
+            return;
+        }
+
+        int newSize = Math.Max(buffer.Length * 2, needed);
+        var newBuffer = new byte[newSize];
+        buffer.AsSpan(0, position).CopyTo(newBuffer);
+        buffer = newBuffer;
     }
 
     /// <summary>写 u8。</summary>
     public WireWriter U8(byte value)
     {
-        stream.WriteByte(value);
+        EnsureCapacity(1);
+        buffer[position++] = value;
         return this;
     }
 
     /// <summary>写 u32（小端）。</summary>
     public WireWriter U32(uint value)
     {
-        Span<byte> buffer = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt32LittleEndian(buffer, value);
-        stream.Write(buffer);
+        EnsureCapacity(4);
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(position, 4), value);
+        position += 4;
         return this;
     }
 
     /// <summary>写 i32（小端）。</summary>
     public WireWriter I32(int value)
     {
-        Span<byte> buffer = stackalloc byte[4];
-        BinaryPrimitives.WriteInt32LittleEndian(buffer, value);
-        stream.Write(buffer);
+        EnsureCapacity(4);
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(position, 4), value);
+        position += 4;
         return this;
     }
 
     /// <summary>写 u64（小端）。</summary>
     public WireWriter U64(ulong value)
     {
-        Span<byte> buffer = stackalloc byte[8];
-        BinaryPrimitives.WriteUInt64LittleEndian(buffer, value);
-        stream.Write(buffer);
+        EnsureCapacity(8);
+        BinaryPrimitives.WriteUInt64LittleEndian(buffer.AsSpan(position, 8), value);
+        position += 8;
         return this;
     }
 
     /// <summary>写定长字节。</summary>
     public WireWriter Bytes(ReadOnlySpan<byte> value)
     {
-        stream.Write(value);
+        int length = value.Length;
+        EnsureCapacity(length);
+        value.CopyTo(buffer.AsSpan(position, length));
+        position += length;
         return this;
     }
 
     /// <summary>写 u32 个数 + 5 trits/byte 打包体。</summary>
+    /// <remarks>
+    /// 直接把 packed trits 写进内部 buffer，绕开 <see cref="Wire.PackTrits"/>
+    /// 每次新建 byte[] 的临时分配。wire 格式逐字节不变，只是中间省了一份拷贝。
+    /// </remarks>
     public WireWriter Trits(IReadOnlyList<TritDelta> values)
     {
-        U32((uint)values.Count);
-        Bytes(Wire.PackTrits(values));
+        int count = values.Count;
+        int packedLen = (count + Wire.TritsPerByte - 1) / Wire.TritsPerByte;
+        EnsureCapacity(4 + packedLen);
+
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(position, 4), (uint)count);
+        position += 4;
+
+        Span<byte> dest = buffer.AsSpan(position, packedLen);
+        for (int i = 0; i < count; i++)
+        {
+            int digit = (int)values[i];
+            dest[i / Wire.TritsPerByte] += (byte)(digit * Wire.Pow3(i % Wire.TritsPerByte));
+        }
+
+        position += packedLen;
         return this;
     }
 
     /// <summary>写出为字节数组。</summary>
     public byte[] ToArray()
     {
-        return stream.ToArray();
+        if (position == buffer.Length)
+        {
+            return buffer;
+        }
+
+        var result = new byte[position];
+        buffer.AsSpan(0, position).CopyTo(result);
+        return result;
     }
 }
 

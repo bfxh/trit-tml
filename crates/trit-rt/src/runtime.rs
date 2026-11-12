@@ -879,7 +879,8 @@ impl TritRuntime {
     /// 仲裁范围 = 本批意图 ∪ 其他未关闭事务的待落地意图——跨模组冲突在
     /// **提交时点**暴露，而不是各自落地后才互相覆盖。
     fn commit_intents(&mut self, intents: &[Intent], txn_id: u64) -> Result<(u32, u64), RtError> {
-        if intents.is_empty() && self.txns.pending_intents(txn_id).is_empty() {
+        let pending = self.txns.pending_intents(txn_id);
+        if intents.is_empty() && pending.is_empty() {
             return Ok((0, self.log.seq()));
         }
         // 提交前若日志已逼近硬上限，先压缩（依赖保留的快照锚点驱逐旧记录），
@@ -887,8 +888,9 @@ impl TritRuntime {
         if self.log.len() >= self.config.max_log_entries {
             self.compact_log();
         }
-        let mut batch: Vec<Intent> = intents.to_vec();
-        batch.extend(self.txns.pending_intents(txn_id));
+        let mut batch = Vec::with_capacity(intents.len() + pending.len());
+        batch.extend_from_slice(intents);
+        batch.extend(pending);
         let resolved: Vec<ResolvedIntent> =
             arbitrate(&batch, self.arbitration).map_err(|disputes: Vec<LaneDispute>| {
                 RtError::Conflict {
