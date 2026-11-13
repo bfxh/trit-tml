@@ -318,6 +318,30 @@ jobs:
           path: target/release/${{ matrix.lib }}
           if-no-files-found: error
 
+      # 额外产物：release-mobile profile（fat LTO + opt-level=z + codegen-units=1
+      # + strip）+ --no-default-features（防御性：default=[] 但写明意图）。
+      # 给追求最小体积的桌面玩家手动替换用——比 release profile 小 ~33-52%，
+      # 但 thin LTO 比 fat LTO 慢 ~2%（桌面玩家通常无感）。
+      - name: build cdylib (release-mobile, no-default-features)
+        run: cargo build --profile release-mobile --no-default-features -p trit-rt
+
+      - name: strip mobile artifact
+        shell: bash
+        run: |
+          lib="target/release-mobile/${{ matrix.lib }}"
+          test -f "$lib" || exit 1
+          # macOS 自带 strip，Linux/Windows runner 也有 binutils strip 或 llvm-strip
+          if command -v strip >/dev/null 2>&1; then
+            strip --strip-all "$lib"
+          fi
+          echo "mobile artifact: $(stat -c %s "$lib" 2>/dev/null || stat -f %z "$lib") bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trit-rt-mobile-${{ matrix.os }}
+          path: target/release-mobile/${{ matrix.lib }}
+          if-no-files-found: error
+
   # ────────────────────────────────────────────────────────────────────────
   # 6b) Android 原生库：交叉编译 arm64-v8a + armeabi-v7a 两个 ABI。
   #     用 cargo-ndk 自动下载 NDK、按 target 注入 CC/CXX——避免手动配
