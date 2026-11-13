@@ -2,6 +2,7 @@
 
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using TritRuntime.Kernel;
@@ -25,6 +26,42 @@ public sealed class TritSettings
 
     /// <summary>全局内存预算上限（MiB）。</summary>
     public const int MaxMemoryCapacityMb = 8192;
+
+    // ── Mobile profile 推荐值（与 Rust cfg(target_os="android") Profile::Mobile 对齐）───────
+    // 注意：这些不是"最大值"，是"默认值"。Sanitize 里 Android 会做硬夹。
+
+    /// <summary>Android 推荐 memory_capacity：32 MiB（桌面默认 512）。</summary>
+    public const int MobileMemoryCapacityMb = 32;
+
+    /// <summary>Android 推荐 worker count：1（桌面 自动 ≤4）。</summary>
+    public const int MobileWorkerCount = 1;
+
+    /// <summary>Android 推荐 scan_chunk：512（桌面默认 4096）。</summary>
+    public const int MobileScanChunk = 512;
+
+    /// <summary>Android 推荐事务日志上限：64K（桌面默认 1M，省 4.3 MB 常驻）。</summary>
+    public const int MobileMaxLogEntries = 1 << 16;
+
+    /// <summary>Android 每 tick 最多采样 NPC：32（桌面 256，桥接层数组从 10 KB → 128 KB 起步）。</summary>
+    public const int MobileMaxNpcs = 32;
+
+    /// <summary>Android 每 tick 最多采样 Projectile：32（桌面 256）。</summary>
+    public const int MobileMaxProjectiles = 32;
+
+    /// <summary>Android 每 tick 最多采样 Player：8（桌面 16）。</summary>
+    public const int MobileMaxPlayers = 8;
+
+    /// <summary>Android 快照间隔：600 tick（桌面 300，快照更省）。</summary>
+    public const int MobileSnapshotIntervalTicks = 600;
+
+    /// <summary>
+    /// 当前进程是否跑在 Android 上。
+    /// 用 <c>OperatingSystem.IsAndroid()</c> —— tModLoader 在 Android 上编译时会把目标设为 Android，
+    /// 这个检查会在装载期精确返回 true。模拟器（x86 Android）也返回 true，没问题。
+    /// </summary>
+    public static bool IsAndroidDevice => OperatingSystem.IsAndroid();
+
+    // ── 以下是现有常量，保持不动 ──
 
     /// <summary>事务日志条数上限（默认）。内核侧的默认值必须与此一致。</summary>
     public const int DefaultMaxLogEntries = 1 << 20;
@@ -188,6 +225,35 @@ public sealed class TritSettings
     [JsonIgnore]
     public string LoadedFrom { get; private set; } = string.Empty;
 
+    /// <summary>
+    /// 构造函数：Android 上自动切 Mobile 默认值（<c>cfg(target_os="android")</c> 等价的 C# 侧）。
+    /// </summary>
+    /// <remarks>
+    /// 为什么在构造函数里 override 而不是把属性初始化器改成三元表达式：
+    /// C# 属性初始化器在编译期求值，<c>OperatingSystem.IsAndroid()</c> 是运行时
+    /// 检测。静态属性、字段、构造函数体都能访问运行时检测结果。
+    /// Sanitize 会再硬夹一遍，这里只负责"首次创建时就是 Mobile 默认值"。
+    /// </remarks>
+    public TritSettings()
+    {
+        if (!IsAndroidDevice)
+        {
+            return;
+        }
+
+        MemoryCapacityMb = MobileMemoryCapacityMb;
+        WorkerCount = MobileWorkerCount;
+        ScanChunk = MobileScanChunk;
+        MaxLogEntries = MobileMaxLogEntries;
+        EnableHooks = false;
+        ShadowMode = false;
+        GpuPolicyText = "off";
+        MaxNpcs = MobileMaxNpcs;
+        MaxProjectiles = MobileMaxProjectiles;
+        MaxPlayers = MobileMaxPlayers;
+        SnapshotIntervalTicks = MobileSnapshotIntervalTicks;
+    }
+
     private static readonly JsonSerializerOptions ReadOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -309,6 +375,27 @@ public sealed class TritSettings
         GpuPolicyText = policy is "on" or "off" ? policy : "auto";
 
         LibraryPath ??= string.Empty;
+
+        // ── Android 硬夹：把一切值收敛到 Mobile profile 允许的安全范围。
+        //    为什么要硬夹而不是"只夹默认值"：
+        //    (a) 桌面玩家把 settings.json 复制到 Android 上，桌面值在 Android 上很容易 OOM；
+        //    (b) Rust cfg(target_os="android") 只有 Android target 编译时生效，C# 侧的值
+        //        是无条件传给内核的，一旦传了桌面默认值就会 override Rust 的 Mobile Default。
+        //    硬夹就是"无论玩家写了什么，都不让 Android 进桌面级的资源消耗"。
+        if (IsAndroidDevice)
+        {
+            MemoryCapacityMb = Math.Min(MemoryCapacityMb, 64); // 最多给 64 MiB（Mobile 默认 32）
+            WorkerCount = MobileWorkerCount;                   // Android 上任务池单线程就够，多了调度开销更大
+            ScanChunk = Math.Min(ScanChunk, 1024);             // 最多 1024 步，默认 512
+            MaxLogEntries = Math.Min(MaxLogEntries, MobileMaxLogEntries); // 最多 64K，默认 64K
+            GpuPolicyText = "off";                             // Android 上 wgpu 大概率无有效 Vulkan adapter
+            EnableHooks = false;                                // 减 CPU 开销；玩家要观测只能靠 Mod.Call
+            ShadowMode = false;                                 // Mobile profile 默认 false
+            MaxNpcs = Math.Min(MaxNpcs, MobileMaxNpcs);        // 桥接层数组是定长分配
+            MaxProjectiles = Math.Min(MaxProjectiles, MobileMaxProjectiles);
+            MaxPlayers = Math.Min(MaxPlayers, MobileMaxPlayers);
+            SnapshotIntervalTicks = Math.Max(SnapshotIntervalTicks, MobileSnapshotIntervalTicks);
+        }
     }
 
     /// <summary>
