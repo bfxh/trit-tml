@@ -399,6 +399,27 @@ jobs:
           after=$(stat -c %s "$so")
           echo "strip 后：$after bytes ($(( after / 1024 )) KB)"
 
+      - name: ELF 合法性 + 架构 sanity check
+        shell: bash
+        run: |
+          so="target/${{ matrix.target }}/release-mobile/libtrit_rt.so"
+          # ELF magic header：前 4 字节 7F 45 4C 46（.ELF）
+          magic=$(head -c 4 "$so" | od -A n -t x1 | tr -d ' \n')
+          echo "ELF magic: $magic"
+          [ "$magic" = "7f454c46" ] || { echo "❌ 不是合法 ELF（magic=$magic）"; exit 1; }
+          # file 命令二次确认架构——防止 target 配置被改、产出错误架构的 .so
+          file_out=$(file -b "$so")
+          echo "file: $file_out"
+          case "${{ matrix.target }}" in
+            aarch64-linux-android)
+              echo "$file_out" | grep -qi "aarch64\|arm64" || { echo "❌ 期望 aarch64 .so，file 说：$file_out"; exit 1; }
+              ;;
+            armv7-linux-androideabi)
+              echo "$file_out" | grep -qi "arm\|32-bit" || { echo "❌ 期望 armv7 .so，file 说：$file_out"; exit 1; }
+              ;;
+          esac
+          echo "✅ ELF 架构校验通过"
+
       - name: 体积护栏（超过 3 MB 即失败）
         shell: bash
         run: |

@@ -68,8 +68,19 @@ pub struct GpuConfig {
 
 impl Default for GpuConfig {
     fn default() -> Self {
+        // Android target 强制 Off：老安卓机上
+        // (a) wgpu Vulkan 初始化容易因缺少驱动 / 版本太低而 panic；
+        // (b) 真机实测 GPU 比 CPU 位并行慢 58 倍（n=1 单列扫描）；
+        // (c) release-mobile profile 本来就不带 gpu feature，
+        //     这里是最后一道闸——即使有人加了 --features gpu 也不会碰 GPU。
+        #[cfg(target_os = "android")]
+        let policy = GpuPolicy::Off;
+
+        #[cfg(not(target_os = "android"))]
+        let policy = GpuPolicy::Auto;
+
         Self {
-            policy: GpuPolicy::Auto,
+            policy,
             min_trits: DEFAULT_MIN_TRITS,
         }
     }
