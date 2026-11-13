@@ -59,8 +59,35 @@ mod mem {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "android")]
 mod mem {
+    /// 从 /proc/self/status 解析 VmRSS / VmHWM（Android/Linux 通用）。
+    /// Android 的 bionic libc 没有 getrusage() 的 ru_maxrss 语义，
+    /// /proc 文件系统是唯一可靠的 RSS 读数。
+    pub fn rss_mb() -> (f64, f64) {
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            return (0.0, 0.0);
+        };
+        let mut rss_kb: Option<f64> = None;
+        let mut hwm_kb: Option<f64> = None;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                rss_kb = rest.trim().split_whitespace().next().and_then(|s| s.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+                hwm_kb = rest.trim().split_whitespace().next().and_then(|s| s.parse().ok());
+            }
+        }
+        match (rss_kb, hwm_kb) {
+            (Some(rss), Some(hwm)) => (rss / 1024.0, hwm / 1024.0),
+            (Some(rss), None) => (rss / 1024.0, rss / 1024.0), // 没峰值就拿当前当峰值
+            _ => (0.0, 0.0),
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "android")))]
+mod mem {
+    /// 桌面 Linux / macOS — 没 Windows 内核 API，也没 Android /proc 保证时兜底返回零。
     pub fn rss_mb() -> (f64, f64) {
         (0.0, 0.0)
     }
