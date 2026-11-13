@@ -144,6 +144,12 @@ public static class Opcode
     /// "未知 opcode"，<c>ApplyBatch</c> 会回退到三步流程。
     /// </remarks>
     public const uint TxnApply = 0x1C;
+
+    /// <summary>
+    /// 内核预测：刷新 fork + 历史外推。返回 <c>count u32, [key u32, delta u8] * n</c>。
+    /// 托管回退路径（ManagedKernel）无 fork，返回 count=0（零开销降级）。
+    /// </summary>
+    public const uint Predictions = 0x1D;
 }
 
 /// <summary>查询编号，与 Rust 侧 <c>trit_rt::wire::query</c> 对齐。</summary>

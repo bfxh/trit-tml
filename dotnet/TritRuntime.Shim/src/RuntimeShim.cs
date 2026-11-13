@@ -352,6 +352,55 @@ public sealed class RuntimeShim : IDisposable
         host.Kernel.Submit(Opcode.SessionReset, Array.Empty<byte>()).IsOk;
 
     /// <summary>
+    /// 刷新接管系统 fork + 跑历史外推预测。
+    ///
+    /// 返回"内核认为本 tick 可接管的实体字段"列表。
+    /// <c>(key, delta)</c> 语义：<c>delta = 0</c>（弃权）不会出现在列表里；
+    /// <c>delta = 1</c> 是 Neg（建议字段值下调）；<c>delta = 2</c> 是 Pos（建议字段值上调）。
+    ///
+    /// 零开销降级：
+    /// - 内核侧 <c>RuntimeConfig.takeover</c> 为 <c>None</c>（L0）或
+    ///   <c>prediction_interval_ticks</c> 不在预测窗口时返回空；
+    /// - 托管回退路径（ManagedKernel）没有 fork，永远返回空。
+    /// </summary>
+    /// <returns>本 tick 内核预测的可接管实体列表；空列表 = 本次 tick 跳过接管。</returns>
+    public IReadOnlyList<(uint Key, byte Delta)> GetPredictions()
+    {
+        var response = host.Kernel.Submit(Opcode.Predictions, Array.Empty<byte>());
+        if (!response.IsOk || response.Payload.Length < 4)
+        {
+            // 旧版原生库不认识这个 opcode → 空列表跳过接管（行为降级，不是错误）
+            return Array.Empty<(uint, byte)>();
+        }
+
+        var payload = response.Payload;
+        int count = BinaryPrimitives.ReadInt32LittleEndian(payload.AsSpan(0, 4));
+        if (count <= 0)
+        {
+            return Array.Empty<(uint, byte)>();
+        }
+
+        // 需要 count * 5 字节 = count × (4 字节 key + 1 字节 delta)
+        int expected = 4 + (count * 5);
+        if (payload.Length < expected)
+        {
+            // 载荷损坏（内核 bug？）—— 返回空列表跳过，不让接管链崩溃
+            return Array.Empty<(uint, byte)>();
+        }
+
+        var result = new (uint Key, byte Delta)[count];
+        for (int i = 0; i < count; i++)
+        {
+            int offset = 4 + (i * 5);
+            uint key = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(offset, 4));
+            byte delta = payload[offset + 4];
+            result[i] = (key, delta);
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// <c>Mod.Call</c> 契约入口。模组侧这样暴露：
     /// <code>
     /// public override object Call(params object[] args)

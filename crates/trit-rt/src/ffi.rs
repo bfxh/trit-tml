@@ -533,6 +533,27 @@ pub unsafe extern "C" fn tt_rt_diff(
     }
 }
 
+/// `0x1D PREDICTIONS`：刷新 fork + 跑历史外推预测。载荷空。
+///
+/// 返回 `count u32, [key u32, delta u8] * n`（delta = 0 弃权，1 Neg，2 Pos）。
+/// RuntimeConfig.takeover 为 None（L0）时返回 count=0（零开销降级）。
+///
+/// # Safety
+///
+/// 指针参数必须由调用方保证有效：`out`/`cap` 指向可写内存，
+/// 缓冲区不足时回写所需长度并返回 `TT_ERR_BUFFER`。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tt_rt_predictions(handle: u64, out: *mut u8, cap: usize) -> i32 {
+    let outcome = std::panic::catch_unwind(|| {
+        with_runtime(handle, |runtime| runtime.dispatch(op::PREDICTIONS, &[]))
+    });
+    match outcome {
+        Ok(Ok(response)) => write_out(out, cap, &frame_response(&response)),
+        Ok(Err(error)) => error.status_code(),
+        Err(_) => TT_ERR_PANIC,
+    }
+}
+
 /// 能力位图；句柄非法返回 0。
 ///
 /// # Safety

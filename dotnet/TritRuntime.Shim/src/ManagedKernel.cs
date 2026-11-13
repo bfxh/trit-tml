@@ -1251,9 +1251,13 @@ public sealed class ManagedKernel : ITritKernel
             Opcode.Budget => OpBudget(),
             Opcode.Metrics => OpMetrics(),
             Opcode.SessionReset => OpSessionReset(payload),
+            Opcode.Predictions => OpPredictions(),
             _ => throw new RtException(Status.Arg, $"输入非法：未知 opcode {opcode:#x}"),
         };
     }
+
+    /// 托管回退路径没有 fork，返回 count=0 零开销降级（C# 侧 EntityTakeover 看到空就跳过）。
+    private static byte[] OpPredictions() => new byte[4]; // count = 0
 
     private byte[] OpSessionReset(byte[] payload)
     {

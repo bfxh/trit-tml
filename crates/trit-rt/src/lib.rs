@@ -35,6 +35,7 @@ pub mod router;
 pub mod runtime;
 pub mod scan;
 pub mod snapshot;
+pub mod takeover;
 pub mod txn;
 pub mod wire;
 

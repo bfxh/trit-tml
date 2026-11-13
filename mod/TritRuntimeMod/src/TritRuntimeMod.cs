@@ -80,6 +80,7 @@ public sealed class TritRuntimeMod : Mod
     private RuntimeShim? shim;
     private WorldBridge? bridge;
     private TritHooks? hooks;
+    private EntityTakeover? takeover;
     private bool loaded;
 
     // 轮询开关：一旦轮询本身抛异常就永久关闭，避免每 tick 刷一条错误日志。
@@ -161,6 +162,20 @@ public sealed class TritRuntimeMod : Mod
                 writer.WriteString("policy", settings.GpuPolicyText);
                 writer.WriteNumber("min_trits", settings.GpuMinTrits);
                 writer.WriteEndObject();
+
+                // 接管配置：只有显式选了 L1+ 才写入，ObserveOnly 时留空让 Rust 侧
+                // Option<TakeoverConfig> = None → 零开销降级。
+                if (settings.Takeover != TritSettings.TakeoverMode.ObserveOnly)
+                {
+                    writer.WriteStartObject("takeover");
+                    string modeStr = settings.Takeover == TritSettings.TakeoverMode.PatchAfterOrig
+                        ? "patch_after_orig"
+                        : "replace_orig";
+                    writer.WriteString("mode", modeStr);
+                    // 其他字段全用 Rust TakeoverConfig 的 serde(default) 默认值
+                    // （confidence_threshold=0.95, confidence_window=30, etc.）
+                    writer.WriteEndObject();
+                }
 
                 writer.WriteEndObject();
             }
@@ -387,6 +402,15 @@ public sealed class TritRuntimeMod : Mod
             {
                 Logger.Info("[trit] 设置要求不安装钩子，本层仅提供 Mod.Call 内核服务。");
             }
+
+            // 接管层：只有显式选了 L1+ 才创建。ObserveOnly 时整类零开销。
+            // Phase 1 MVP 接管层只做 predictions 链路验证 + 置信度表，
+            // 真正的 trit delta → C# 实体字段映射留到 Phase 1.5。
+            if (settings.Takeover != TritSettings.TakeoverMode.ObserveOnly && shim is not null)
+            {
+                takeover = new EntityTakeover(shim, settings);
+                Logger.Info($"[trit] 接管层已启用（{settings.Takeover}）");
+            }
         }
         catch (Exception ex)
         {
@@ -419,6 +443,18 @@ public sealed class TritRuntimeMod : Mod
 
         bridge?.OnTickEnd();
         OnPollJobs();
+
+        // 接管层：Phase 1 MVP 只跑 predictions 链路 + 置信度表。
+        // ObserveOnly 时 takeover == null，这里零开销。
+        try
+        {
+            takeover?.AfterOrig();
+        }
+        catch (Exception ex)
+        {
+            // 接管层任何异常绝不能中断游戏 tick
+            Logger.Warn("[trit] 接管层异常（已跳过）：" + ex.Message);
+        }
     }
 
     /// <summary>
@@ -677,6 +713,7 @@ public sealed class TritRuntimeMod : Mod
         jobPollingEnabled = false;
         recentJobs.Clear();
         ownerMailboxes.Clear();
+        takeover = null;
 
         try
         {

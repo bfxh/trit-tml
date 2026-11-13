@@ -61,6 +61,29 @@ public sealed class TritSettings
     /// </summary>
     public static bool IsAndroidDevice => OperatingSystem.IsAndroid();
 
+    /// <summary>
+    /// 接管模式（内核是否"替代"原版 C# AI/Update 的部分逻辑）。
+    /// </summary>
+    /// <remarks>
+    /// Phase 1 L1 MVP 只实现了 ObserveOnly 和 PatchAfterOrig。ReplaceOrig 是 L2 中接管的事。
+    /// </remarks>
+    public enum TakeoverMode
+    {
+        /// <summary>只观测（默认，DesktopHigh / DesktopLow）。零开销。</summary>
+        ObserveOnly = 0,
+
+        /// <summary>
+        /// L1 轻接管：原版 orig 先跑，内核事后用预测结果修正（Android Mobile 默认）。
+        /// 置信度门禁 + 降级链保证安全。
+        /// </summary>
+        PatchAfterOrig = 1,
+
+        /// <summary>
+        /// L2 中接管：内核先跑，直接跳过原版 orig（Phase 1 不实现，保留枚举位）。
+        /// </summary>
+        ReplaceOrig = 2,
+    }
+
     // ── 以下是现有常量，保持不动 ──
 
     /// <summary>事务日志条数上限（默认）。内核侧的默认值必须与此一致。</summary>
@@ -115,6 +138,12 @@ public sealed class TritSettings
     /// </summary>
     [JsonPropertyName("shadowMode")]
     public bool ShadowMode { get; set; }
+
+    /// <summary>
+    /// 内核接管模式。桌面默认 ObserveOnly（只观测，零开销）；Android 默认 PatchAfterOrig（L1 轻接管，省 CPU）。
+    /// </summary>
+    [JsonPropertyName("takeover")]
+    public TakeoverMode Takeover { get; set; }
 
     /// <summary>强制托管回退内核（诊断用：用于确认托管路径本身没问题）。</summary>
     [JsonPropertyName("forceManaged")]
@@ -247,6 +276,7 @@ public sealed class TritSettings
         MaxLogEntries = MobileMaxLogEntries;
         EnableHooks = false;
         ShadowMode = false;
+        Takeover = TakeoverMode.PatchAfterOrig;
         GpuPolicyText = "off";
         MaxNpcs = MobileMaxNpcs;
         MaxProjectiles = MobileMaxProjectiles;
@@ -395,6 +425,25 @@ public sealed class TritSettings
             MaxProjectiles = Math.Min(MaxProjectiles, MobileMaxProjectiles);
             MaxPlayers = Math.Min(MaxPlayers, MobileMaxPlayers);
             SnapshotIntervalTicks = Math.Max(SnapshotIntervalTicks, MobileSnapshotIntervalTicks);
+        }
+
+        // ── 接管模式合法性检查 ──
+        if (!IsAndroidDevice)
+        {
+            // 桌面：Phase 1 只实现了 ObserveOnly + PatchAfterOrig，ReplaceOrig 暂不开放。
+            if (Takeover is not (TakeoverMode.ObserveOnly or TakeoverMode.PatchAfterOrig))
+            {
+                Takeover = TakeoverMode.ObserveOnly;
+            }
+        }
+        else
+        {
+            // Android：默认 PatchAfterOrig。玩家可显式改回 ObserveOnly（关掉接管），
+            // 但禁止 ReplaceOrig（Phase 1 不实现，强夹避免崩溃）。
+            if (Takeover is TakeoverMode.ReplaceOrig)
+            {
+                Takeover = TakeoverMode.PatchAfterOrig;
+            }
         }
     }
 

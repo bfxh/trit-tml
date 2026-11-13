@@ -100,6 +100,12 @@ pub mod op {
     /// 跨事务/可回滚的语义仍走三步流程。属**可选**操作：老内核返回
     /// [`crate::error::RtError::InvalidInput`]，上层回退到三步流程即可。
     pub const TXN_APPLY: u32 = 0x1C;
+    /// 内核预测：刷新 fork 世界快照 + 对配置的全部可接管键跑历史外推。
+    /// 载荷：空（fork 从主内核当前世界投影自动 clone）
+    /// 返回：`count u32, [key u32, delta u8] * n`（delta = 0 表示弃权，delta = 1/2 表示 Neg/Pos）。
+    ///
+    /// RuntimeConfig.takeover 为 None 时返回空 payload（零开销降级）。
+    pub const PREDICTIONS: u32 = 0x1D;
 }
 
 /// 查询编号。

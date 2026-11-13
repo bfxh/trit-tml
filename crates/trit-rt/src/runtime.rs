@@ -75,6 +75,12 @@ pub struct RuntimeConfig {
     pub parallel: ParallelConfig,
     /// GPU 后端配置（v2）。
     pub gpu: GpuConfig,
+    /// 内核接管配置（L1+）。`None` = L0 零开销（不做预测，不影响原版）。
+    ///
+    /// Phase 1 MVP 默认值：全部 profile 都 `None`（保持只观测）。
+    /// 玩家显式传 JSON `"takeover": {...}` 才启用。
+    #[serde(default)]
+    pub takeover: Option<crate::takeover::TakeoverConfig>,
 }
 
 impl RuntimeConfig {
@@ -112,6 +118,7 @@ impl RuntimeConfig {
             shadow: true,
             parallel: ParallelConfig::desktop_high(),
             gpu: GpuConfig::default(),
+            takeover: None,
         }
     }
 
@@ -126,6 +133,7 @@ impl RuntimeConfig {
             shadow: true,
             parallel: ParallelConfig::desktop_low(),
             gpu: GpuConfig::default(),
+            takeover: None,
         }
     }
 
@@ -141,6 +149,7 @@ impl RuntimeConfig {
             shadow: false,
             parallel: ParallelConfig::mobile(),
             gpu: GpuConfig::default(),
+            takeover: None,
         }
     }
 }
@@ -284,11 +293,17 @@ pub struct TritRuntime {
     ai_model: Option<trit_net::Model>,
     /// 并行任务池（v2）：扫描任务在这里跑，游戏主线程只提交与回收。
     pool: Arc<JobPool>,
+    /// 接管系统 fork（L1+）。`None` = L0 零开销（整个接管模块不初始化）。
+    takeover_fork: Option<crate::takeover::WorldProjectionFork>,
 }
 
 impl TritRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
         let pool = Arc::new(JobPool::new(config.parallel, config.gpu));
+        // 只有显式配置了 takeover 才创建 fork。保持 Default/桌面/L0 全部零开销。
+        let takeover_fork = config.takeover.as_ref().map(|tc| {
+            crate::takeover::WorldProjectionFork::fork_from(&BTreeMap::new(), tc.clone())
+        });
         Self {
             router: EventRouter::new(config.max_subscribers),
             txns: TxnTable::new(config.max_open_txns),
@@ -308,6 +323,7 @@ impl TritRuntime {
             #[cfg(feature = "ai-voting")]
             ai_model: None,
             pool,
+            takeover_fork,
         }
     }
 
@@ -392,6 +408,7 @@ impl TritRuntime {
             op::METRICS => self.op_metrics(payload),
             op::SESSION_RESET => self.op_session_reset(payload),
             op::TXN_APPLY => self.op_txn_apply(payload),
+            op::PREDICTIONS => self.op_predictions(),
             _ => Err(RtError::InvalidInput(format!("未知 opcode {opcode:#x}"))),
         };
         if let Err(error) = &result {
@@ -620,6 +637,49 @@ impl TritRuntime {
         let mut writer = Writer::new();
         writer.u32(applied);
         writer.u64(log_seq);
+        Ok(writer.into_vec())
+    }
+
+    /// `0x1D PREDICTIONS`：刷新 fork + 历史外推预测。
+    ///
+    /// 载荷空（fork 从主内核当前 world() 自动 clone 刷新）。
+    /// 返回 `count u32, [key u32, delta u8] * n`（delta = 0 弃权，1 Neg，2 Pos）。
+    ///
+    /// 零开销降级：
+    /// - `takeover_fork == None` → 返回空（count=0），C# 侧跳过接管。
+    /// - 配置了 `prediction_interval_ticks` → 每隔 N tick 才真正预测（中间 tick 返回空）。
+    /// - 置信度门禁 / divergence_tolerance 在 fork.predict_all 里自动过滤。
+    fn op_predictions(&mut self) -> Result<Vec<u8>, RtError> {
+        let Some(fork) = self.takeover_fork.as_mut() else {
+            // L0：零开销降级
+            let mut w = Writer::new();
+            w.u32(0);
+            return Ok(w.into_vec());
+        };
+
+        let interval = self
+            .config
+            .takeover
+            .as_ref()
+            .map(|tc| tc.prediction_interval_ticks)
+            .unwrap_or(1);
+        if interval > 0 && !self.tick.is_multiple_of(interval as u64) {
+            // 不在预测窗口 → 返回空（C# 侧跳过）
+            let mut w = Writer::new();
+            w.u32(0);
+            return Ok(w.into_vec());
+        }
+
+        // 刷新 fork 的世界投影（每次 predictions 调用都 clone 一份当前 world）
+        fork.refresh_world(&self.world);
+        let preds = fork.predict_all();
+
+        let mut writer = Writer::new();
+        writer.u32(preds.len() as u32);
+        for (key, trit) in preds {
+            writer.u32(key);
+            writer.u8(wire::trit_byte(trit));
+        }
         Ok(writer.into_vec())
     }
 
