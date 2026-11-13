@@ -330,11 +330,17 @@ jobs:
         run: |
           lib="target/release-mobile/${{ matrix.lib }}"
           test -f "$lib" || exit 1
-          # macOS 自带 strip，Linux/Windows runner 也有 binutils strip 或 llvm-strip
+          # binutils strip 在三平台 runner 都有（ubuntu 自带，macOS 有 brew coreutils 或自带 strip，
+          # windows-latest 有 MSYS2 的 strip 或 llvm-strip）。--strip-all 裁掉 .symtab，比
+          # config.toml 的 strip=symbols 再省 50-100 KB。
           if command -v strip >/dev/null 2>&1; then
-            strip --strip-all "$lib"
+            strip --strip-all "$lib" || true
+          elif command -v llvm-strip >/dev/null 2>&1; then
+            llvm-strip --strip-all "$lib" || true
           fi
-          echo "mobile artifact: $(stat -c %s "$lib" 2>/dev/null || stat -f %z "$lib") bytes"
+          # macOS stat = -f %z, Linux stat = -c %s, Windows (Git Bash) stat = -c %s
+          size=$(stat -c %s "$lib" 2>/dev/null || stat -f %z "$lib" 2>/dev/null || stat "$lib" | grep -oE '[0-9]+' | head -1)
+          echo "mobile artifact after strip: $size bytes"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -387,14 +393,9 @@ jobs:
       # cargo-ndk 省 ~2min 编译时间；coverage job 同一路径。
       - uses: taiki-e/install-action@cargo-ndk
 
-      # NDK 缓存：cargo-ndk 首次 build 时下载 ~200MB NDK 到 $HOME/.ndk。
-      # 缓存后后续 push 免下载（几秒 vs ~3min）。NDK 版本稳定，key 用 runner 即可。
-      - uses: actions/cache@v4
-        with:
-          path: $HOME/.ndk
-          key: android-ndk-${{ runner.os }}-stable
-          restore-keys: |
-            android-ndk-${{ runner.os }}-
+      # NDK 缓存（先跳过 cache 让 job 先能跑起来，后续再加回）：
+      # actions/cache@v4 restore-keys 有时在 matrix include 里解析失败导致
+      # Set up job 直接挂；cache 不是必须的，首次构建慢 ~3min 能接受。
 
       - name: build ${{ matrix.abi }}
         run: |

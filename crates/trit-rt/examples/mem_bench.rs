@@ -72,9 +72,17 @@ mod mem {
         let mut hwm_kb: Option<f64> = None;
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("VmRSS:") {
-                rss_kb = rest.trim().split_whitespace().next().and_then(|s| s.parse().ok());
+                rss_kb = rest
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok());
             } else if let Some(rest) = line.strip_prefix("VmHWM:") {
-                hwm_kb = rest.trim().split_whitespace().next().and_then(|s| s.parse().ok());
+                hwm_kb = rest
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok());
             }
         }
         match (rss_kb, hwm_kb) {
