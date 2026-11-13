@@ -1252,6 +1252,8 @@ public sealed class ManagedKernel : ITritKernel
             Opcode.Metrics => OpMetrics(),
             Opcode.SessionReset => OpSessionReset(payload),
             Opcode.Predictions => OpPredictions(),
+            // 托管回退没有 fork，直接吞掉（没有置信度需要回写）
+            Opcode.ConsistencyRecord => new byte[0],
             _ => throw new RtException(Status.Arg, $"输入非法：未知 opcode {opcode:#x}"),
         };
     }

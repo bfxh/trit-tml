@@ -409,6 +409,7 @@ impl TritRuntime {
             op::SESSION_RESET => self.op_session_reset(payload),
             op::TXN_APPLY => self.op_txn_apply(payload),
             op::PREDICTIONS => self.op_predictions(),
+            op::CONSISTENCY_RECORD => self.op_consistency_record(payload),
             _ => Err(RtError::InvalidInput(format!("未知 opcode {opcode:#x}"))),
         };
         if let Err(error) = &result {
@@ -681,6 +682,41 @@ impl TritRuntime {
             writer.u8(wire::trit_byte(trit));
         }
         Ok(writer.into_vec())
+    }
+
+    /// `0x1E CONSISTENCY_RECORD`：批量回写置信度对拍结果。
+    ///
+    /// 载荷：`count u32, [key u32, consistent u8] * n`（consistent = 1 一致，0 不一致）。
+    ///
+    /// 零开销降级：
+    /// - `takeover_fork == None` → 返回空，载荷被忽略（整 op 无状态）。
+    /// - 载荷损坏（count 与字节数不匹配）→ 返回 InvalidInput，不修改任何置信度。
+    ///   C# 侧 RuntimeShim 捕获后会把异常转成 warning（不会中断接管链）。
+    fn op_consistency_record(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        let Some(fork) = self.takeover_fork.as_mut() else {
+            // L0：零开销降级，直接吞掉载荷
+            return Ok(Vec::new());
+        };
+
+        let mut reader = Reader::new(payload);
+        let count = reader.u32()? as usize;
+        let expected = 4 + count * 5;
+        if payload.len() != expected {
+            return Err(RtError::InvalidInput(format!(
+                "CONSISTENCY_RECORD 载荷长度不匹配：payload={}, expected={}",
+                payload.len(),
+                expected
+            )));
+        }
+
+        for _ in 0..count {
+            let key = reader.u32()?;
+            let byte = reader.u8()?;
+            let consistent = byte != 0;
+            fork.record_outcome(key, consistent);
+        }
+
+        Ok(Vec::new())
     }
 
     fn op_txn_rollback(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {

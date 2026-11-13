@@ -401,6 +401,44 @@ public sealed class RuntimeShim : IDisposable
     }
 
     /// <summary>
+    /// 批量回写置信度对拍结果（EntityTakeover 在原版 vs 内核对拍后调）。
+    /// </summary>
+    /// <param name="records">
+    /// 每个元素是 <c>(key, consistent)</c>，其中 <c>key</c> 是 LaneMap 编码键，
+    /// <c>consistent = true</c> 表示内核预测方向与原版实际值一致。
+    /// 空序列直接返回，不做任何 Submits（省一次开销）。
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> = 内核接受了（包括 L0/L1/L2 任何状态）；
+    /// <see langword="false"/> = 旧版原生库不认识这个 opcode 或载荷损坏（不是致命错误，
+    /// 调用方只需要打个 warning）。
+    /// </returns>
+    /// <remarks>
+    /// 托管回退（ManagedKernel）不做任何事 —— 返回空 response，<c>IsOk=false</c>，
+    /// 这里 <c>return true</c> 统一成"OK"，避免 EntityTakeover 打无意义 warning。
+    /// </remarks>
+    public bool RecordOutcome(IEnumerable<(uint Key, bool Consistent)> records)
+    {
+        var list = records as IList<(uint, bool)> ?? records.ToList();
+        if (list.Count == 0) return true;
+
+        // 载荷格式：count u32, [key u32, consistent u8] * n
+        int totalBytes = 4 + (list.Count * 5);
+        var payload = new byte[totalBytes];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), (uint)list.Count);
+        for (int i = 0; i < list.Count; i++)
+        {
+            int offset = 4 + (i * 5);
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset, 4), list[i].Item1);
+            payload[offset + 4] = (byte)(list[i].Item2 ? 1 : 0);
+        }
+
+        var response = host.Kernel.Submit(Opcode.ConsistencyRecord, payload);
+        // 托管回退 OpPredictions 返回空 response（无 payload）—— 这里返回 true 让调用方安心
+        return response.IsOk || response.Payload.Length == 0;
+    }
+
+    /// <summary>
     /// <c>Mod.Call</c> 契约入口。模组侧这样暴露：
     /// <code>
     /// public override object Call(params object[] args)

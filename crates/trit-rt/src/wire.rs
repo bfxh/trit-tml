@@ -106,6 +106,9 @@ pub mod op {
     ///
     /// RuntimeConfig.takeover 为 None 时返回空 payload（零开销降级）。
     pub const PREDICTIONS: u32 = 0x1D;
+    /// 置信度对拍回写：C# 侧对比原版结果 vs 内核预测方向，批量提交一致/不一致样本。
+    /// 载荷：`count u32, [key u32, consistent u8] * n`（consistent = 1 一致，0 不一致）。
+    pub const CONSISTENCY_RECORD: u32 = 0x1E;
 }
 
 /// 查询编号。

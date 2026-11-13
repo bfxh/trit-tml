@@ -554,6 +554,39 @@ pub unsafe extern "C" fn tt_rt_predictions(handle: u64, out: *mut u8, cap: usize
     }
 }
 
+/// `0x1E CONSISTENCY_RECORD`：批量回写置信度对拍结果。
+/// 载荷 `count u32, [key u32, consistent u8] * n`（consistent = 1 一致，0 不一致）。
+///
+/// 返回值：
+/// - `0` 全部 OK（包括 L0 零开销降级、fork 为空、托管回退）
+/// - `TT_ERR_PANIC` Rust panic 穿透边界
+/// - `TT_ERR_ARG` 载荷损坏（长度不匹配）—— fork 状态未被修改
+///
+/// # Safety
+///
+/// `payload` 必须是调用方提供的可读字节序列，不超过 `len` 长度。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tt_rt_record_outcome(handle: u64, payload: *const u8, len: u32) -> i32 {
+    // unsafe_op_in_unsafe_fn：Rust 2024 edition lint —— FFI wrapper 里 pointer null check
+    // 是标准的防御性写法，合理地 allow。
+    #[allow(unsafe_op_in_unsafe_fn)]
+    let outcome = std::panic::catch_unwind(|| {
+        let bytes = if payload.is_null() || len == 0 {
+            &[] as &[u8]
+        } else {
+            std::slice::from_raw_parts(payload, len as usize)
+        };
+        with_runtime(handle, |runtime| {
+            runtime.dispatch(op::CONSISTENCY_RECORD, bytes)
+        })
+    });
+    match outcome {
+        Ok(Ok(_)) => 0,
+        Ok(Err(error)) => error.status_code(),
+        Err(_) => TT_ERR_PANIC,
+    }
+}
+
 /// 能力位图；句柄非法返回 0。
 ///
 /// # Safety

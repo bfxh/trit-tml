@@ -7,34 +7,27 @@ using Terraria;
 namespace TritRuntimeMod;
 
 /// <summary>
-/// 内核接管层（L1 PatchAfterOrig）。
+/// 内核接管层（L1 PatchAfterOrig + 置信度长期跟踪）。
 /// </summary>
 /// <remarks>
-/// <para>
-/// Phase 1 MVP 链路验证版 → Phase 1.5 真正接管：按 LaneMap key 解码
-/// <c>kind / slot / field</c>，把内核返回的 trit delta（Neg / Zero / Pos）
-/// 映射成 Terraria 实体字段的 <b>方向门</b>。
-/// </para>
-/// <para>
-/// <b>方向门语义</b>（Phase 1.5 MVP）：
-/// <list type="bullet">
-/// <item><c>delta=2 (Pos)</c> → 确保字段值 ≥ 0（velocity 朝正方向；direction = +1）</item>
-/// <item><c>delta=1 (Neg)</c> → 确保字段值 ≤ 0（velocity 朝负方向；direction = -1）</item>
-/// <item><c>delta=0 (Zero / 弃权)</c> → 跳过（原版结果保留）</item>
+/// Phase 1 → Phase 1.5 → Phase 1.6（当前）：
+/// <list type="number">
+/// <item>Phase 1 MVP：链路验证 — predictions + 零开销降级</item>
+/// <item>Phase 1.5：方向门接管 — 把内核预测方向应用到 NPC/Projectile velocity/direction</item>
+/// <item><b>Phase 1.6（本文件）</b>：置信度长期跟踪 — 原版值方向 vs 内核预测方向对拍 + 批量回写</item>
 /// </list>
+/// <para>
+/// 对拍语义：
 /// </para>
 /// <para>
-/// <b>零开销降级链</b>：
-/// <list type="bullet">
-/// <item>ObserveOnly → 构造函数里创建但 AfterOrig 第一行就 return</item>
-/// <item>托管回退 / 旧版原生库 → GetPredictions 返回空列表 → 全循环跳过</item>
-/// <item>Rust 侧 confidence &lt; threshold → predict 返回 Unknown → C# delta=0 → 跳过</item>
-/// <item>实体 inactive / slot 越界 → 跳过这条 prediction（内核可能没同步采样但 fork 里有旧数据）</item>
-/// </list>
+/// 每条 prediction 包含 (key, delta)，delta=2(Pos) 表示内核认为该字段"应该朝正方向"，
+/// delta=1(Neg) 表示"应该朝负方向"。对拍在 <b>原版 AI 刚跑完、接管还没发生时</b>
+/// 读取原版当前值，检查它的方向是否和 delta 一致。一致 = confidence++，
+/// 不一致 = divergence++。fork.predict() 用这些数据决定下一轮该 key 是 Pos/Neg/Unknown。
 /// </para>
 /// <para>
-/// <b>只接管方向类字段</b>：VelocityX / VelocityY / Direction。不碰状态机字段
-/// （Active / Life / LifeMax 受事件驱动不是 AI 直接改的，接管会炸游戏逻辑）。
+/// <b>时序约束</b>：对拍必须在方向门 Apply 之前做 —— 否则原版值被我们改了，
+/// 对拍结果永远是"一致"（方向门自己改的），置信度虚高。
 /// </para>
 /// </remarks>
 internal sealed class EntityTakeover
@@ -51,6 +44,9 @@ internal sealed class EntityTakeover
     /// <summary>本 tick 收到的内核预测条数（fork.predict_all 返回量）。</summary>
     public int PredictionCount => lastPredictions?.Count ?? 0;
 
+    /// <summary>本 tick 对拍后回写的置信度样本数。</summary>
+    public int RecordedCount { get; private set; }
+
     public EntityTakeover(RuntimeShim shim, TritSettings settings)
     {
         this.shim = shim;
@@ -59,10 +55,9 @@ internal sealed class EntityTakeover
 
     /// <summary>
     /// 在 <see cref="TritRuntimeMod.OnWorldTick"/> 里全部原版 AI 跑完后调用。
-    /// <b>PatchAfterOrig 语义</b>：原版已经算完一遍正确结果，这里只是"内核置信度够高就用内核方向修正"。
     /// </summary>
     /// <remarks>
-    /// 调用方必须包裹 <c>try/catch</c> —— 任何接管异常绝不能中断游戏 tick。
+    /// <b>顺序</b>：先 predictions → 先对拍（原版值还没被我们改）→ 批量 RecordOutcome → 再 Apply 方向门。
     /// </remarks>
     public void AfterOrig()
     {
@@ -75,20 +70,45 @@ internal sealed class EntityTakeover
         var preds = shim.GetPredictions();
         lastPredictions = preds;
         TakeoverCount = 0;
+        RecordedCount = 0;
 
         if (preds.Count == 0)
         {
             return; // Rust confidence 全不过 / prediction_interval_ticks 门控 / 托管回退
         }
 
+        // ── Phase 1.6：原版值方向 vs 内核预测方向对拍 ──
+        // 必须在 ApplyToNpc/Projectile 之前做 —— Apply 之后值被我们改了会让对拍结果虚高
+        var records = new List<(uint Key, bool Consistent)>(preds.Count);
         foreach (var (key, delta) in preds)
         {
-            // delta=0 是内核弃权（confidence < threshold / 震荡 / 样本不足）
-            // 托管回退 OpPredictions 返回空帧 → preds.Count=0 已经在上层 return 了
-            if (delta is 0 or > 2)
+            if (delta is 0 or > 2) continue; // 内核弃权的 key 不记对拍
+
+            uint kind = LaneMap.KindOf(key);
+            int slot = LaneMap.SlotOf(key);
+            uint field = LaneMap.FieldOf(key);
+
+            bool consistent = kind switch
             {
-                continue;
-            }
+                LaneMap.KindNpc => CheckNpcConsistency(slot, field, delta),
+                LaneMap.KindProjectile => CheckProjectileConsistency(slot, field, delta),
+                _ => false, // Player 不接管，也不记对拍
+            };
+            // consistent=false 也照样回写 —— 这正是 fork 需要用来算置信度的数据
+            records.Add((key, consistent));
+        }
+
+        if (records.Count > 0)
+        {
+            // 托管回退 → 空 Submits，RuntimeShim.RecordOutcome 返回 true 统一成 OK
+            shim.RecordOutcome(records);
+            RecordedCount = records.Count;
+        }
+
+        // ── Phase 1.5：方向门接管（原版值已经读过，可以放心改了） ──
+        foreach (var (key, delta) in preds)
+        {
+            if (delta is 0 or > 2) continue;
 
             uint kind = LaneMap.KindOf(key);
             int slot = LaneMap.SlotOf(key);
@@ -98,45 +118,96 @@ internal sealed class EntityTakeover
             {
                 LaneMap.KindNpc => ApplyToNpc(slot, field, delta),
                 LaneMap.KindProjectile => ApplyToProjectile(slot, field, delta),
-                // Player 目前不接管（玩家 velocity 受玩家输入驱动，内核不该乱改）
                 _ => 0,
             };
 
             TakeoverCount += applied;
         }
 
-        if (settings.LogJobResults && TakeoverCount > 0)
+        if (settings.LogJobResults && (TakeoverCount > 0 || RecordedCount > 0))
         {
             TritRuntimeMod.Instance?.Logger?.Info(
-                $"[trit] 接管层：{preds.Count} 条预测 → {TakeoverCount} 条方向门已应用");
+                $"[trit] 接管层：{preds.Count} 预测 → 对拍 {RecordedCount} 条 → 方向门 {TakeoverCount} 条");
         }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 方向门实现
+    // 对拍（原版值方向 vs 内核预测方向）
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// <summary>对单个 NPC 的单个字段应用方向门。返回 1 表示实际改了值。</summary>
+    /// <summary>检查单个 NPC 某个字段的原版方向是否与内核 delta 一致。</summary>
+    private static bool CheckNpcConsistency(int slot, uint field, byte delta)
+    {
+        if (slot < 0 || slot >= Main.npc.Length) return false;
+        var npc = Main.npc[slot];
+        if (npc is null || !npc.active) return false;
+
+        float sign = delta == 2 ? +1f : -1f; // Pos→+1, Neg→-1
+
+        return field switch
+        {
+            LaneMap.FieldVelocityX => IsConsistent(npc.velocity.X, sign),
+            LaneMap.FieldVelocityY => IsConsistent(npc.velocity.Y, sign),
+            LaneMap.FieldDirection => IsConsistentDir(npc.direction, sign),
+            _ => false, // 不接管的字段也不记对拍（省对拍开销 + 省置信度历史噪声）
+        };
+    }
+
+    /// <summary>检查单个 Projectile 某个字段的原版方向是否与内核 delta 一致。</summary>
+    private static bool CheckProjectileConsistency(int slot, uint field, byte delta)
+    {
+        if (slot < 0 || slot >= Main.projectile.Length) return false;
+        var proj = Main.projectile[slot];
+        if (proj is null || !proj.active) return false;
+
+        float sign = delta == 2 ? +1f : -1f;
+
+        return field switch
+        {
+            LaneMap.FieldVelocityX => IsConsistent(proj.velocity.X, sign),
+            LaneMap.FieldVelocityY => IsConsistent(proj.velocity.Y, sign),
+            LaneMap.FieldDirection => IsConsistentDir(proj.direction, sign),
+            _ => false,
+        };
+    }
+
+    /// <summary>Pos 期望 ≥ 0，Neg 期望 ≤ 0。</summary>
+    private static bool IsConsistent(float value, float sign)
+    {
+        if (sign > 0) return value >= 0f;
+        if (sign < 0) return value <= 0f;
+        return true; // sign == 0（理论上不会进来）
+    }
+
+    /// <summary>direction 是 int -1/0/+1：Pos 期望 > 0（即 +1），Neg 期望 < 0（即 -1）。</summary>
+    private static bool IsConsistentDir(int direction, float sign)
+    {
+        if (sign > 0) return direction > 0;
+        if (sign < 0) return direction < 0;
+        return true;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 方向门接管（Phase 1.5，不变）
+    // ──────────────────────────────────────────────────────────────────────────
+
     private static int ApplyToNpc(int slot, uint field, byte delta)
     {
-        // Main.npc 总长度 = Main.npc.Length（NPC 是预分配数组，不是 active 数量）
         if (slot < 0 || slot >= Main.npc.Length) return 0;
         var npc = Main.npc[slot];
         if (npc is null || !npc.active) return 0;
 
-        float fdelta = delta == 2 ? +1f : -1f; // Pos→+1, Neg→-1
+        float fdelta = delta == 2 ? +1f : -1f;
 
         return field switch
         {
             LaneMap.FieldVelocityX => GateFloat(ref npc.velocity.X, fdelta),
             LaneMap.FieldVelocityY => GateFloat(ref npc.velocity.Y, fdelta),
             LaneMap.FieldDirection => GateDirection(ref npc.direction, delta),
-            // 其他字段（Life / Active / Position 等）不接管 —— 安全优先
             _ => 0,
         };
     }
 
-    /// <summary>对单个 Projectile 的单个字段应用方向门。返回 1 表示实际改了值。</summary>
     private static int ApplyToProjectile(int slot, uint field, byte delta)
     {
         if (slot < 0 || slot >= Main.projectile.Length) return 0;
@@ -154,31 +225,13 @@ internal sealed class EntityTakeover
         };
     }
 
-    /// <summary>
-    /// 方向门：Pos → 确保 <c>refVal ≥ 0</c>；Neg → 确保 <c>refVal ≤ 0</c>。
-    /// </summary>
-    /// <returns>1 表示本次修改了值，0 表示值已经在正确方向。</returns>
     private static int GateFloat(ref float value, float sign)
     {
-        if (sign > 0 && value < 0f)
-        {
-            value = -value; // 取反成正
-            return 1;
-        }
-
-        if (sign < 0 && value > 0f)
-        {
-            value = -value; // 取反成负
-            return 1;
-        }
-
+        if (sign > 0 && value < 0f) { value = -value; return 1; }
+        if (sign < 0 && value > 0f) { value = -value; return 1; }
         return 0;
     }
 
-    /// <summary>
-    /// direction 是 int（-1 / 0 / +1），方向门语义比 velocity 简单：
-    /// Pos → 强制 +1；Neg → 强制 -1。
-    /// </summary>
     private static int GateDirection(ref int direction, byte delta)
     {
         int target = delta == 2 ? +1 : -1;

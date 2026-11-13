@@ -150,6 +150,13 @@ public static class Opcode
     /// 托管回退路径（ManagedKernel）无 fork，返回 count=0（零开销降级）。
     /// </summary>
     public const uint Predictions = 0x1D;
+
+    /// <summary>
+    /// 置信度对拍回写：C# 侧对比原版结果 vs 内核预测方向，批量提交一致/不一致样本。
+    /// 载荷 <c>count u32, [key u32, consistent u8] * n</c>（consistent = 1 一致，0 不一致）。
+    /// 托管回退路径不做任何事（fork 不存在，置信度永远不被更新）。
+    /// </summary>
+    public const uint ConsistencyRecord = 0x1E;
 }
 
 /// <summary>查询编号，与 Rust 侧 <c>trit_rt::wire::query</c> 对齐。</summary>
