@@ -15,6 +15,7 @@ name = "trit_rt"
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
+trit-engine.workspace = true
 trit-core.workspace = true
 trit-codec.workspace = true
 trit-schedule.workspace = true

@@ -145,6 +145,52 @@ public sealed class TritSettings
     [JsonPropertyName("takeover")]
     public TakeoverMode Takeover { get; set; }
 
+    /// <summary>
+    /// 自动档：是否允许按长期对拍置信度自动升级 / 降级接管模式。
+    /// <para>关闭后接管档位只由玩家（命令 / 设置文件）决定，本字段不影响手动开关。</para>
+    /// </summary>
+    [JsonPropertyName("autoTakeover")]
+    public bool AutoTakeover { get; set; } = true;
+
+    /// <summary>自动升级需要连续观测的天数（墙钟时间，默认 30 天）。</summary>
+    [JsonPropertyName("autoUpgradeDays")]
+    public int AutoUpgradeDays { get; set; } = 30;
+
+    /// <summary>自动升级需要窗口一致率达到的比例（默认 0.95）。</summary>
+    [JsonPropertyName("autoUpgradeRatio")]
+    public double AutoUpgradeRatio { get; set; } = 0.95;
+
+    /// <summary>单 tick 一致率跌破该比例就立即自动降级（默认 0.80）。</summary>
+    [JsonPropertyName("autoDowngradeRatio")]
+    public double AutoDowngradeRatio { get; set; } = 0.80;
+
+    /// <summary>自动升级需要的最少窗口样本数（默认 10000，防止样本太少就升档）。</summary>
+    [JsonPropertyName("autoMinSamples")]
+    public long AutoMinSamples { get; set; } = 10_000;
+
+    /// <summary>
+    /// ObserveOnly 下的校准采样间隔（tick）。0 = 不校准（严格零开销）。
+    /// <para>自动升级的证据来自 L0 校准：只对拍、不应用，默认 1200 tick（约 20 秒）一次。</para>
+    /// </summary>
+    [JsonPropertyName("autoCalibrationIntervalTicks")]
+    public int AutoCalibrationIntervalTicks { get; set; } = 1200;
+
+    /// <summary>当前校准窗口的起点（Unix 秒）。0 = 尚未开始积累。</summary>
+    [JsonPropertyName("autoWindowStartUtc")]
+    public long AutoWindowStartUtc { get; set; }
+
+    /// <summary>当前校准窗口累计的对拍样本数。</summary>
+    [JsonPropertyName("autoSamples")]
+    public long AutoSamples { get; set; }
+
+    /// <summary>当前校准窗口累计的一致样本数（<see cref="AutoSamples"/> 的子集）。</summary>
+    [JsonPropertyName("autoConsistent")]
+    public long AutoConsistent { get; set; }
+
+    /// <summary>当前 L1 档位是否由自动升级设置（决定自动降级是否有权接管）。</summary>
+    [JsonPropertyName("autoManaged")]
+    public bool AutoManaged { get; set; }
+
     /// <summary>强制托管回退内核（诊断用：用于确认托管路径本身没问题）。</summary>
     [JsonPropertyName("forceManaged")]
     public bool ForceManaged { get; set; }
@@ -427,10 +473,38 @@ public sealed class TritSettings
             SnapshotIntervalTicks = Math.Max(SnapshotIntervalTicks, MobileSnapshotIntervalTicks);
         }
 
+        // ── 自动档参数 ──
+        // 天数 / 比例 / 样本数都是"护栏"：写错一个数不应该让自动档做出离谱决定。
+        AutoUpgradeDays = Clamp(AutoUpgradeDays, 1, 3650);
+        AutoUpgradeRatio = Clamp01(AutoUpgradeRatio);
+        AutoDowngradeRatio = Clamp01(AutoDowngradeRatio);
+        if (AutoDowngradeRatio > AutoUpgradeRatio)
+        {
+            AutoDowngradeRatio = AutoUpgradeRatio;
+        }
+
+        AutoMinSamples = AutoMinSamples < 1 ? 1 : Math.Min(AutoMinSamples, 1_000_000_000_000L);
+        AutoCalibrationIntervalTicks = Clamp(AutoCalibrationIntervalTicks, 0, 36000);
+        AutoWindowStartUtc = AutoWindowStartUtc < 0 ? 0 : AutoWindowStartUtc;
+        AutoSamples = AutoSamples < 0 ? 0 : AutoSamples;
+        AutoConsistent = AutoConsistent < 0 ? 0 : Math.Min(AutoConsistent, AutoSamples);
+
         // ── 接管模式合法性检查 ──
+        // ReplaceOrig（Phase 2 KernelFirst）置信度门槛更高 —— 必须 ≥ 99.99% 才能真的跳过 orig
+        // （内核预测如果有一次错，ReplaceOrig 直接把实体写炸）。
+        // PatchAfterOrig（Phase 1.5）门槛 95% —— 方向门只是修正，原版已经跑过一次正确值。
+        // 阈值维护在两处：EntityTakeover.cs 硬夹（C# 侧方向门）+
+        // TritRuntimeMod.BuildRuntimeConfigJson 传 confidence_threshold 给 Rust Fork.predict。
+        // Sanitize 只管枚举合法性（不会配个非法值就真的 ReplaceOrig）。
+
         if (!IsAndroidDevice)
         {
-            // 桌面：Phase 1 只实现了 ObserveOnly + PatchAfterOrig，ReplaceOrig 暂不开放。
+            // 桌面：Phase 2 MVP 不开放 ReplaceOrig —— 这是 KernelFirst，
+            // 在 PC 上原版 AI 开销不是瓶颈，没必要搞跳过 orig 的风险。
+            if (Takeover is TakeoverMode.ReplaceOrig)
+            {
+                Takeover = TakeoverMode.PatchAfterOrig;
+            }
             if (Takeover is not (TakeoverMode.ObserveOnly or TakeoverMode.PatchAfterOrig))
             {
                 Takeover = TakeoverMode.ObserveOnly;
@@ -438,9 +512,18 @@ public sealed class TritSettings
         }
         else
         {
-            // Android：默认 PatchAfterOrig。玩家可显式改回 ObserveOnly（关掉接管），
-            // 但禁止 ReplaceOrig（Phase 1 不实现，强夹避免崩溃）。
+            // Android：默认 PatchAfterOrig。玩家可以显式选 ReplaceOrig（实验性），
+            // 但 KernelFirst 置信度门槛必须 ≥ 99.99%（由 Rust TakeoverConfig 默认值保证）。
             if (Takeover is TakeoverMode.ReplaceOrig)
+            {
+                // 保留玩家选择，但 BuildRuntimeConfigJson 会传 "patch_after_orig" 的 mode 字符串 ——
+                // Rust 侧 TakeoverConfig.mode 字段决定 Fork.predict 的置信度门槛，
+                // ReplaceOrig 模式下 C# EntityTakeover 会从 GetActionPlan 里读 confidence，
+                // 只对 confidence >= 0.9999 的 key 跳过 orig。
+                // 这里只是 Sanitize 层的最小门禁（玩家 json 不能写 9999 以外的 value）。
+            }
+            // Android 玩家也可以显式改回 ObserveOnly（关掉接管）。禁止非法值。
+            if (Takeover > TakeoverMode.ReplaceOrig)
             {
                 Takeover = TakeoverMode.PatchAfterOrig;
             }
@@ -512,4 +595,6 @@ public sealed class TritSettings
     }
 
     private static int Clamp(int value, int min, int max) => value < min ? min : value > max ? max : value;
+
+    private static double Clamp01(double value) => double.IsNaN(value) ? 0d : value < 0d ? 0d : value > 1d ? 1d : value;
 }

@@ -50,6 +50,9 @@ internal sealed class TritHooks
     // 观测一旦持续抛异常，不节流就是每秒几万条带完整栈回溯的日志。
     private readonly ErrorThrottle hookErrorLog = new(MinLogIntervalSeconds);
 
+    /// <summary>是否启用 KernelFirst —— 只在 ReplaceOrig 模式（Android）下为 true。</summary>
+    private bool KernelFirstActive => settings.Takeover == TritSettings.TakeoverMode.ReplaceOrig;
+
     public TritHooks(TritRuntimeMod mod, TritSettings settings, WorldBridge bridge)
     {
         this.mod = mod;
@@ -70,6 +73,19 @@ internal sealed class TritHooks
         {
             npcAi = (orig, self) =>
             {
+                // KernelFirst: confidence >= 0.9999 的实体跳过 orig 直接写字段
+                if (KernelFirstActive)
+                {
+                    var takeover = mod.Takeover;
+                    if (takeover?.TryApplyKernelFirstToNpc(self) == true)
+                    {
+                        // KernelFirst 接管成功 —— 不调 orig(self)，只做观测计数
+                        Guarded("On_NPC.AI", bridge.NoteNpcAi);
+                        return;
+                    }
+                }
+
+                // PatchAfterOrig / ObserveOnly / KernelFirst fallback: 正常走 orig + 观测
                 orig(self);
                 Guarded("On_NPC.AI", bridge.NoteNpcAi);
             };
@@ -80,6 +96,19 @@ internal sealed class TritHooks
         {
             projectileUpdate = (orig, self, i) =>
             {
+                // KernelFirst: confidence >= 0.9999 的弹幕跳过 orig 直接写字段
+                if (KernelFirstActive)
+                {
+                    var takeover = mod.Takeover;
+                    if (takeover?.TryApplyKernelFirstToProjectile(self) == true)
+                    {
+                        // KernelFirst 接管成功 —— 不调 orig(self, i)，只做观测计数
+                        Guarded("On_Projectile.Update", bridge.NoteProjectileUpdate);
+                        return;
+                    }
+                }
+
+                // PatchAfterOrig / ObserveOnly / KernelFirst fallback: 正常走 orig + 观测
                 orig(self, i);
                 Guarded("On_Projectile.Update", bridge.NoteProjectileUpdate);
             };

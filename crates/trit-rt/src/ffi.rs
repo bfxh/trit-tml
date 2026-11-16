@@ -587,12 +587,61 @@ pub unsafe extern "C" fn tt_rt_record_outcome(handle: u64, payload: *const u8, l
     }
 }
 
+/// `0x1F ACTION_PLAN`：完整 intent 列表 + 置信度（每 key 多 4 字节 f32）。
+/// 和 tt_rt_predictions 签名相同 —— 返回帧（out, cap），载荷在内部组装。
+/// RuntimeConfig.takeover 为 None 时返回 count=0（零开销降级）。
+///
+/// # Safety
+///
+/// 指针参数必须由调用方保证有效：`out`/`cap` 指向可写内存，
+/// 缓冲区不足时回写所需长度并返回 `TT_ERR_BUFFER`。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tt_rt_action_plan(handle: u64, out: *mut u8, cap: usize) -> i32 {
+    let outcome = std::panic::catch_unwind(|| {
+        with_runtime(handle, |runtime| runtime.dispatch(op::ACTION_PLAN, &[]))
+    });
+    match outcome {
+        Ok(Ok(response)) => write_out(out, cap, &frame_response(&response)),
+        Ok(Err(error)) => error.status_code(),
+        Err(_) => TT_ERR_PANIC,
+    }
+}
+
+/// `0x20 STATE_PUSH`：整批推送实体状态（TritEnginePort 的输入）。
+///
+/// 载荷：`count u32, [定长 83 字节记录] * n`（见 `wire::STATE_RECORD_LEN`）。
+///
+/// 返回值：
+/// - `0` 全部 OK（包括 L0 零开销降级 —— 载荷被吞掉）
+/// - `TT_ERR_ARG` 载荷损坏（count 与字节数不匹配）—— 已有状态表未被改动
+/// - `TT_ERR_PANIC` Rust panic 穿透边界
+///
+/// # Safety
+///
+/// `payload` 必须是调用方提供的可读字节序列，不超过 `len` 长度。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tt_rt_push_states(handle: u64, payload: *const u8, len: u32) -> i32 {
+    #[allow(unsafe_op_in_unsafe_fn)]
+    let outcome = std::panic::catch_unwind(|| {
+        let bytes = if payload.is_null() || len == 0 {
+            &[] as &[u8]
+        } else {
+            std::slice::from_raw_parts(payload, len as usize)
+        };
+        with_runtime(handle, |runtime| runtime.dispatch(op::STATE_PUSH, bytes))
+    });
+    match outcome {
+        Ok(Ok(_)) => 0,
+        Ok(Err(error)) => error.status_code(),
+        Err(_) => TT_ERR_PANIC,
+    }
+}
+
 /// 能力位图；句柄非法返回 0。
 ///
 /// # Safety
 ///
-/// 指针参数必须由调用方保证有效：`payload`/`len` 指向可读内存，
-/// `out`/`cap` 指向可写内存（`out` 为空且 `cap` 为 0 时按「查询所需长度」处理）。
+/// 无指针参数，安全。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tt_rt_capabilities(handle: u64) -> u64 {
     let outcome = std::panic::catch_unwind(|| {

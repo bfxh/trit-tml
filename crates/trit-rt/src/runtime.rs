@@ -6,7 +6,7 @@
 //! - 它**从不持有** Player / NPC / Tile 等 Unity/tModLoader 对象；
 //! - 所有真实状态修改由 C# 在游戏主线程提交。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -295,6 +295,125 @@ pub struct TritRuntime {
     pool: Arc<JobPool>,
     /// 接管系统 fork（L1+）。`None` = L0 零开销（整个接管模块不初始化）。
     takeover_fork: Option<crate::takeover::WorldProjectionFork>,
+    /// TritEnginePort 的实体状态表（`STATE_PUSH` 每 tick 整批替换）。
+    /// 空表 = 引擎不参与，`ACTION_PLAN` 全走历史外推。
+    entity_states: BTreeMap<(u8, i32), EntityState>,
+}
+
+/// 一条实体状态（STATE_PUSH 推来的）。
+#[derive(Debug, Clone, Copy)]
+enum EntityState {
+    Npc(trit_engine::npc::NpcState),
+    Projectile(trit_engine::projectile::ProjectileState),
+}
+
+/// 引擎对某个车道键的态度。
+#[derive(Debug, Clone, Copy)]
+enum EngineOpinion {
+    /// 引擎不表态（sign=0 静止、或该字段不归引擎管）—— 仍然覆盖历史外推，避免旧结论继续生效。
+    Abstain,
+    /// 引擎给出方向 + 置信度（TritEnginePort 的置信度固定 1.0）。
+    Predict(Ternary, f32),
+}
+
+/// TritEnginePort 输出的置信度：引擎等价逻辑，不靠历史统计。
+const ENGINE_CONFIDENCE: f32 = 1.0;
+
+/// 查引擎对单个车道键的意见。
+///
+/// 返回 `None` = 引擎不管这个键（没有状态 / type 未 port / 字段不支持）→ 调用方保留历史外推。
+fn engine_opinion(
+    states: &BTreeMap<(u8, i32), EntityState>,
+    key: u32,
+    rand: &mut trit_engine::prng::Prng,
+) -> Option<EngineOpinion> {
+    use crate::takeover::lane;
+
+    let kind = lane::kind(key);
+    let slot = lane::slot(key);
+    let field = lane::field(key);
+
+    let sign = match states.get(&(kind, slot))? {
+        EntityState::Npc(state) => {
+            if !trit_engine::is_ported_npc_type(state.npc_type) {
+                return None;
+            }
+            let delta = trit_engine::npc_ai_step(state, rand);
+            match field {
+                lane::FIELD_VELOCITY_X => delta.velocity_x_sign,
+                lane::FIELD_VELOCITY_Y => delta.velocity_y_sign,
+                lane::FIELD_DIRECTION => delta.direction.map(|dir| dir as f32),
+                _ => None,
+            }
+        }
+        EntityState::Projectile(state) => {
+            if !trit_engine::is_ported_projectile_type(state.proj_type) {
+                return None;
+            }
+            let delta = trit_engine::projectile_update_step(state, rand);
+            match field {
+                lane::FIELD_VELOCITY_X => delta.velocity_x_sign,
+                lane::FIELD_VELOCITY_Y => delta.velocity_y_sign,
+                lane::FIELD_DIRECTION => delta.direction.map(|dir| dir as f32),
+                _ => None,
+            }
+        }
+    };
+
+    Some(match sign {
+        Some(v) if v > 0.0 => EngineOpinion::Predict(Ternary::True, ENGINE_CONFIDENCE),
+        Some(v) if v < 0.0 => EngineOpinion::Predict(Ternary::False, ENGINE_CONFIDENCE),
+        _ => EngineOpinion::Abstain,
+    })
+}
+
+/// 双轨预测：TritEnginePort 优先，历史外推兜底。
+///
+/// - 实体状态表为空（未 push / 托管回退 / 旧原生库）→ 纯历史外推，行为与 Phase 1 一致。
+/// - 已 port 的 type → 引擎算出的 sign（confidence 1.0），覆盖同 key 的历史外推结果。
+/// - 引擎对该 key 弃权（sign=0 或字段不支持）→ 同样覆盖，抑制历史外推的旧结论。
+/// - 未 port 的 type / 未 push 的实体 → 保留历史外推结果。
+fn merge_engine_predictions(
+    fork: &crate::takeover::WorldProjectionFork,
+    entity_states: &BTreeMap<(u8, i32), EntityState>,
+    tick: u64,
+) -> Vec<(u32, Ternary, f32)> {
+    let historical = fork.predict_all();
+    if entity_states.is_empty() {
+        return historical;
+    }
+
+    let keys = fork.keys();
+    if keys.is_empty() {
+        return historical;
+    }
+
+    // 引擎 PRNG 按 tick 播种：同 tick 内可复现，且不污染主 PRNG 流。
+    let mut rand = trit_engine::prng::Prng::new(tick.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut covered = BTreeSet::new();
+    let mut merged: Vec<(u32, Ternary, f32)> = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        match engine_opinion(entity_states, key, &mut rand) {
+            Some(EngineOpinion::Predict(trit, conf)) => {
+                covered.insert(key);
+                merged.push((key, trit, conf));
+            }
+            Some(EngineOpinion::Abstain) => {
+                covered.insert(key);
+            }
+            None => {}
+        }
+    }
+
+    for (key, trit, conf) in historical {
+        if !covered.contains(&key) {
+            merged.push((key, trit, conf));
+        }
+    }
+
+    merged.sort_by_key(|(key, _, _)| *key);
+    merged
 }
 
 impl TritRuntime {
@@ -324,6 +443,7 @@ impl TritRuntime {
             ai_model: None,
             pool,
             takeover_fork,
+            entity_states: BTreeMap::new(),
         }
     }
 
@@ -410,6 +530,8 @@ impl TritRuntime {
             op::TXN_APPLY => self.op_txn_apply(payload),
             op::PREDICTIONS => self.op_predictions(),
             op::CONSISTENCY_RECORD => self.op_consistency_record(payload),
+            op::ACTION_PLAN => self.op_action_plan(),
+            op::STATE_PUSH => self.op_state_push(payload),
             _ => Err(RtError::InvalidInput(format!("未知 opcode {opcode:#x}"))),
         };
         if let Err(error) = &result {
@@ -456,6 +578,7 @@ impl TritRuntime {
         self.event_payload_trits = 0;
         self.shadow = ShadowLog::default();
         self.prng = DeterministicPrng::new(0);
+        self.entity_states = BTreeMap::new();
         self.tick = 0;
         self.last_error.clear();
         self.pool.reset_session();
@@ -677,11 +800,133 @@ impl TritRuntime {
 
         let mut writer = Writer::new();
         writer.u32(preds.len() as u32);
-        for (key, trit) in preds {
+        for (key, trit, _conf) in preds {
             writer.u32(key);
             writer.u8(wire::trit_byte(trit));
         }
         Ok(writer.into_vec())
+    }
+
+    /// `0x1F ACTION_PLAN`：完整 intent 列表 + 置信度。
+    /// 和 op_predictions 复用同一个 fork.predict_all()（避免 clone 世界投影两次），
+    /// 区别只在于返回格式多了 `confidence f32(IEEE754)` 每 key 4 字节。
+    fn op_action_plan(&mut self) -> Result<Vec<u8>, RtError> {
+        let Some(fork) = self.takeover_fork.as_mut() else {
+            let mut w = Writer::new();
+            w.u32(0);
+            return Ok(w.into_vec());
+        };
+
+        let interval = self
+            .config
+            .takeover
+            .as_ref()
+            .map(|tc| tc.prediction_interval_ticks)
+            .unwrap_or(1);
+        if interval > 0 && !self.tick.is_multiple_of(interval as u64) {
+            let mut w = Writer::new();
+            w.u32(0);
+            return Ok(w.into_vec());
+        }
+
+        fork.refresh_world(&self.world);
+        let preds = merge_engine_predictions(fork, &self.entity_states, self.tick);
+
+        let mut writer = Writer::new();
+        writer.u32(preds.len() as u32);
+        for (key, trit, conf) in preds {
+            writer.u32(key);
+            writer.u8(wire::trit_byte(trit));
+            // f32 IEEE754 → u32 little-endian。C# 侧用 BinaryPrimitives.ReadSingleLittleEndian 读回。
+            writer.u32(conf.to_bits());
+        }
+        Ok(writer.into_vec())
+    }
+
+    /// `0x20 STATE_PUSH`：整批替换实体状态表（TritEnginePort 的输入）。
+    ///
+    /// 零开销降级：`takeover_fork == None`（L0）直接吞掉载荷，不解析、不建表。
+    /// 载荷损坏（count 与字节数不匹配）→ InvalidInput，且**不改动**已有状态表。
+    fn op_state_push(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
+        if self.takeover_fork.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let mut reader = Reader::new(payload);
+        let count = reader.u32()? as usize;
+        let expected = count
+            .checked_mul(wire::STATE_RECORD_LEN)
+            .ok_or_else(|| RtError::InvalidInput("STATE_PUSH count 溢出".to_string()))?;
+        let actual = payload.len().saturating_sub(4);
+        if actual != expected {
+            return Err(RtError::InvalidInput(format!(
+                "STATE_PUSH 长度不匹配：count={count} 期望 {expected} 字节，实际 {actual}"
+            )));
+        }
+
+        let mut states: BTreeMap<(u8, i32), EntityState> = BTreeMap::new();
+        for _ in 0..count {
+            let kind = reader.u8()?;
+            let slot = reader.i32()?;
+            let entity_type = reader.i32()?;
+            let velocity_x = reader.f32()?;
+            let velocity_y = reader.f32()?;
+            let position_x = reader.f32()?;
+            let position_y = reader.f32()?;
+            let direction = reader.i32()?;
+            let life = reader.i32()?;
+            let life_max = reader.i32()?;
+            let target = reader.i32()?;
+            let mut ai = [0.0f32; 8];
+            for value in &mut ai {
+                *value = reader.f32()?;
+            }
+            let walk_speed = reader.f32()?;
+            let target_distance = reader.f32()?;
+            let tile_below = reader.u8()? != 0;
+            let on_ground = reader.u8()? != 0;
+
+            let state = match kind {
+                crate::takeover::lane::KIND_NPC => EntityState::Npc(trit_engine::npc::NpcState {
+                    npc_type: entity_type,
+                    velocity_x,
+                    velocity_y,
+                    position_x,
+                    position_y,
+                    direction,
+                    life,
+                    life_max,
+                    target,
+                    ai,
+                    walk_speed,
+                    target_distance,
+                    tile_below,
+                    on_ground,
+                }),
+                crate::takeover::lane::KIND_PROJECTILE => {
+                    EntityState::Projectile(trit_engine::projectile::ProjectileState {
+                        proj_type: entity_type,
+                        velocity_x,
+                        velocity_y,
+                        position_x,
+                        position_y,
+                        direction,
+                        ai: [ai[0], ai[1]],
+                        // Projectile 记录里 `on_ground` 字节复用为 `active`
+                        active: on_ground,
+                        tile_below,
+                        target,
+                        gravity: 0.08,
+                    })
+                }
+                // Player 等种类暂不参与引擎（字段语义不同），整条忽略。
+                _ => continue,
+            };
+            states.insert((kind, slot), state);
+        }
+
+        self.entity_states = states;
+        Ok(Vec::new())
     }
 
     /// `0x1E CONSISTENCY_RECORD`：批量回写置信度对拍结果。
@@ -1671,5 +1916,167 @@ mod tests {
             "无快照时日志未保持有界：len={}",
             rt.log_len()
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Phase 2 TritEnginePort：STATE_PUSH + 双轨预测
+    // ──────────────────────────────────────────────────────────────────────
+
+    fn takeover_runtime() -> TritRuntime {
+        let config = RuntimeConfig {
+            takeover: Some(crate::takeover::TakeoverConfig {
+                mode: crate::takeover::TakeoverMode::PatchAfterOrig,
+                prediction_interval_ticks: 1,
+                ..crate::takeover::TakeoverConfig::default()
+            }),
+            ..RuntimeConfig::default()
+        };
+        TritRuntime::new(config)
+    }
+
+    /// 造一条 83 字节实体状态记录（顺序与 `wire::STATE_RECORD_LEN` 严格一致）。
+    fn state_record(kind: u8, slot: i32, entity_type: i32, direction: i32) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(kind);
+        w.i32(slot);
+        w.i32(entity_type);
+        w.f32(1.0).f32(0.0).f32(0.0).f32(0.0); // velocity_x/y, position_x/y
+        w.i32(direction);
+        w.i32(100).i32(100); // life, life_max
+        w.i32(0); // target
+        for _ in 0..8 {
+            w.f32(0.0); // ai
+        }
+        w.f32(2.0); // walk_speed
+        w.f32(300.0); // target_distance
+        w.u8(1); // tile_below
+        w.u8(1); // on_ground（Projectile 记录里读作 active）
+        w.into_vec()
+    }
+
+    fn lane_key(kind: u8, slot: i32, field: u32) -> u32 {
+        ((kind as u32) << 28) | ((slot as u32) << 12) | field
+    }
+
+    /// 解析 ACTION_PLAN 响应为 (key, delta, confidence) 列表。
+    fn read_action_plan(out: &[u8]) -> Vec<(u32, u8, f32)> {
+        let mut r = Reader::new(out);
+        let count = r.u32().unwrap() as usize;
+        let mut preds = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key = r.u32().unwrap();
+            let delta = r.u8().unwrap();
+            let conf = f32::from_bits(r.u32().unwrap());
+            preds.push((key, delta, conf));
+        }
+        preds
+    }
+
+    /// L0（无 fork）必须整包吞掉 STATE_PUSH：不解析、不建表、不报错。
+    #[test]
+    fn state_push_is_a_noop_without_takeover() {
+        let mut rt = default_runtime();
+        let mut w = Writer::new();
+        w.u32(1).u8(1); // count=1，后面故意什么都不给
+        let out = rt.dispatch(op::STATE_PUSH, &w.into_vec()).unwrap();
+        assert!(out.is_empty());
+        assert!(rt.entity_states.is_empty());
+    }
+
+    /// count 与字节数不匹配必须拒绝，且不能污染已有状态表。
+    #[test]
+    fn state_push_rejects_truncated_payload() {
+        let mut rt = takeover_runtime();
+        let good = {
+            let mut w = Writer::new();
+            w.u32(1);
+            w.bytes(&state_record(1, 0, 3, 1));
+            w.into_vec()
+        };
+        rt.dispatch(op::STATE_PUSH, &good).unwrap();
+        assert_eq!(rt.entity_states.len(), 1);
+
+        let bad = {
+            let mut w = Writer::new();
+            w.u32(1);
+            w.u8(1);
+            w.into_vec()
+        };
+        let error = rt.dispatch(op::STATE_PUSH, &bad).unwrap_err();
+        assert!(matches!(error, RtError::InvalidInput(_)), "{error}");
+        assert_eq!(rt.entity_states.len(), 1, "损坏载荷不能改动已有状态表");
+    }
+
+    /// 引擎接管已 port 的 type：sign 明确的车道给 confidence 1.0，
+    /// 弃权车道（velocity_y=0）被抑制，不落回历史外推。
+    #[test]
+    fn engine_predictions_override_history_with_full_confidence() {
+        let mut rt = takeover_runtime();
+        let vel_x = lane_key(
+            crate::takeover::lane::KIND_NPC,
+            0,
+            crate::takeover::lane::FIELD_VELOCITY_X,
+        );
+        let vel_y = lane_key(
+            crate::takeover::lane::KIND_NPC,
+            0,
+            crate::takeover::lane::FIELD_VELOCITY_Y,
+        );
+        let dir_key = lane_key(
+            crate::takeover::lane::KIND_NPC,
+            0,
+            crate::takeover::lane::FIELD_DIRECTION,
+        );
+        for key in [vel_x, vel_y, dir_key] {
+            let mut w = Writer::new();
+            w.u64(0).u32(key).u8(2);
+            rt.dispatch(op::TXN_SUBMIT, &w.into_vec()).unwrap();
+        }
+
+        // Zombie（type 3）：朝 direction=1 追击，velocity_y 不给意见。
+        let push = {
+            let mut w = Writer::new();
+            w.u32(1);
+            w.bytes(&state_record(1, 0, 3, 1));
+            w.into_vec()
+        };
+        rt.dispatch(op::STATE_PUSH, &push).unwrap();
+
+        let preds = read_action_plan(&rt.dispatch(op::ACTION_PLAN, b"").unwrap());
+        assert_eq!(
+            preds.len(),
+            2,
+            "只应输出 velX 和 direction，velY 被引擎抑制"
+        );
+        assert_eq!(preds[0].0, vel_x);
+        assert_eq!(preds[0].1, wire::trit_byte(Ternary::True));
+        assert_eq!(preds[0].2, 1.0);
+        assert_eq!(preds[1].0, dir_key);
+        assert_eq!(preds[1].1, wire::trit_byte(Ternary::True));
+        assert!(preds.iter().all(|(key, _, _)| *key != vel_y));
+    }
+
+    /// 未 port 的 type 不参与引擎：无历史样本 ⇒ ACTION_PLAN 为空（行为与 Phase 1 一致）。
+    #[test]
+    fn unported_types_fall_back_to_history() {
+        let mut rt = takeover_runtime();
+        let vel_x = lane_key(
+            crate::takeover::lane::KIND_NPC,
+            0,
+            crate::takeover::lane::FIELD_VELOCITY_X,
+        );
+        let mut w = Writer::new();
+        w.u64(0).u32(vel_x).u8(2);
+        rt.dispatch(op::TXN_SUBMIT, &w.into_vec()).unwrap();
+
+        let push = {
+            let mut w = Writer::new();
+            w.u32(1);
+            w.bytes(&state_record(1, 0, 9999, 1));
+            w.into_vec()
+        };
+        rt.dispatch(op::STATE_PUSH, &push).unwrap();
+
+        assert!(read_action_plan(&rt.dispatch(op::ACTION_PLAN, b"").unwrap()).is_empty());
     }
 }

@@ -44,9 +44,9 @@ public sealed class TritCommand : ModCommand
 
     public override CommandType Type => CommandType.World | CommandType.Console;
 
-    public override string Usage => "trit <status|gpu|mem|budget|metrics|jobs|cancel|scan|help> [参数]";
+    public override string Usage => "trit <status|gpu|takeover|mem|budget|metrics|jobs|cancel|scan|help> [参数]";
 
-    public override string Description => "旁路三进制运行时：总览、GPU、内存、预算、任务与扫描。";
+    public override string Description => "旁路三进制运行时：总览、GPU、接管、内存、预算、任务与扫描。";
 
     public override void Action(CommandCaller caller, string input, string[] args)
     {
@@ -62,6 +62,10 @@ public sealed class TritCommand : ModCommand
 
                 case "gpu":
                     Gpu(caller, args);
+                    break;
+
+                case "takeover":
+                    Takeover(caller, args);
                     break;
 
                 case "budget":
@@ -204,6 +208,193 @@ public sealed class TritCommand : ModCommand
             Error(caller, "命令失败：" + ex.Message);
         }
     }
+
+    /// <summary>接管模式：查看 / 开关 / 对拍统计。</summary>
+    private static void Takeover(CommandCaller caller, string[] args)
+    {
+        try
+        {
+            if (!Require(caller, out TritRuntimeMod? mod, out RuntimeShim? shim))
+            {
+                return;
+            }
+
+            string arg = args.Length > 1 ? args[1].Trim().ToLowerInvariant() : string.Empty;
+            switch (arg)
+            {
+                case "":
+                case "status":
+                    PrintTakeover(caller, mod!, shim!);
+                    return;
+
+                case "stats":
+                    PrintTakeoverStats(caller, mod!);
+                    return;
+
+                case "on":
+                case "off":
+                    ApplyTakeoverMode(caller, mod!, arg == "on");
+                    return;
+
+                case "auto":
+                    if (args.Length < 3)
+                    {
+                        Say(caller, "用法：trit takeover auto on|off", Color.Yellow);
+                        return;
+                    }
+
+                    string autoValue = args[2].Trim().ToLowerInvariant();
+                    if (autoValue is not ("on" or "off"))
+                    {
+                        Say(caller, "用法：trit takeover auto on|off", Color.Yellow);
+                        return;
+                    }
+
+                    ApplyTakeoverAuto(caller, mod!, autoValue == "on");
+                    return;
+
+                default:
+                    Say(caller, "takeover 子命令只接受：on / off / auto on|off / status / stats（不带参数 = 看状态）。", Color.Yellow);
+                    return;
+            }
+        }
+        catch (Exception ex)
+        {
+            Error(caller, "命令失败：" + ex.Message);
+        }
+    }
+
+    /// <summary>接管状态：设置值、内核是否带配置、门槛。</summary>
+    private static void PrintTakeover(CommandCaller caller, TritRuntimeMod mod, RuntimeShim shim)
+    {
+        TritSettings settings = mod.Settings;
+        Say(caller,
+            $"[takeover] 模式={ModeName(settings.Takeover)} 内核={shim.Mode} " +
+            $"启动时已加载接管配置={OnOff(mod.KernelTakeoverConfigured)} " +
+            $"接管层={(mod.Takeover is null ? "未创建" : "已创建")}");
+        Say(caller, "  门槛：PatchAfterOrig≥0.95，KernelFirst≥0.9999；ReplaceOrig 仅 Android 生效（桌面会被夹回 PatchAfterOrig）",
+            Color.Gray);
+        Say(caller, "  " + (mod.AutoPilot?.Describe() ?? "自动档=未装载"), Color.Gray);
+
+        bool wantsKernelPredictions =
+            settings.Takeover != TritSettings.TakeoverMode.ObserveOnly ||
+            (settings.AutoTakeover && settings.AutoCalibrationIntervalTicks > 0);
+        if (wantsKernelPredictions && !mod.KernelTakeoverConfigured)
+        {
+            Say(caller, "  注意：内核启动时没有加载 takeover 配置，本会话不会产生预测（校准 / 接管都不会生效）—— 重进世界后生效。",
+                Color.Yellow);
+        }
+    }
+
+    /// <summary>对拍统计：本 tick 与进程内累计的一致率、接管数。</summary>
+    private static void PrintTakeoverStats(CommandCaller caller, TritRuntimeMod mod)
+    {
+        EntityTakeover? takeover = mod.Takeover;
+        if (takeover is null)
+        {
+            Say(caller,
+                "接管层未创建（当前是 ObserveOnly 且自动档已关闭 / 校准间隔为 0，或本次装配失败）" +
+                "——先 trit takeover on 或 trit takeover auto on，重进世界后才有统计。",
+                Color.Yellow);
+            return;
+        }
+
+        EntityTakeover.TakeoverSnapshot stats = takeover.Snapshot();
+        Say(caller,
+            $"[takeover] 本 tick：plan={stats.TickPlans} 对拍={stats.TickRecorded} " +
+            $"一致={stats.TickConsistent} 方向门={stats.TickTakeovers} KernelFirst={stats.TickKernelFirst}");
+        Say(caller,
+            $"  累计：plan={stats.TotalPlans} 对拍={stats.TotalRecorded} 一致={stats.TotalConsistent} " +
+            $"一致率={stats.ConsistencyRate:P1} 方向门={stats.TotalTakeovers} " +
+            $"KernelFirst={stats.TotalKernelFirst}",
+            Color.Gray);
+        Say(caller, "  " + (mod.AutoPilot?.Describe() ?? "自动档=未装载"), Color.Gray);
+    }
+
+    /// <summary>切换接管开关并写回设置文件。</summary>
+    private static void ApplyTakeoverMode(CommandCaller caller, TritRuntimeMod mod, bool on)
+    {
+        TritSettings settings = mod.Settings;
+        TritSettings.TakeoverMode before = settings.Takeover;
+        TritSettings.TakeoverMode target = on
+            ? TritSettings.TakeoverMode.PatchAfterOrig
+            : TritSettings.TakeoverMode.ObserveOnly;
+
+        if (before == target)
+        {
+            Say(caller, $"接管模式已经是 {ModeName(target)}。", Color.Gray);
+            return;
+        }
+
+        settings.Takeover = target;
+        // 玩家手动改档位：自动档交还控制权（不会被自动降级覆盖），升级窗口重新积累。
+        settings.AutoManaged = false;
+        mod.AutoPilot?.ResetWindow();
+        bool saved = settings.Save(out string warning);
+        Say(caller,
+            $"接管模式 {ModeName(before)} → {ModeName(target)}" + (saved ? "（已写回设置文件）" : "（仅本次会话）"),
+            Color.Green);
+        if (!string.IsNullOrWhiteSpace(warning))
+        {
+            Say(caller, "  写入设置时有问题：" + warning, Color.Yellow);
+        }
+
+        if (on && !mod.KernelTakeoverConfigured)
+        {
+            // 内核配置在 Attach 时烘焙，没有热重载路径。
+            Say(caller, "  内核启动时没有加载 takeover 配置，本会话不会产生预测 —— 请重进世界后生效。", Color.Yellow);
+        }
+        else if (!on)
+        {
+            Say(caller, "  已立即停止接管：钩子全部回到 orig，内核预测不再被应用。", Color.Gray);
+        }
+    }
+
+    /// <summary>自动档开关：写回设置文件；重新打开时从零开始积累升级窗口。</summary>
+    private static void ApplyTakeoverAuto(CommandCaller caller, TritRuntimeMod mod, bool on)
+    {
+        TritSettings settings = mod.Settings;
+        if (settings.AutoTakeover == on)
+        {
+            Say(caller, $"自动档已经是 {OnOff(on)}。", Color.Gray);
+            return;
+        }
+
+        settings.AutoTakeover = on;
+        if (on)
+        {
+            // 重新打开自动档 = 重新积累证据，不复用之前的窗口（可能早已过期）。
+            mod.AutoPilot?.ResetWindow();
+        }
+
+        bool saved = settings.Save(out string warning);
+        Say(caller,
+            $"自动档 {OnOff(on)}" + (saved ? "（已写回设置文件）" : "（仅本次会话）"),
+            Color.Green);
+        if (!string.IsNullOrWhiteSpace(warning))
+        {
+            Say(caller, "  写入设置时有问题：" + warning, Color.Yellow);
+        }
+
+        if (on && !mod.KernelTakeoverConfigured)
+        {
+            // 校准需要内核产出预测，而内核配置在 Attach 时烘焙。
+            Say(caller, "  内核启动时没有加载 takeover 配置，本会话无法校准 —— 请重进世界后开始积累升级窗口。",
+                Color.Yellow);
+        }
+        else if (!on)
+        {
+            Say(caller, "  已停止自动管理：当前接管档位保持不变，后续只由 trit takeover on|off 决定。", Color.Gray);
+        }
+    }
+
+    /// <summary>接管模式的可读名（与设置文件里的取值一致）。</summary>
+    private static string ModeName(TritSettings.TakeoverMode mode) => mode switch
+    {
+        TritSettings.TakeoverMode.PatchAfterOrig => "patch_after_orig",
+        TritSettings.TakeoverMode.ReplaceOrig => "replace_orig",
+        _ => "observe_only",
+    };
 
     /// <summary>全局资源预算：容量 + 各模组账本。</summary>
     private static void Budget(CommandCaller caller)
@@ -550,6 +741,10 @@ public sealed class TritCommand : ModCommand
             Say(caller, "  trit gpu                    GPU 状态（adapter/backend/policy/对拍）", Color.Gray);
             Say(caller, "  trit gpu on|off|auto        切换策略并写回设置文件", Color.Gray);
             Say(caller, "  trit gpu probe              强制重新探测（会卡一下，几百毫秒）", Color.Gray);
+            Say(caller, "  trit takeover [status]      接管模式 / 自动档 / 内核配置 / 门槛", Color.Gray);
+            Say(caller, "  trit takeover on|off        手动开关 L1 并写回设置文件（on 需内核已加载接管配置）", Color.Gray);
+            Say(caller, "  trit takeover auto on|off   自动档：长期置信度达标自动升 L1，异常自动降回 L0", Color.Gray);
+            Say(caller, "  trit takeover stats         本 tick + 累计：plan / 对拍 / 一致率 / 接管数 / 升级窗口", Color.Gray);
             Say(caller, "  trit budget                 全局预算与各模组账本", Color.Gray);
             Say(caller, "  trit mem                    整进程工作集 / 托管堆 / 内核常驻 / 预算旋钮", Color.Gray);
             Say(caller, "  trit metrics                最近一轮任务池指标（Prometheus，截断）", Color.Gray);

@@ -2,6 +2,7 @@
 
 using System.Buffers.Binary;
 using TritRuntime.Wire;
+using WireFormat = TritRuntime.Wire.Wire;
 
 namespace TritRuntime.Kernel;
 
@@ -436,6 +437,99 @@ public sealed class RuntimeShim : IDisposable
         var response = host.Kernel.Submit(Opcode.ConsistencyRecord, payload);
         // 托管回退 OpPredictions 返回空 response（无 payload）—— 这里返回 true 让调用方安心
         return response.IsOk || response.Payload.Length == 0;
+    }
+
+    /// <summary>
+    /// 获取完整 intent 列表 + 每条的置信度（Phase 2 L2 ActionPlan）。
+    ///
+    /// 返回 <c>(Key, Delta, Confidence)</c> 列表。
+    /// <list type="bullet">
+    /// <item><c>Delta = 1</c> = Neg（方向门：≤ 0）</item>
+    /// <item><c>Delta = 2</c> = Pos（方向门：≥ 0）</item>
+    /// <item><c>Confidence</c> = 0.0..1.0 —— 用 confidence ≥ 阈值决定是否真正跳过 orig</item>
+    /// </list>
+    /// 零开销降级同 GetPredictions：ManagedKernel 空帧 / 旧版原生库不认识 opcode / 载荷损坏 → 空列表。
+    /// </summary>
+    public IReadOnlyList<(uint Key, byte Delta, float Confidence)> GetActionPlan()
+    {
+        var response = host.Kernel.Submit(Opcode.ActionPlan, Array.Empty<byte>());
+        if (!response.IsOk || response.Payload.Length < 4)
+        {
+            return Array.Empty<(uint, byte, float)>();
+        }
+
+        var payload = response.Payload;
+        int count = BinaryPrimitives.ReadInt32LittleEndian(payload.AsSpan(0, 4));
+        if (count <= 0) return Array.Empty<(uint, byte, float)>();
+
+        // 每条 = 4 bytes key + 1 byte delta + 4 bytes confidence(f32) = 9 bytes
+        int expected = 4 + (count * 9);
+        if (payload.Length < expected)
+        {
+            return Array.Empty<(uint, byte, float)>();
+        }
+
+        var result = new (uint, byte, float)[count];
+        for (int i = 0; i < count; i++)
+        {
+            int offset = 4 + (i * 9);
+            uint key = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(offset, 4));
+            byte delta = payload[offset + 4];
+            float conf = BinaryPrimitives.ReadSingleLittleEndian(payload.AsSpan(offset + 5, 4));
+            result[i] = (key, delta, conf);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 推送本 tick 的实体状态快照（Phase 2 TritEnginePort）。
+    ///
+    /// 内核拿这批状态跑 `trit-engine` 的原版等价 AI，下一次
+    /// <see cref="GetActionPlan"/> 就会返回置信度 1.0 的引擎预测。
+    /// 整批<b>替换</b>上一 tick 的状态表，所以每 tick 都要传全量（而不是增量）；
+    /// 没有实体时传空列表即可清空。
+    ///
+    /// 零开销降级：<c>takeover</c> 为 <c>None</c>（L0）时内核整包忽略；
+    /// 托管回退与旧版原生库返回 <see langword="false"/>，调用方跳过即可。
+    /// </summary>
+    /// <returns><see langword="true"/> = 内核接受了这批状态。</returns>
+    public bool PushEntityStates(IReadOnlyList<EntitySnapshot> states)
+    {
+        int count = states.Count;
+        var writer = new WireWriter(4 + (count * WireFormat.StateRecordLength));
+        writer.U32((uint)count);
+        for (int i = 0; i < count; i++)
+        {
+            var state = states[i];
+            writer
+                .U8(state.Kind)
+                .I32(state.Slot)
+                .I32(state.Type)
+                .F32(state.VelocityX)
+                .F32(state.VelocityY)
+                .F32(state.PositionX)
+                .F32(state.PositionY)
+                .I32(state.Direction)
+                .I32(state.Life)
+                .I32(state.LifeMax)
+                .I32(state.Target)
+                .F32(state.Ai0)
+                .F32(state.Ai1)
+                .F32(state.Ai2)
+                .F32(state.Ai3)
+                .F32(state.Ai4)
+                .F32(state.Ai5)
+                .F32(state.Ai6)
+                .F32(state.Ai7)
+                .F32(state.WalkSpeed)
+                .F32(state.TargetDistance)
+                .U8(state.TileBelow ? (byte)1 : (byte)0)
+                .U8(state.OnGround ? (byte)1 : (byte)0);
+        }
+
+        var response = host.Kernel.Submit(Opcode.StatePush, writer.ToArray());
+        return response.IsOk;
     }
 
     /// <summary>
@@ -877,4 +971,95 @@ internal static class Args
 
     private static ArgumentException Type(object? value, string name, string command, string expected) =>
         new($"命令 {command} 的参数 {name} 需要 {expected}，实际是 {value?.GetType().Name ?? "null"}");
+}
+
+/// <summary>实体状态记录的种类，与 Rust <c>takeover::lane::KIND_*</c> 一致。</summary>
+public static class EntityKinds
+{
+    /// <summary>NPC（对应 trit-engine 的 <c>NpcState</c>）。</summary>
+    public const byte Npc = 1;
+
+    /// <summary>弹幕（对应 trit-engine 的 <c>ProjectileState</c>）。</summary>
+    public const byte Projectile = 2;
+}
+
+/// <summary>
+/// 一条实体状态快照，对应 STATE_PUSH 的定长记录（<see cref="WireFormat.StateRecordLength"/> 字节）。
+/// 字段顺序即线上顺序，不能调整。
+/// </summary>
+/// <remarks>
+/// Projectile 复用部分字段：<see cref="Target"/> = 追踪目标、
+/// <see cref="OnGround"/> = <c>active</c>、<see cref="TileBelow"/> = 脚下有方块；
+/// 重力在内核侧固定 0.08。<see cref="Ai2"/>..<see cref="Ai7"/> 目前引擎未使用，填 0 即可。
+/// </remarks>
+public struct EntitySnapshot
+{
+    /// <summary>种类，见 <see cref="EntityKinds"/>。</summary>
+    public byte Kind;
+
+    /// <summary>世界内槽位（<c>whoAmI</c>）。</summary>
+    public int Slot;
+
+    /// <summary>实体类型（<c>npc.type</c> / <c>projectile.type</c>）。</summary>
+    public int Type;
+
+    /// <summary>水平速度。</summary>
+    public float VelocityX;
+
+    /// <summary>垂直速度。</summary>
+    public float VelocityY;
+
+    /// <summary>X 坐标。</summary>
+    public float PositionX;
+
+    /// <summary>Y 坐标。</summary>
+    public float PositionY;
+
+    /// <summary>朝向（-1 / 1）。</summary>
+    public int Direction;
+
+    /// <summary>剩余生命周期。</summary>
+    public int Life;
+
+    /// <summary>生命周期上限。</summary>
+    public int LifeMax;
+
+    /// <summary>目标槽位（<c>-1</c> = 无目标）。</summary>
+    public int Target;
+
+    /// <summary><c>ai[0]</c>（史莱姆跳跃计时等）。</summary>
+    public float Ai0;
+
+    /// <summary><c>ai[1]</c>。</summary>
+    public float Ai1;
+
+    /// <summary><c>ai[2]</c>（引擎暂未使用）。</summary>
+    public float Ai2;
+
+    /// <summary><c>ai[3]</c>（引擎暂未使用）。</summary>
+    public float Ai3;
+
+    /// <summary><c>ai[4]</c>（引擎暂未使用）。</summary>
+    public float Ai4;
+
+    /// <summary><c>ai[5]</c>（引擎暂未使用）。</summary>
+    public float Ai5;
+
+    /// <summary><c>ai[6]</c>（引擎暂未使用）。</summary>
+    public float Ai6;
+
+    /// <summary><c>ai[7]</c>（引擎暂未使用）。</summary>
+    public float Ai7;
+
+    /// <summary>行走速度。</summary>
+    public float WalkSpeed;
+
+    /// <summary>到目标的距离。</summary>
+    public float TargetDistance;
+
+    /// <summary>脚下是否有方块。</summary>
+    public bool TileBelow;
+
+    /// <summary>是否站在地面（Projectile 复用为 <c>active</c>）。</summary>
+    public bool OnGround;
 }

@@ -846,6 +846,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "trit-engine"
+version = "0.1.0"
+
+[[package]]
 name = "trit-gpu"
 version = "0.12.0"
 dependencies = [
@@ -875,6 +879,7 @@ dependencies = [
  "thiserror",
  "trit-codec",
  "trit-core",
+ "trit-engine",
  "trit-gpu",
  "trit-net",
  "trit-schedule",

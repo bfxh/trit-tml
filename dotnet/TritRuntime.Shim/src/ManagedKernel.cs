@@ -1254,6 +1254,10 @@ public sealed class ManagedKernel : ITritKernel
             Opcode.Predictions => OpPredictions(),
             // 托管回退没有 fork，直接吞掉（没有置信度需要回写）
             Opcode.ConsistencyRecord => new byte[0],
+            // ActionPlan 同理 —— 托管回退没有 fork，没有 intent 可输出
+            Opcode.ActionPlan => new byte[0],
+            // 托管回退没有 trit-engine，实体状态无处可用，整包吞掉
+            Opcode.StatePush => new byte[0],
             _ => throw new RtException(Status.Arg, $"输入非法：未知 opcode {opcode:#x}"),
         };
     }

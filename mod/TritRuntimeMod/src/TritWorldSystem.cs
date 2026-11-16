@@ -1,5 +1,6 @@
 #nullable enable
 
+using System;
 using Terraria;
 using Terraria.ModLoader;
 
@@ -38,6 +39,32 @@ public sealed class TritWorldSystem : ModSystem
     public override void OnModLoad()
     {
         TritRuntimeMod.Instance?.Logger.Info("[trit] 世界投影 tick 驱动已装载（ModSystem）");
+    }
+
+    /// <summary>
+    /// KernelFirst 缓存预拉 / L0 校准取样：在实体 AI 之前触发。
+    /// <para>
+    /// ReplaceOrig 模式下建 KernelFirst 缓存，让 On_NPC.AI 钩子能查到 confidence ≥ 0.9999 的 intent；
+    /// ObserveOnly + 自动档时按校准间隔取一次"只对拍不应用"的样本。其他模式空操作。
+    /// </para>
+    /// </summary>
+    public override void PreUpdateEntities()
+    {
+        if (Main.gameMenu) return;
+        if (!announced) return;  // tick 回调还没到过（避免和 OnModLoad 同一 tick 误触发）
+
+        EntityTakeover? takeover = TritRuntimeMod.Instance?.Takeover;
+        if (takeover is null) return;
+
+        try
+        {
+            takeover.PrepareTickPlan();
+        }
+        catch (Exception ex)
+        {
+            // 预拉失败不能让 tick 卡住 —— 钩子层自动走 orig 路径，校准本 tick 跳过
+            TritRuntimeMod.Instance!.Logger.Warn("[trit] 接管计划预拉失败，本 tick 全部走原版路径：" + ex.Message);
+        }
     }
 
     /// <summary>每 tick 推进一次世界投影；模组未装配、无桥接或不在世界中时静默跳过。</summary>

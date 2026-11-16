@@ -14,10 +14,55 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use trit_core::value::Ternary;
 
+/// 车道键解码 —— 与 C# `LaneMap` 的编码严格对齐（ABI，改动必须同步升 LayoutVersion）。
+///
+/// 编码：`[31..28] kind | [27..12] slot | [11..0] field`。
+pub mod lane {
+    /// 种类：NPC。
+    pub const KIND_NPC: u8 = 1;
+    /// 种类：Projectile。
+    pub const KIND_PROJECTILE: u8 = 2;
+    /// 种类：Player。
+    pub const KIND_PLAYER: u8 = 3;
+
+    /// 字段：velocity.X。
+    pub const FIELD_VELOCITY_X: u32 = 0x007;
+    /// 字段：velocity.Y。
+    pub const FIELD_VELOCITY_Y: u32 = 0x008;
+    /// 字段：direction。
+    pub const FIELD_DIRECTION: u32 = 0x009;
+
+    const SLOT_SHIFT: u32 = 12;
+    const KIND_SHIFT: u32 = 28;
+    const SLOT_MASK: u32 = 0xFFFF;
+    const KIND_MASK: u32 = 0xF;
+    const FIELD_MASK: u32 = 0xFFF;
+
+    /// 拆出种类（4 位）。
+    #[inline]
+    pub fn kind(key: u32) -> u8 {
+        ((key >> KIND_SHIFT) & KIND_MASK) as u8
+    }
+
+    /// 拆出槽位（16 位，即 `whoAmI`）。
+    #[inline]
+    pub fn slot(key: u32) -> i32 {
+        ((key >> SLOT_SHIFT) & SLOT_MASK) as i32
+    }
+
+    /// 拆出字段号（12 位）。
+    #[inline]
+    pub fn field(key: u32) -> u32 {
+        key & FIELD_MASK
+    }
+}
+
 /// 接管模式。
 ///
-/// Phase 1 只实现 L0（只观测）和 L1（PatchAfterOrig：原版先跑、内核事后修正）。
-/// L2 及以上留给后续。
+/// Phase 1 MVP 只实现 L0（只观测）和 L1（PatchAfterOrig）。
+/// Phase 2 MVP 新增 L2 ReplaceOrig —— 枚举位保留，完整 KernelFirst 行为后续接入。
+/// 当前 L2 在 Rust 侧行为等价于 L1（Fork.predict 不读 mode 字段，只靠 confidence_threshold 区分），
+/// mode 字符串主要用于 C# 侧日志与硬夹。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TakeoverMode {
@@ -26,6 +71,10 @@ pub enum TakeoverMode {
     ObserveOnly,
     /// L1 轻接管：原版先跑、内核事后修正（Android Mobile 默认）。
     PatchAfterOrig,
+    /// L2 中接管：完整 KernelFirst（先跑内核 ActionPlan，跳过 orig）。
+    /// Phase 2 MVP 里 Rust 侧暂时等价于 PatchAfterOrig（Fork.predict 只看 confidence_threshold），
+    /// C# 侧用更高门槛（≥ 0.9999）区分 —— 真正跳过 orig 等 KernelFirst 完整版。
+    ReplaceOrig,
 }
 
 /// 接管配置。`None` = L0（零开销）。
@@ -147,24 +196,31 @@ impl WorldProjectionFork {
         self.keys = snapshot.keys().copied().collect();
     }
 
+    /// 已观察键集快照（TritEnginePort 双轨 predict 遍历用）。
+    pub fn keys(&self) -> Vec<u32> {
+        self.keys.iter().copied().collect()
+    }
+
     /// 对每个可接管键跑历史外推预测。
     ///
     /// 预测规则（Phase 1 MVP）：
-    /// - 置信度 < threshold → 弃权（Zero）
+    /// - 置信度 < threshold → 弃权（Unknown）
     /// - 历史最近 N 次都是 Pos → Pos
     /// - 历史最近 N 次都是 Neg → Neg
     /// - 震荡或样本不足 → 弃权
     ///
-    /// 返回 key → 预测 trit 的列表（按 key 升序，便于 C# 侧按 LaneMap 查找）。
-    pub fn predict_all(&self) -> Vec<(u32, Ternary)> {
+    /// 返回 (key, delta, confidence) 列表（按 key 升序）。
+    /// confidence = fork.confidence_of(key) —— C# 侧用来决定 KernelFirst 是否跳过 orig。
+    pub fn predict_all(&self) -> Vec<(u32, Ternary, f32)> {
         let mut preds = Vec::new();
 
         for key in &self.keys {
+            let conf = self.confidence_of(*key);
             let Some(trit) = self.predict(*key) else {
                 continue;
             };
             if trit != Ternary::Unknown {
-                preds.push((*key, trit));
+                preds.push((*key, trit, conf));
             }
         }
 

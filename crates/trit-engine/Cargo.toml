@@ -1,0 +1,18 @@
+[package]
+name = "trit-engine"
+description = "Terraria AI 纯函数端口：NPC.AI + Projectile.Update 的原版等价逻辑（Rust 纯函数实现）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["ternary", "trit", "terraria", "game-engine", "ai"]
+categories = ["game-development", "no-std"]
+
+[lib]
+name = "trit_engine"
+crate-type = ["lib"]
+
+[features]
+# MVP 默认空。未来加 `port-all` 覆盖全部 150+ Terraria NPC type。
+default = []

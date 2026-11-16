@@ -157,6 +157,25 @@ public static class Opcode
     /// 托管回退路径不做任何事（fork 不存在，置信度永远不被更新）。
     /// </summary>
     public const uint ConsistencyRecord = 0x1E;
+
+    /// <summary>
+    /// ActionPlan：完整 intent 列表，每条带置信度。
+    /// 载荷 <c>count u32, [key u32, delta u8, confidence f32(IEEE754)] * n</c>。
+    ///
+    /// 比 Predictions(0x1D) 多 4 字节 f32 —— C# 侧用 confidence 判断 ReplaceOrig 是否跳过 orig
+    /// （PatchAfterOrig ≥ 0.95 即可；ReplaceOrig 需要 ≥ 0.9999）。
+    /// </summary>
+    public const uint ActionPlan = 0x1F;
+
+    /// <summary>
+    /// 实体状态推送（Phase 2 TritEnginePort）：把当前世界的完整实体状态喂给内核，
+    /// 让引擎能跑原版等价 AI，而不是只做历史外推。
+    /// 载荷 <c>count u32, [record] * n</c>，每条记录定长 <see cref="Wire.StateRecordLength"/> 字节。
+    ///
+    /// 整批<b>替换</b>上一 tick 的状态表（不是增量合并）—— 消失的实体自然被清掉。
+    /// 内核 <c>takeover</c> 为 <c>None</c>（L0）时忽略载荷；托管回退路径同样直接吞掉。
+    /// </summary>
+    public const uint StatePush = 0x20;
 }
 
 /// <summary>查询编号，与 Rust 侧 <c>trit_rt::wire::query</c> 对齐。</summary>
@@ -283,6 +302,13 @@ public static class Wire
 
     /// <summary>单字节可表示的最大合法值（0..=242）。</summary>
     public const int Combinations = 243;
+
+    /// <summary>
+    /// STATE_PUSH 单条实体状态记录的字节长度，与 Rust <c>wire::STATE_RECORD_LEN</c> 一致：
+    /// <c>kind u8(1) + slot/type i32(8) + 4×f32(16) + direction/life/life_max/target i32(16)
+    /// + ai[8] f32(32) + walk_speed/target_distance f32(8) + tile_below/on_ground u8(2) = 83</c>。
+    /// </summary>
+    public const int StateRecordLength = 83;
 
     /// <summary>把 trit 序列打包成字节；最后不足 5 个的低位补 Neg（解码时按长度截断）。</summary>
     public static byte[] PackTrits(IReadOnlyList<TritDelta> values)
@@ -455,6 +481,15 @@ public sealed class WireWriter
         return this;
     }
 
+    /// <summary>写 f32（IEEE 754 小端）。</summary>
+    public WireWriter F32(float value)
+    {
+        EnsureCapacity(4);
+        BinaryPrimitives.WriteSingleLittleEndian(buffer.AsSpan(position, 4), value);
+        position += 4;
+        return this;
+    }
+
     /// <summary>写定长字节。</summary>
     public WireWriter Bytes(ReadOnlySpan<byte> value)
     {
@@ -550,6 +585,15 @@ public sealed class WireReader
         Ensure(8);
         var value = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Span.Slice(position, 8));
         position += 8;
+        return value;
+    }
+
+    /// <summary>读 f32（IEEE 754 小端）。</summary>
+    public float F32()
+    {
+        Ensure(4);
+        var value = BinaryPrimitives.ReadSingleLittleEndian(buffer.Span.Slice(position, 4));
+        position += 4;
         return value;
     }
 

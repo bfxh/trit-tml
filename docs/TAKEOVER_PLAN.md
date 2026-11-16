@@ -300,21 +300,25 @@ public enum TakeoverMode
 public TakeoverMode Takeover { get; set; }
 ```
 
-自动升级逻辑：
+自动升级逻辑（Phase 3 实现口径）：
 
 ```
-ObserveOnly 持续 30 天
-  → 影子对拍置信度 >= 95%
-  → 自动升到 PatchAfterOrig (L1)
-  → 玩家在日志里看到提示："trit 内核已升级为 L1 接管模式，可在 settings.json 里关闭"
+ObserveOnly + 自动档（autoTakeover=true，默认）
+  → 每 autoCalibrationIntervalTicks（默认 1200 tick ≈ 20 秒）做一次 L0 校准：
+    推一次全量实体状态 → 取一次 ActionPlan → 只对拍、不应用
+  → 窗口连续 30 天、样本 ≥ 10000、一致率 ≥ 95%
+  → 装载期或校准 tick 自动升到 PatchAfterOrig (L1)，写回 settings.json
+  → 日志提示："trit 内核已升级为 L1 接管模式，可用 trit takeover auto off 关闭"
 
-PatchAfterOrig 持续 60 天
-  → 影子对拍置信度 >= 99.99%
-  → 自动升到 ReplaceOrig (L2)
-  → 同上提示
+PatchAfterOrig（仅当档位由自动升级设置，autoManaged=true）
+  → 单 tick 样本 ≥ 20 且一致率跌破 80%
+  → 本 tick 立即回落 ObserveOnly，清空窗口重新积累
 
-任何时刻置信度跌破 90% → 自动降回 ObserveOnly
+任何时刻玩家手动 trit takeover on|off → autoManaged=false，自动档不再降级该档位；
+trit takeover auto on|off 控制自动档本身。
 ```
+
+L1 → L2 不自动升级：ReplaceOrig 始终由玩家显式开启。
 
 ---
 
@@ -369,10 +373,10 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
 - Hook 链升级为 kernel-first 模式
 - **验收**：L2 下原版 AI CPU 降到 0（已跳过）；整体 CPU 使用率降 40-60%
 
-### Phase 3：自动升级 + 仪表盘（~2 周）
-- 置信度长期跟踪 + 自动升级/降级逻辑
-- `/trit takeover` 子命令（on/off/status）
-- `/trit takeover stats` 实时仪表盘（置信度、接管数、diff 率）
+### Phase 3：自动升级 + 仪表盘（~2 周）— 已实现
+- 置信度长期跟踪 + 自动升级/降级逻辑（`TakeoverAutoPilot`，L0 低频校准取证）
+- `/trit takeover` 子命令（on / off / auto on|off / status）
+- `/trit takeover stats` 实时仪表盘（置信度、接管数、diff 率、升级窗口进度）
 - **验收**：连续 30 天置信度 ≥ 95% 后自动升级到 L1；任何异常 1 tick 内自动降级
 
 ---

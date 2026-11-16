@@ -81,6 +81,7 @@ public sealed class TritRuntimeMod : Mod
     private WorldBridge? bridge;
     private TritHooks? hooks;
     private EntityTakeover? takeover;
+    private TakeoverAutoPilot? autoPilot;
     private bool loaded;
 
     // 轮询开关：一旦轮询本身抛异常就永久关闭，避免每 tick 刷一条错误日志。
@@ -116,11 +117,31 @@ public sealed class TritRuntimeMod : Mod
     /// <summary>装载期端到端自检是否通过（决定是否安装钩子）。</summary>
     public bool SelfCheckPassed { get; private set; }
 
+    /// <summary>
+    /// 装配时内核配置里是否带了 takeover（<see cref="BuildRuntimeConfigJson"/> 写入）。
+    /// <para>
+    /// 为 <see langword="false"/> 时本会话内核不会输出预测 —— 命令层切到接管模式后
+    /// 必须提示"重进世界生效"。这是配置在 <see cref="RuntimeShim.Attach"/> 时一次性
+    /// 烘焙、没有热重载路径导致的限制。
+    /// </para>
+    /// </summary>
+    internal bool KernelTakeoverConfigured { get; private set; }
+
     /// <summary>当前生效的设置（命令层与 API 层共用同一份实例，改了立即生效）。</summary>
     internal TritSettings Settings => settings;
 
     /// <summary>世界投影桥（未装配时为 <c>null</c>）。</summary>
     internal WorldBridge? Bridge => bridge;
+
+    /// <summary>
+    /// 接管层实例 —— 供 TritHooks 在 AI 钩子内调用 KernelFirst 缓存查询。
+    /// ReplaceOrig 模式下 TritHooks 每 tick 开头通过
+    /// <see cref="EntityTakeover.PrepareKernelFirstCache"/> 预拉 ActionPlan。
+    /// </summary>
+    internal EntityTakeover? Takeover => takeover;
+
+    /// <summary>接管自动档（Phase 3）。未装载时为 <c>null</c>。</summary>
+    internal TakeoverAutoPilot? AutoPilot => autoPilot;
 
     /// <summary>最近完成的任务结果（最多 <see cref="RecentJobCapacity"/> 条，最新的在末尾）。</summary>
     internal IReadOnlyList<JobResult> RecentJobs => recentJobs;
@@ -163,17 +184,40 @@ public sealed class TritRuntimeMod : Mod
                 writer.WriteNumber("min_trits", settings.GpuMinTrits);
                 writer.WriteEndObject();
 
-                // 接管配置：只有显式选了 L1+ 才写入，ObserveOnly 时留空让 Rust 侧
-                // Option<TakeoverConfig> = None → 零开销降级。
-                if (settings.Takeover != TritSettings.TakeoverMode.ObserveOnly)
+                // 接管配置：L1+ 显式写入；ObserveOnly 只有在自动档校准启用时才写入
+                // （校准要内核产出预测，否则拿不到升级证据）。两者都不满足就留空，
+                // 让 Rust 侧 Option<TakeoverConfig> = None → 严格零开销。
+                bool calibrating = autoPilot?.CalibrationEnabled == true;
+                if (settings.Takeover != TritSettings.TakeoverMode.ObserveOnly || calibrating)
                 {
                     writer.WriteStartObject("takeover");
-                    string modeStr = settings.Takeover == TritSettings.TakeoverMode.PatchAfterOrig
-                        ? "patch_after_orig"
-                        : "replace_orig";
+                    string modeStr = settings.Takeover switch
+                    {
+                        TritSettings.TakeoverMode.ReplaceOrig => "replace_orig",
+                        TritSettings.TakeoverMode.PatchAfterOrig => "patch_after_orig",
+                        _ => "observe_only",
+                    };
                     writer.WriteString("mode", modeStr);
-                    // 其他字段全用 Rust TakeoverConfig 的 serde(default) 默认值
-                    // （confidence_threshold=0.95, confidence_window=30, etc.）
+
+                    // confidence_threshold 两侧对齐：
+                    // PatchAfterOrig → 0.95（和 Rust 默认值一致，显式写出来可读性）
+                    // ReplaceOrig → 0.9999（EntityTakeover 硬夹的门槛，Rust Fork.predict
+                    // 过滤 key 用这个阈值，避免输出了又被 C# 丢弃）
+                    float confMin = settings.Takeover switch
+                    {
+                        TritSettings.TakeoverMode.ReplaceOrig => 0.9999f,
+                        _ => 0.95f,
+                    };
+                    writer.WriteNumber("confidence_threshold", confMin);
+
+                    if (calibrating)
+                    {
+                        // 校准是低频抽样（默认 1200 tick 一次），必须保证被抽到的那一 tick
+                        // 内核真的产出预测；Rust 默认的"每 3 tick 预测一次"会让两次校准
+                        // 之间随机落空。
+                        writer.WriteNumber("prediction_interval_ticks", 1);
+                    }
+
                     writer.WriteEndObject();
                 }
 
@@ -329,6 +373,11 @@ public sealed class TritRuntimeMod : Mod
             Logger.Info("[trit] 设置来源：" + settings.LoadedFrom);
         }
 
+        // 自动档：装载期先评估一次升级（窗口跨会话累计，重启后可能刚好达标）。
+        // 必须在 BuildRuntimeConfigJson / Attach 之前，内核配置要按升级后的档位烘焙。
+        autoPilot = new TakeoverAutoPilot(settings);
+        autoPilot.TryUpgrade();
+
         // 让游戏内"配置"面板反映当前真实设置（TritSettings 为主，ModConfig 为展示层）。
         SyncConfigFromSettings();
 
@@ -360,6 +409,9 @@ public sealed class TritRuntimeMod : Mod
 
             loaded = true;
             jobPollingEnabled = true;
+            KernelTakeoverConfigured =
+                settings.Takeover != TritSettings.TakeoverMode.ObserveOnly ||
+                autoPilot?.CalibrationEnabled == true;
 
             CapabilityReport caps = shim.Capabilities();
             Logger.Info(
@@ -403,13 +455,14 @@ public sealed class TritRuntimeMod : Mod
                 Logger.Info("[trit] 设置要求不安装钩子，本层仅提供 Mod.Call 内核服务。");
             }
 
-            // 接管层：只有显式选了 L1+ 才创建。ObserveOnly 时整类零开销。
-            // Phase 1 MVP 接管层只做 predictions 链路验证 + 置信度表，
-            // 真正的 trit delta → C# 实体字段映射留到 Phase 1.5。
-            if (settings.Takeover != TritSettings.TakeoverMode.ObserveOnly && shim is not null)
+            // 接管层：L1+ 或 L0 自动档校准时创建。既不开接管也不校准 → 整类零开销。
+            if ((settings.Takeover != TritSettings.TakeoverMode.ObserveOnly || autoPilot?.CalibrationEnabled == true)
+                && shim is not null)
             {
-                takeover = new EntityTakeover(shim, settings);
-                Logger.Info($"[trit] 接管层已启用（{settings.Takeover}）");
+                takeover = new EntityTakeover(shim, settings, autoPilot);
+                Logger.Info(autoPilot?.CalibrationEnabled == true
+                    ? $"[trit] 接管层已启用（L0 自动档校准，每 {settings.AutoCalibrationIntervalTicks} tick 取样一次；接管模式仍为 {settings.Takeover}）"
+                    : $"[trit] 接管层已启用（{settings.Takeover}）");
             }
         }
         catch (Exception ex)
@@ -683,6 +736,9 @@ public sealed class TritRuntimeMod : Mod
         ownerMailboxes.Clear();
         recentJobs.Clear();
 
+        // 退出存档：把自动档窗口计数落盘（跨会话累计是 30 天升级的前提）。
+        autoPilot?.Flush();
+
         try
         {
             bridge?.ResetSession();
@@ -711,9 +767,14 @@ public sealed class TritRuntimeMod : Mod
     {
         loaded = false;
         jobPollingEnabled = false;
+        KernelTakeoverConfigured = false;
         recentJobs.Clear();
         ownerMailboxes.Clear();
         takeover = null;
+
+        // 自动档窗口计数落盘（内部吞异常，绝不阻塞卸载）。
+        autoPilot?.Flush();
+        autoPilot = null;
 
         try
         {

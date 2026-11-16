@@ -109,7 +109,29 @@ pub mod op {
     /// 置信度对拍回写：C# 侧对比原版结果 vs 内核预测方向，批量提交一致/不一致样本。
     /// 载荷：`count u32, [key u32, consistent u8] * n`（consistent = 1 一致，0 不一致）。
     pub const CONSISTENCY_RECORD: u32 = 0x1E;
+    /// ActionPlan：完整 intent 列表，每条带置信度。
+    /// 载荷：`count u32, [key u32, delta u8, confidence f32(IEEE754)] * n`。
+    ///
+    /// 和 PREDICTIONS(0x1D) 的区别：PREDICTIONS 只返回 (key, delta) 做 Phase 1.5 方向门；
+    /// ACTION_PLAN 返回额外 confidence —— C# 侧用它判断 KernelFirst 是否跳过 orig
+    /// （ReplaceOrig 需要 ≥ 0.9999，PatchAfterOrig ≥ 0.95）。
+    pub const ACTION_PLAN: u32 = 0x1F;
+    /// 实体状态推送（Phase 2 TritEnginePort）：把当前世界的完整实体状态喂给内核，
+    /// 让 `trit-engine` 能跑原版等价 AI 而不是只做历史外推。
+    ///
+    /// 载荷：`count u32, [record] * n`，每条 record 定长 [`STATE_RECORD_LEN`] 字节：
+    /// `kind u8, slot i32, type i32, velocity_x f32, velocity_y f32, position_x f32,
+    ///  position_y f32, direction i32, life i32, life_max i32, target i32,
+    ///  ai[8] f32, walk_speed f32, target_distance f32, tile_below u8, on_ground u8`
+    ///
+    /// 响应：空。整批**替换**上一 tick 的状态表（不是增量合并）—— 消失的实体自然被清掉。
+    /// `takeover_fork == None`（L0）时忽略载荷，零开销。
+    pub const STATE_PUSH: u32 = 0x20;
 }
+
+/// [`op::STATE_PUSH`] 单条实体状态记录的字节长度。
+/// `u8(1) + i32(6)*4 + f32(4)*4 + f32(8)*4 + f32(2)*4 + u8(2)` = 1 + 24 + 16 + 32 + 8 + 2 = 83。
+pub const STATE_RECORD_LEN: usize = 83;
 
 /// 查询编号。
 pub mod query {
@@ -195,6 +217,13 @@ impl<'a> Reader<'a> {
         ]))
     }
 
+    /// 读 f32（IEEE 754 小端）。
+    pub fn f32(&mut self) -> Result<f32, RtError> {
+        Ok(f32::from_le_bytes(
+            self.take(4)?.try_into().expect("take(4) 保证长度"),
+        ))
+    }
+
     /// 读一段定长字节。
     pub fn bytes(&mut self, len: usize) -> Result<Vec<u8>, RtError> {
         Ok(self.take(len)?.to_vec())
@@ -241,6 +270,12 @@ impl Writer {
     }
 
     pub fn u64(&mut self, value: u64) -> &mut Self {
+        self.buf.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    /// 写 f32（IEEE 754 小端）。
+    pub fn f32(&mut self, value: f32) -> &mut Self {
         self.buf.extend_from_slice(&value.to_le_bytes());
         self
     }
