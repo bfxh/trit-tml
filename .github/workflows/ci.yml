@@ -391,7 +391,9 @@ jobs:
 
       # taiki-e/install-action 直接拉预编译二进制 (~5s)，比 cargo install
       # cargo-ndk 省 ~2min 编译时间；coverage job 同一路径。
-      - uses: taiki-e/install-action@cargo-ndk
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
 
       # NDK 缓存（先跳过 cache 让 job 先能跑起来，后续再加回）：
       # actions/cache@v4 restore-keys 有时在 matrix include 里解析失败导致
