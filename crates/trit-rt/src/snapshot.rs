@@ -14,6 +14,7 @@ use trit_core::value::Ternary;
 
 use crate::error::RtError;
 use crate::wire::{Reader, Writer};
+use crate::world::TritWorld;
 
 /// 快照格式版本。
 pub const SNAPSHOT_VERSION: u8 = 1;
@@ -55,18 +56,22 @@ pub struct DiffEntry {
 }
 
 /// 把世界投影编码为字节。
-pub fn encode_world(world: &BTreeMap<u32, Ternary>, tick: u64, log_seq: u64) -> Vec<u8> {
+///
+/// 键数组与值张量用同一套遍历顺序（`TritWorld::for_each`），因此键值天然对齐；
+/// 解码方不依赖顺序，旧版按 key 升序的快照仍可正常还原。
+pub fn encode_world(world: &TritWorld, tick: u64, log_seq: u64) -> Vec<u8> {
     let mut writer = Writer::new();
     writer.u8(SNAPSHOT_VERSION);
     writer.u64(tick);
     writer.u64(log_seq);
-    writer.u32(world.len() as u32);
-    for key in world.keys() {
-        writer.u32(*key);
-    }
-    // 直接从 world.values() 迭代器打包，省掉中间 Vec<Ternary> 分配。
     let count = world.len();
-    writer.trits_iter(count, world.values().copied());
+    writer.u32(count as u32);
+    world.for_each(|key, _| {
+        writer.u32(key);
+    });
+    let mut values = Vec::with_capacity(count);
+    world.for_each(|_, value| values.push(value));
+    writer.trits_iter(count, values);
     writer.into_vec()
 }
 
@@ -163,15 +168,20 @@ mod tests {
         pairs.iter().copied().collect()
     }
 
+    fn compact(pairs: &[(u32, Ternary)]) -> TritWorld {
+        TritWorld::from_map(&world(pairs))
+    }
+
     #[test]
     fn world_round_trips_through_bytes() {
-        let original = world(&[
+        let pairs = [
             (1, Ternary::False),
             (7, Ternary::True),
             (900, Ternary::Unknown),
             (4242, Ternary::True),
-        ]);
-        let bytes = encode_world(&original, 12, 34);
+        ];
+        let original = world(&pairs);
+        let bytes = encode_world(&compact(&pairs), 12, 34);
         let (tick, log_seq, decoded) = decode_world(&bytes).unwrap();
         assert_eq!(tick, 12);
         assert_eq!(log_seq, 34);
@@ -180,14 +190,14 @@ mod tests {
 
     #[test]
     fn empty_world_round_trips() {
-        let bytes = encode_world(&BTreeMap::new(), 0, 0);
+        let bytes = encode_world(&TritWorld::new(), 0, 0);
         let (_, _, decoded) = decode_world(&bytes).unwrap();
         assert!(decoded.is_empty());
     }
 
     #[test]
     fn bad_version_is_rejected() {
-        let mut bytes = encode_world(&world(&[(1, Ternary::True)]), 0, 0);
+        let mut bytes = encode_world(&compact(&[(1, Ternary::True)]), 0, 0);
         bytes[0] = 9;
         assert!(decode_world(&bytes).is_err());
     }
@@ -314,7 +324,7 @@ mod tests {
             (4_194_303, Ternary::False),
         ];
         let original = world(&pairs);
-        let bytes = encode_world(&original, 555, 777);
+        let bytes = encode_world(&compact(&pairs), 555, 777);
         let (tick, log_seq, decoded) = decode_world(&bytes).unwrap();
         assert_eq!(tick, 555);
         assert_eq!(log_seq, 777);

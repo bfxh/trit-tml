@@ -170,7 +170,8 @@ public static class Opcode
     /// <summary>
     /// 实体状态推送（Phase 2 TritEnginePort）：把当前世界的完整实体状态喂给内核，
     /// 让引擎能跑原版等价 AI，而不是只做历史外推。
-    /// 载荷 <c>count u32, [record] * n</c>，每条记录定长 <see cref="Wire.StateRecordLength"/> 字节。
+    /// 载荷 <c>count u32, [record] * n</c>，每条记录定长
+    /// <see cref="Wire.StateRecordFixedLength"/> 字节 + 每个非零 ai 槽 2 字节。
     ///
     /// 整批<b>替换</b>上一 tick 的状态表（不是增量合并）—— 消失的实体自然被清掉。
     /// 内核 <c>takeover</c> 为 <c>None</c>（L0）时忽略载荷；托管回退路径同样直接吞掉。
@@ -294,6 +295,26 @@ public enum ArbitrationMode
     Majority = 1,
 }
 
+/// <summary>STATE_PUSH 记录里的标志位，与 Rust <c>wire::state_flags</c> 一致。</summary>
+[Flags]
+public enum StateFlags : byte
+{
+    /// <summary>无。</summary>
+    None = 0,
+
+    /// <summary>NPC 站在地面上。</summary>
+    OnGround = 1 << 0,
+
+    /// <summary>脚下有方块。</summary>
+    TileBelow = 1 << 1,
+
+    /// <summary>Projectile 处于活跃状态。</summary>
+    Active = 1 << 2,
+
+    /// <summary>NPC 有目标（引擎只判符号）。</summary>
+    HasTarget = 1 << 3,
+}
+
 /// <summary>线格式读写器：小端整数 + 5 trits/byte 打包体（与 Rust trit-codec 逐字节一致）。</summary>
 public static class Wire
 {
@@ -304,11 +325,53 @@ public static class Wire
     public const int Combinations = 243;
 
     /// <summary>
-    /// STATE_PUSH 单条实体状态记录的字节长度，与 Rust <c>wire::STATE_RECORD_LEN</c> 一致：
-    /// <c>kind u8(1) + slot/type i32(8) + 4×f32(16) + direction/life/life_max/target i32(16)
-    /// + ai[8] f32(32) + walk_speed/target_distance f32(8) + tile_below/on_ground u8(2) = 83</c>。
+    /// STATE_PUSH 单条实体状态记录的<b>定长部分</b>，与 Rust <c>wire::STATE_RECORD_FIXED_LEN</c> 一致：
+    /// <c>kind u8(1) + slot u16(2) + type u16(2) + vel_x/vel_y i16(4) + dir i8(1) + flags u8(1)
+    /// + walk_speed i16(2) + target_distance u16(2) + ai_mask u8(1) = 16</c>。
+    /// 每个非零 ai 槽再加一个 <c>i16</c>。
     /// </summary>
-    public const int StateRecordLength = 83;
+    public const int StateRecordFixedLength = 16;
+
+    /// <summary>ai 槽数量（<c>ai_mask</c> 的位宽）。</summary>
+    public const int StateAiSlots = 8;
+
+    /// <summary>velocity 量化比例（<c>q = round(v * 256)</c>）。</summary>
+    public const float StateVelocityScale = 256f;
+
+    /// <summary>walk_speed 量化比例。</summary>
+    public const float StateWalkSpeedScale = 256f;
+
+    /// <summary>ai 量化比例（<c>q = round(ai * 16)</c>）。</summary>
+    public const float StateAiScale = 16f;
+
+    /// <summary>target_distance 量化比例（<c>q = round(d * 4)</c>）。</summary>
+    public const float StateTargetDistanceScale = 4f;
+
+    /// <summary>量化到 <see cref="short"/>（四舍五入 + 饱和；NaN → 0），与 Rust <c>quantize_i16</c> 一致。</summary>
+    public static short QuantizeI16(float value, float scale)
+    {
+        float scaled = MathF.Round(value * scale, MidpointRounding.AwayFromZero);
+        if (float.IsNaN(scaled))
+        {
+            return 0;
+        }
+
+        return scaled >= short.MaxValue ? short.MaxValue
+            : scaled <= short.MinValue ? short.MinValue
+            : (short)scaled;
+    }
+
+    /// <summary>量化到 <see cref="ushort"/>（四舍五入 + 饱和；负数/NaN → 0），与 Rust <c>quantize_u16</c> 一致。</summary>
+    public static ushort QuantizeU16(float value, float scale)
+    {
+        float scaled = MathF.Round(value * scale, MidpointRounding.AwayFromZero);
+        if (float.IsNaN(scaled) || scaled <= 0f)
+        {
+            return 0;
+        }
+
+        return scaled >= ushort.MaxValue ? ushort.MaxValue : (ushort)scaled;
+    }
 
     /// <summary>把 trit 序列打包成字节；最后不足 5 个的低位补 Neg（解码时按长度截断）。</summary>
     public static byte[] PackTrits(IReadOnlyList<TritDelta> values)
@@ -463,6 +526,32 @@ public sealed class WireWriter
         return this;
     }
 
+    /// <summary>写 u16（小端）。</summary>
+    public WireWriter U16(ushort value)
+    {
+        EnsureCapacity(2);
+        BinaryPrimitives.WriteUInt16LittleEndian(buffer.AsSpan(position, 2), value);
+        position += 2;
+        return this;
+    }
+
+    /// <summary>写 i16（小端）。</summary>
+    public WireWriter I16(short value)
+    {
+        EnsureCapacity(2);
+        BinaryPrimitives.WriteInt16LittleEndian(buffer.AsSpan(position, 2), value);
+        position += 2;
+        return this;
+    }
+
+    /// <summary>写 i8。</summary>
+    public WireWriter I8(sbyte value)
+    {
+        EnsureCapacity(1);
+        buffer[position++] = (byte)value;
+        return this;
+    }
+
     /// <summary>写 i32（小端）。</summary>
     public WireWriter I32(int value)
     {
@@ -568,6 +657,31 @@ public sealed class WireReader
         var value = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Span.Slice(position, 4));
         position += 4;
         return value;
+    }
+
+    /// <summary>读 u16（小端）。</summary>
+    public ushort U16()
+    {
+        Ensure(2);
+        var value = BinaryPrimitives.ReadUInt16LittleEndian(buffer.Span.Slice(position, 2));
+        position += 2;
+        return value;
+    }
+
+    /// <summary>读 i16（小端）。</summary>
+    public short I16()
+    {
+        Ensure(2);
+        var value = BinaryPrimitives.ReadInt16LittleEndian(buffer.Span.Slice(position, 2));
+        position += 2;
+        return value;
+    }
+
+    /// <summary>读 i8。</summary>
+    public sbyte I8()
+    {
+        Ensure(1);
+        return (sbyte)buffer.Span[position++];
     }
 
     /// <summary>读 i32（小端）。</summary>

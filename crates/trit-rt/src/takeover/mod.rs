@@ -3,16 +3,18 @@
 //! 设计原则：
 //! - **零开销 L0**：`RuntimeConfig.takeover == None` 时，整模块不会被 Rust 侧调起。
 //!   `predictions` opcode 返回空 payload，C# 侧跳过接管。
-//! - **fork 不持有主内核锁**：每次 predictions 调用从 `Runtime.world()` 克隆一份
-//!   `BTreeMap<u32, Ternary>`（世界投影快照），fork 独立工作。
+//! - **fork 不持有主内核锁**：fork 只保存键集（`Vec<u32>`）与对拍历史，不复制世界值；
+//!   `refresh_world` 仅在结构变化（新增车道 / 清空 / 重建）时重建键集，稳态零分配。
 //! - **置信度 = 影子对拍延伸**：fork 的 `record_outcome` 被 C# 侧在对拍原版 vs 内核
-//!   时调用，自动更新置信度表。
+//!   时调用，自动更新置信度表（环形位图，每键一个 `u64`，不再有独立堆分配）。
 //!
 //! Phase 1 只做**历史外推**预测（L1），不跑原版等价逻辑（那是 L2 trit-engine 的事）。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use trit_core::value::Ternary;
+
+use crate::world::TritWorld;
 
 /// 车道键解码 —— 与 C# `LaneMap` 的编码严格对齐（ABI，改动必须同步升 LayoutVersion）。
 ///
@@ -149,91 +151,149 @@ impl PartialEq for TakeoverConfig {
     }
 }
 
-/// 世界投影 fork：独立快照 + 历史外推预测。
+/// 单键的对拍历史：一个 64 位环形位图 + 累计不一致次数。
+#[derive(Clone, Copy, Debug)]
+struct HistoryRing {
+    /// bit = 1 表示该次内核预测与原版一致；只使用低 `window` 位。
+    bits: u64,
+    /// 有效样本数（≤ window）。
+    len: u8,
+    /// 下一个写入位。
+    head: u8,
+    /// 窗口大小（1..=64）。
+    window: u8,
+}
+
+impl HistoryRing {
+    fn new(window: u32) -> Self {
+        Self {
+            bits: 0,
+            len: 0,
+            head: 0,
+            window: window.clamp(1, 64) as u8,
+        }
+    }
+
+    fn push(&mut self, consistent: bool) {
+        let mask = 1u64 << self.head;
+        if consistent {
+            self.bits |= mask;
+        } else {
+            self.bits &= !mask;
+        }
+        self.head += 1;
+        if self.head >= self.window {
+            self.head = 0;
+        }
+        if self.len < self.window {
+            self.len += 1;
+        }
+    }
+
+    #[inline]
+    fn samples(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    fn matches(&self) -> usize {
+        self.bits.count_ones() as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KeyHistory {
+    ring: HistoryRing,
+    divergences: u32,
+}
+
+impl KeyHistory {
+    fn new(window: u32) -> Self {
+        Self {
+            ring: HistoryRing::new(window),
+            divergences: 0,
+        }
+    }
+}
+
+fn window_of(config: &TakeoverConfig) -> u32 {
+    config.confidence_window.clamp(1, 64)
+}
+
+/// 世界投影 fork：键集 + 历史外推预测。
 ///
-/// 每个键在 fork 里维护：
-/// - 当前世界值（从主内核克隆）
-/// - 过去 `confidence_window` 次"内核预测 vs 原版实际"结果
-/// - 置信度 = 一致样本 / 窗口大小
+/// 每个键维护过去 `confidence_window` 次「内核预测 vs 原版实际」结果（环形位图）。
+/// 世界值本身不复制——预测只需要键集，键集只随世界结构变化而重建。
 #[derive(Clone, Debug)]
 pub struct WorldProjectionFork {
-    /// 世界投影（fork 独立副本，不影响主内核）。
-    snapshot: BTreeMap<u32, Ternary>,
+    /// 已观察键集（升序，用于 predict_all 遍历）。
+    keys: Vec<u32>,
 
-    /// 每个键的历史窗口：true = 内核预测和原版一致，false = 不一致。
-    /// 长度上限 = `confidence_window`。
-    history: BTreeMap<u32, Vec<bool>>,
-
-    /// 每个键累计的不一致次数（超过 `divergence_tolerance` 后降级为只观测）。
-    divergences: BTreeMap<u32, u32>,
+    /// 每个键的对拍历史与不一致计数。
+    history: BTreeMap<u32, KeyHistory>,
 
     /// 配置（阈值 / 窗口 / 间隔）。
     config: TakeoverConfig,
 
-    /// 已观察键集（用于 predict_all 遍历）。
-    keys: BTreeSet<u32>,
+    /// 键集对应的世界结构版本；相同则 `refresh_world` 直接返回。
+    seen_serial: u64,
 }
 
 impl WorldProjectionFork {
     /// 从主内核的世界投影创建 fork。
-    ///
-    /// `snapshot` 可以来自 `Runtime.world().clone()` 或任意 `BTreeMap<u32, Ternary>`。
-    pub fn fork_from(snapshot: &BTreeMap<u32, Ternary>, config: TakeoverConfig) -> Self {
-        let keys: BTreeSet<u32> = snapshot.keys().copied().collect();
+    pub fn fork_from(snapshot: &TritWorld, config: TakeoverConfig) -> Self {
+        let mut keys = Vec::with_capacity(snapshot.len());
+        snapshot.for_each(|key, _| keys.push(key));
+        keys.sort_unstable();
         Self {
-            snapshot: snapshot.clone(),
-            history: BTreeMap::new(),
-            divergences: BTreeMap::new(),
-            config,
             keys,
+            history: BTreeMap::new(),
+            config,
+            seen_serial: snapshot.structure_serial(),
         }
     }
 
-    /// 从主内核世界投影刷新 fork 的世界值。
-    /// 不重置历史 —— 置信度是长期跟踪，刷新世界值是每次 tick 都要做的。
-    pub fn refresh_world(&mut self, snapshot: &BTreeMap<u32, Ternary>) {
-        self.snapshot = snapshot.clone();
-        self.keys = snapshot.keys().copied().collect();
+    /// 从主内核世界投影刷新键集。
+    /// 只在世界结构变化时重建，不重置历史 —— 置信度是长期跟踪。
+    pub fn refresh_world(&mut self, snapshot: &TritWorld) {
+        let serial = snapshot.structure_serial();
+        if serial == self.seen_serial {
+            return;
+        }
+        self.keys.clear();
+        snapshot.for_each(|key, _| self.keys.push(key));
+        self.keys.sort_unstable();
+        self.seen_serial = serial;
     }
 
-    /// 已观察键集快照（TritEnginePort 双轨 predict 遍历用）。
-    pub fn keys(&self) -> Vec<u32> {
-        self.keys.iter().copied().collect()
+    /// 已观察键集（升序，TritEnginePort 双轨 predict 遍历用）。
+    pub fn keys(&self) -> &[u32] {
+        &self.keys
     }
 
-    /// 对每个可接管键跑历史外推预测。
+    /// 对每个可接管键跑历史外推预测，结果写入 `out`（按 key 升序）。
     ///
-    /// 预测规则（Phase 1 MVP）：
-    /// - 置信度 < threshold → 弃权（Unknown）
-    /// - 历史最近 N 次都是 Pos → Pos
-    /// - 历史最近 N 次都是 Neg → Neg
-    /// - 震荡或样本不足 → 弃权
-    ///
-    /// 返回 (key, delta, confidence) 列表（按 key 升序）。
-    /// confidence = fork.confidence_of(key) —— C# 侧用来决定 KernelFirst 是否跳过 orig。
-    pub fn predict_all(&self) -> Vec<(u32, Ternary, f32)> {
-        let mut preds = Vec::new();
-
-        for key in &self.keys {
-            let conf = self.confidence_of(*key);
-            let Some(trit) = self.predict(*key) else {
+    /// 复用调用方缓冲：稳态不再分配。
+    pub fn predict_all_into(&self, out: &mut Vec<(u32, Ternary, f32)>) {
+        out.clear();
+        for &key in &self.keys {
+            let Some(trit) = self.predict(key) else {
                 continue;
             };
             if trit != Ternary::Unknown {
-                preds.push((*key, trit, conf));
+                out.push((key, trit, self.confidence_of(key)));
             }
         }
-
-        preds
+        out.sort_unstable_by_key(|(key, _, _)| *key);
     }
 
     /// 预测单个键的下一 tick 值（三值：Neg / Zero 弃权 / Pos）。
     pub fn predict(&self, key: u32) -> Option<Ternary> {
         // 置信度门禁：不一致次数超标 → 永远弃权
         if self
-            .divergences
+            .history
             .get(&key)
-            .map(|d| *d >= self.config.divergence_tolerance)
+            .map(|h| h.divergences >= self.config.divergence_tolerance)
             .unwrap_or(false)
         {
             return Some(Ternary::Unknown);
@@ -244,22 +304,17 @@ impl WorldProjectionFork {
             return Some(Ternary::Unknown);
         }
 
-        // 历史外推：连续 Pos → Pos，连续 Neg → Neg
+        // 历史外推：全部 Pos → Pos，全部 Neg → Neg，否则震荡。
         let hist = self.history.get(&key)?;
-        let window = self.config.confidence_window as usize;
-        let start = hist.len().saturating_sub(window);
-        let recent = &hist[start..];
-
-        if recent.len() < 3 {
+        if hist.ring.samples() < 3 {
             return Some(Ternary::Unknown); // 样本太少
         }
 
-        let pos_count = recent.iter().filter(|&&v| v).count();
-        let neg_count = recent.len() - pos_count;
-
-        if pos_count == recent.len() {
+        let pos = hist.ring.matches();
+        let neg = hist.ring.samples() - pos;
+        if neg == 0 {
             Some(Ternary::True)
-        } else if neg_count == recent.len() {
+        } else if pos == 0 {
             Some(Ternary::False)
         } else {
             Some(Ternary::Unknown) // 震荡
@@ -271,38 +326,132 @@ impl WorldProjectionFork {
         let Some(hist) = self.history.get(&key) else {
             return 0.0;
         };
-        if hist.len() < 5 {
+        let samples = hist.ring.samples();
+        if samples < 5 {
             return 0.0;
         }
-        let matches = hist.iter().filter(|&&v| v).count();
-        matches as f32 / hist.len() as f32
+        hist.ring.matches() as f32 / samples as f32
     }
 
-    /// 记录一次"内核预测 vs 原版实际"的对拍结果。
+    /// 记录一次「内核预测 vs 原版实际」的对拍结果。
     ///
     /// `consistent = true` 表示内核预测的 trit 和原版观察到的结果一致。
     pub fn record_outcome(&mut self, key: u32, consistent: bool) {
+        let window = window_of(&self.config);
         let hist = self
             .history
             .entry(key)
-            .or_insert_with(|| Vec::with_capacity(self.config.confidence_window as usize));
-
-        hist.push(consistent);
-
-        // 超窗口时丢掉最旧样本
-        let window = self.config.confidence_window as usize;
-        if hist.len() > window {
-            hist.drain(..hist.len() - window);
-        }
-
+            .or_insert_with(|| KeyHistory::new(window));
+        hist.ring.push(consistent);
         if !consistent {
-            let d = self.divergences.entry(key).or_insert(0);
-            *d = d.saturating_add(1);
+            hist.divergences = hist.divergences.saturating_add(1);
         }
     }
 
     /// 当前可预测键数。
     pub fn key_count(&self) -> usize {
         self.keys.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: u32 = (2 << 28) | (7 << 12) | 8;
+
+    fn fork(window: u32) -> WorldProjectionFork {
+        let config = TakeoverConfig {
+            confidence_threshold: 0.0,
+            confidence_window: window,
+            ..TakeoverConfig::default()
+        };
+        WorldProjectionFork::fork_from(&TritWorld::new(), config)
+    }
+
+    #[test]
+    fn ring_confidence_matches_vec_semantics() {
+        for window in [1u32, 3, 5, 30, 64] {
+            let mut fork = fork(window);
+            // 与旧 `Vec<bool>` + drain 的语义逐项对拍。
+            let mut reference: Vec<bool> = Vec::new();
+            let mut state = 0x9E37_79B9_u32;
+            for _ in 0..200 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let consistent = state & 1 == 0;
+                reference.push(consistent);
+                if reference.len() > window as usize {
+                    reference.drain(..reference.len() - window as usize);
+                }
+                fork.record_outcome(KEY, consistent);
+
+                let expected_conf = if reference.len() < 5 {
+                    0.0
+                } else {
+                    reference.iter().filter(|&&v| v).count() as f32 / reference.len() as f32
+                };
+                assert!(
+                    (fork.confidence_of(KEY) - expected_conf).abs() < f32::EPSILON,
+                    "window {window} 置信度不一致"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ring_prediction_matches_vec_semantics() {
+        for pattern in [
+            vec![true; 6],
+            vec![false; 6],
+            vec![true, false, true, false, true, true],
+        ] {
+            let mut fork = fork(30);
+            for &consistent in &pattern {
+                fork.record_outcome(KEY, consistent);
+            }
+            let expected = if pattern.iter().all(|&v| v) {
+                Some(Ternary::True)
+            } else if pattern.iter().all(|&v| !v) {
+                Some(Ternary::False)
+            } else {
+                Some(Ternary::Unknown)
+            };
+            assert_eq!(fork.predict(KEY), expected);
+        }
+    }
+
+    #[test]
+    fn refresh_only_rebuilds_on_structural_change() {
+        let mut world = TritWorld::new();
+        world.set(KEY, Ternary::True);
+        let mut fork = WorldProjectionFork::fork_from(&world, TakeoverConfig::default());
+        assert_eq!(fork.keys(), &[KEY]);
+
+        world.set(KEY, Ternary::False); // 只改值，不重建
+        fork.refresh_world(&world);
+        assert_eq!(fork.keys(), &[KEY]);
+
+        let other = (1 << 28) | (3 << 12) | 7;
+        world.set(other, Ternary::True); // 新车道，重建
+        fork.refresh_world(&world);
+        assert_eq!(fork.keys(), &[other.min(KEY), other.max(KEY)]);
+    }
+
+    #[test]
+    fn predict_all_into_reuses_buffer() {
+        let mut world = TritWorld::new();
+        world.set(KEY, Ternary::True);
+        let mut fork = WorldProjectionFork::fork_from(&world, TakeoverConfig::default());
+        for _ in 0..6 {
+            fork.record_outcome(KEY, true);
+        }
+        let mut out = Vec::with_capacity(8);
+        fork.predict_all_into(&mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, KEY);
+        assert_eq!(out[0].1, Ternary::True);
+        let cap = out.capacity();
+        fork.predict_all_into(&mut out);
+        assert_eq!(out.capacity(), cap, "第二次不应扩容");
     }
 }

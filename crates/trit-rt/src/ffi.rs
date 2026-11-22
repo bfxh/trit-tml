@@ -23,7 +23,7 @@ use crate::wire::{Writer, frame_response, op};
 /// 算了：v2 的老 DLL 会让每次批量提交拿到 `BAD_OP`，于是每 tick 都失败、
 /// 钩子被熔断，表象是「模组忽然完全没作用」。递增后这种混装会在装载期被
 /// 版本检查挡下，干净地退回托管内核（功能完整，只是慢）。
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// 运行时版本：`0x00_MM_mm_pp`（0.1.0）。
 pub const RUNTIME_VERSION: u32 = 0x00_01_00_00;
@@ -609,11 +609,11 @@ pub unsafe extern "C" fn tt_rt_action_plan(handle: u64, out: *mut u8, cap: usize
 
 /// `0x20 STATE_PUSH`：整批推送实体状态（TritEnginePort 的输入）。
 ///
-/// 载荷：`count u32, [定长 83 字节记录] * n`（见 `wire::STATE_RECORD_LEN`）。
+/// 载荷：`count u32, [变长记录] * n`（见 `wire::STATE_RECORD_FIXED_LEN`）。
 ///
 /// 返回值：
 /// - `0` 全部 OK（包括 L0 零开销降级 —— 载荷被吞掉）
-/// - `TT_ERR_ARG` 载荷损坏（count 与字节数不匹配）—— 已有状态表未被改动
+/// - `TT_ERR_ARG` 载荷损坏（截断 / 多余字节）—— 已有状态表未被改动
 /// - `TT_ERR_PANIC` Rust panic 穿透边界
 ///
 /// # Safety

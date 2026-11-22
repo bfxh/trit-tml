@@ -119,19 +119,83 @@ pub mod op {
     /// 实体状态推送（Phase 2 TritEnginePort）：把当前世界的完整实体状态喂给内核，
     /// 让 `trit-engine` 能跑原版等价 AI 而不是只做历史外推。
     ///
-    /// 载荷：`count u32, [record] * n`，每条 record 定长 [`STATE_RECORD_LEN`] 字节：
-    /// `kind u8, slot i32, type i32, velocity_x f32, velocity_y f32, position_x f32,
-    ///  position_y f32, direction i32, life i32, life_max i32, target i32,
-    ///  ai[8] f32, walk_speed f32, target_distance f32, tile_below u8, on_ground u8`
+    /// 载荷：`count u32, [record] * n`，每条 record 变长：
+    /// `kind u8, slot u16, type u16, vel_x i16, vel_y i16, dir i8, flags u8,
+    ///  walk_speed i16, target_distance u16, ai_mask u8, ai_q i16 * popcount(ai_mask)`。
+    ///
+    /// 定长部分 [`STATE_RECORD_FIXED_LEN`] = 16 字节，每个非零 ai 槽再加 2 字节。
+    /// 位置 / 生命 / target 槽值 / ai[2..8] 引擎不消费，不再传输（旧版每条 83 字节）。
     ///
     /// 响应：空。整批**替换**上一 tick 的状态表（不是增量合并）—— 消失的实体自然被清掉。
     /// `takeover_fork == None`（L0）时忽略载荷，零开销。
     pub const STATE_PUSH: u32 = 0x20;
 }
 
-/// [`op::STATE_PUSH`] 单条实体状态记录的字节长度。
-/// `u8(1) + i32(6)*4 + f32(4)*4 + f32(8)*4 + f32(2)*4 + u8(2)` = 1 + 24 + 16 + 32 + 8 + 2 = 83。
-pub const STATE_RECORD_LEN: usize = 83;
+/// [`op::STATE_PUSH`] 单条实体状态记录的定长部分（不含变长 ai 值）。
+/// `u8(1) + u16(2)*3 + i16(2)*2 + i8(1) + u8(1) + u16(2) + u8(1)` = 16。
+pub const STATE_RECORD_FIXED_LEN: usize = 16;
+
+/// ai 槽数量（`ai_mask` 的位宽）。
+pub const STATE_AI_SLOTS: usize = 8;
+
+/// velocity / walk_speed 量化比例：`q = round(v * 256)`，范围约 ±128。
+pub const STATE_VELOCITY_SCALE: f32 = 256.0;
+/// walk_speed 量化比例（与 velocity 同精度）。
+pub const STATE_WALK_SPEED_SCALE: f32 = 256.0;
+/// ai 量化比例：`q = round(ai * 16)`，范围约 ±2048。
+pub const STATE_AI_SCALE: f32 = 16.0;
+/// target_distance 量化比例：`q = round(d * 4)`，u16 范围约 16383 px。
+pub const STATE_TARGET_DISTANCE_SCALE: f32 = 4.0;
+
+/// [`op::STATE_PUSH`] 记录里的标志位。
+pub mod state_flags {
+    /// NPC 站在地面上。
+    pub const ON_GROUND: u8 = 1 << 0;
+    /// 脚下有方块。
+    pub const TILE_BELOW: u8 = 1 << 1;
+    /// Projectile 处于活跃状态（旧版复用 `on_ground` 字节）。
+    pub const ACTIVE: u8 = 1 << 2;
+    /// NPC 有目标（旧版 `target >= 0`；引擎只判符号）。
+    pub const HAS_TARGET: u8 = 1 << 3;
+}
+
+/// 一条 STATE_PUSH 记录的总字节数（定长部分 + 2 × 非零 ai 槽数）。
+#[inline]
+pub fn state_record_len(ai_mask: u8) -> usize {
+    STATE_RECORD_FIXED_LEN + 2 * ai_mask.count_ones() as usize
+}
+
+/// 量化到 i16（四舍五入 + 饱和）。
+#[inline]
+pub fn quantize_i16(value: f32, scale: f32) -> i16 {
+    let scaled = (value * scale).round();
+    if scaled.is_nan() {
+        return 0;
+    }
+    scaled.clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+/// 反量化 i16。
+#[inline]
+pub fn dequantize_i16(value: i16, scale: f32) -> f32 {
+    value as f32 / scale
+}
+
+/// 量化到 u16（四舍五入 + 饱和，负数归零）。
+#[inline]
+pub fn quantize_u16(value: f32, scale: f32) -> u16 {
+    let scaled = (value * scale).round();
+    if scaled.is_nan() || scaled <= 0.0 {
+        return 0;
+    }
+    scaled.min(u16::MAX as f32) as u16
+}
+
+/// 反量化 u16。
+#[inline]
+pub fn dequantize_u16(value: u16, scale: f32) -> f32 {
+    value as f32 / scale
+}
 
 /// 查询编号。
 pub mod query {
@@ -200,6 +264,20 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0])
     }
 
+    pub fn i8(&mut self) -> Result<i8, RtError> {
+        Ok(self.take(1)?[0] as i8)
+    }
+
+    pub fn u16(&mut self) -> Result<u16, RtError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    pub fn i16(&mut self) -> Result<i16, RtError> {
+        let b = self.take(2)?;
+        Ok(i16::from_le_bytes([b[0], b[1]]))
+    }
+
     pub fn u32(&mut self) -> Result<u32, RtError> {
         let b = self.take(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -256,6 +334,21 @@ impl Writer {
 
     pub fn u8(&mut self, value: u8) -> &mut Self {
         self.buf.push(value);
+        self
+    }
+
+    pub fn i8(&mut self, value: i8) -> &mut Self {
+        self.buf.push(value as u8);
+        self
+    }
+
+    pub fn u16(&mut self, value: u16) -> &mut Self {
+        self.buf.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    pub fn i16(&mut self, value: i16) -> &mut Self {
+        self.buf.extend_from_slice(&value.to_le_bytes());
         self
     }
 
@@ -380,6 +473,39 @@ mod tests {
         assert_eq!(r.i32().unwrap(), -5);
         assert_eq!(r.u64().unwrap(), 0x0102_0304_0506_0708);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn round_trip_short_primitives() {
+        let mut w = Writer::new();
+        w.i8(-128).u16(0xBEEF).i16(-1234);
+        let bytes = w.into_vec();
+        assert_eq!(bytes.len(), 1 + 2 + 2);
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.i8().unwrap(), -128);
+        assert_eq!(r.u16().unwrap(), 0xBEEF);
+        assert_eq!(r.i16().unwrap(), -1234);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn quantization_saturates_and_round_trips() {
+        assert_eq!(quantize_i16(1.5, 256.0), 384);
+        assert_eq!(dequantize_i16(384, 256.0), 1.5);
+        assert_eq!(quantize_i16(-1000.0, 256.0), i16::MIN);
+        assert_eq!(quantize_i16(f32::NAN, 256.0), 0);
+        assert_eq!(quantize_u16(-1.0, 4.0), 0);
+        assert_eq!(quantize_u16(50.0, 4.0), 200);
+        assert_eq!(dequantize_u16(200, 4.0), 50.0);
+        assert_eq!(quantize_u16(1e9, 4.0), u16::MAX);
+    }
+
+    #[test]
+    fn state_record_len_matches_v2_layout() {
+        assert_eq!(STATE_RECORD_FIXED_LEN, 16);
+        assert_eq!(state_record_len(0b0000_0000), 16);
+        assert_eq!(state_record_len(0b0000_0011), 20);
+        assert_eq!(state_record_len(0b1111_1111), 32);
     }
 
     #[test]

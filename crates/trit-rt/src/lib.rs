@@ -38,6 +38,7 @@ pub mod snapshot;
 pub mod takeover;
 pub mod txn;
 pub mod wire;
+pub mod world;
 
 pub use error::RtError;
 pub use gpu::{GpuConfig, GpuPolicy, GpuStatus};

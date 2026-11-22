@@ -497,40 +497,151 @@ public sealed class RuntimeShim : IDisposable
     public bool PushEntityStates(IReadOnlyList<EntitySnapshot> states)
     {
         int count = states.Count;
-        var writer = new WireWriter(4 + (count * WireFormat.StateRecordLength));
+
+        // 先精确算长度（16 B 定长 + 每个非零 ai 槽 2 B），一次分配到位。
+        int payloadSize = 4;
+        for (int i = 0; i < count; i++)
+        {
+            int aiSlots = System.Numerics.BitOperations.PopCount(AiMask(states[i]));
+            payloadSize += WireFormat.StateRecordFixedLength + (2 * aiSlots);
+        }
+
+        var writer = new WireWriter(payloadSize);
         writer.U32((uint)count);
         for (int i = 0; i < count; i++)
         {
             var state = states[i];
+            byte aiMask = AiMask(state);
+
+            byte flags = 0;
+            if (state.OnGround)
+            {
+                flags |= (byte)StateFlags.OnGround;
+            }
+
+            if (state.TileBelow)
+            {
+                flags |= (byte)StateFlags.TileBelow;
+            }
+
+            // mod 侧只推送活跃弹幕；旧协议用 on_ground 字节承载 active，这里显式分离。
+            if (state.Kind == EntityKinds.Projectile && state.OnGround)
+            {
+                flags |= (byte)StateFlags.Active;
+            }
+
+            if (state.Target >= 0)
+            {
+                flags |= (byte)StateFlags.HasTarget;
+            }
+
             writer
                 .U8(state.Kind)
-                .I32(state.Slot)
-                .I32(state.Type)
-                .F32(state.VelocityX)
-                .F32(state.VelocityY)
-                .F32(state.PositionX)
-                .F32(state.PositionY)
-                .I32(state.Direction)
-                .I32(state.Life)
-                .I32(state.LifeMax)
-                .I32(state.Target)
-                .F32(state.Ai0)
-                .F32(state.Ai1)
-                .F32(state.Ai2)
-                .F32(state.Ai3)
-                .F32(state.Ai4)
-                .F32(state.Ai5)
-                .F32(state.Ai6)
-                .F32(state.Ai7)
-                .F32(state.WalkSpeed)
-                .F32(state.TargetDistance)
-                .U8(state.TileBelow ? (byte)1 : (byte)0)
-                .U8(state.OnGround ? (byte)1 : (byte)0);
+                .U16(ClampToU16(state.Slot))
+                .U16(ClampToU16(state.Type))
+                .I16(WireFormat.QuantizeI16(state.VelocityX, WireFormat.StateVelocityScale))
+                .I16(WireFormat.QuantizeI16(state.VelocityY, WireFormat.StateVelocityScale))
+                .I8((sbyte)Math.Clamp(state.Direction, sbyte.MinValue, sbyte.MaxValue))
+                .U8(flags)
+                .I16(WireFormat.QuantizeI16(state.WalkSpeed, WireFormat.StateWalkSpeedScale))
+                .U16(WireFormat.QuantizeU16(state.TargetDistance, WireFormat.StateTargetDistanceScale))
+                .U8(aiMask);
+
+            if ((aiMask & (1 << 0)) != 0)
+            {
+                writer.I16(WireFormat.QuantizeI16(state.Ai0, WireFormat.StateAiScale));
+            }
+
+            if ((aiMask & (1 << 1)) != 0)
+            {
+                writer.I16(WireFormat.QuantizeI16(state.Ai1, WireFormat.StateAiScale));
+            }
+
+            if ((aiMask & (1 << 2)) != 0)
+            {
+                writer.I16(WireFormat.QuantizeI16(state.Ai2, WireFormat.StateAiScale));
+            }
+
+            if ((aiMask & (1 << 3)) != 0)
+            {
+                writer.I16(WireFormat.QuantizeI16(state.Ai3, WireFormat.StateAiScale));
+            }
+
+            if ((aiMask & (1 << 4)) != 0)
+            {
+                writer.I16(WireFormat.QuantizeI16(state.Ai4, WireFormat.StateAiScale));
+            }
+
+            if ((aiMask & (1 << 5)) != 0)
+            {
+                writer.I16(WireFormat.QuantizeI16(state.Ai5, WireFormat.StateAiScale));
+            }
+
+            if ((aiMask & (1 << 6)) != 0)
+            {
+                writer.I16(WireFormat.QuantizeI16(state.Ai6, WireFormat.StateAiScale));
+            }
+
+            if ((aiMask & (1 << 7)) != 0)
+            {
+                writer.I16(WireFormat.QuantizeI16(state.Ai7, WireFormat.StateAiScale));
+            }
         }
 
         var response = host.Kernel.Submit(Opcode.StatePush, writer.ToArray());
         return response.IsOk;
     }
+
+    /// <summary>非零 ai 槽的位图，与 Rust 侧 <c>ai_mask</c> 一致。</summary>
+    private static byte AiMask(EntitySnapshot state)
+    {
+        byte mask = 0;
+        if (state.Ai0 != 0f)
+        {
+            mask |= 1 << 0;
+        }
+
+        if (state.Ai1 != 0f)
+        {
+            mask |= 1 << 1;
+        }
+
+        if (state.Ai2 != 0f)
+        {
+            mask |= 1 << 2;
+        }
+
+        if (state.Ai3 != 0f)
+        {
+            mask |= 1 << 3;
+        }
+
+        if (state.Ai4 != 0f)
+        {
+            mask |= 1 << 4;
+        }
+
+        if (state.Ai5 != 0f)
+        {
+            mask |= 1 << 5;
+        }
+
+        if (state.Ai6 != 0f)
+        {
+            mask |= 1 << 6;
+        }
+
+        if (state.Ai7 != 0f)
+        {
+            mask |= 1 << 7;
+        }
+
+        return mask;
+    }
+
+    /// <summary>把 int 饱和到 u16（协议只承载非负槽位/类型）。</summary>
+    private static ushort ClampToU16(int value) =>
+        value <= 0 ? (ushort)0 : (ushort)Math.Min(value, ushort.MaxValue);
 
     /// <summary>
     /// <c>Mod.Call</c> 契约入口。模组侧这样暴露：
@@ -984,13 +1095,16 @@ public static class EntityKinds
 }
 
 /// <summary>
-/// 一条实体状态快照，对应 STATE_PUSH 的定长记录（<see cref="WireFormat.StateRecordLength"/> 字节）。
-/// 字段顺序即线上顺序，不能调整。
+/// 一条实体状态快照，对应 STATE_PUSH 的一条变长记录。
 /// </summary>
 /// <remarks>
-/// Projectile 复用部分字段：<see cref="Target"/> = 追踪目标、
-/// <see cref="OnGround"/> = <c>active</c>、<see cref="TileBelow"/> = 脚下有方块；
-/// 重力在内核侧固定 0.08。<see cref="Ai2"/>..<see cref="Ai7"/> 目前引擎未使用，填 0 即可。
+/// v2 协议只传输引擎真正消费的字段：kind/slot/type、velocity、direction、flags、
+/// walk_speed、target_distance、非零 ai 槽。
+/// <see cref="PositionX"/>、<see cref="PositionY"/>、<see cref="Life"/>、
+/// <see cref="LifeMax"/>、<see cref="Target"/> 的槽值、<see cref="Ai2"/>..<see cref="Ai7"/>
+/// 不再上线（保留字段是为了不破坏模组侧构造代码）。
+/// Projectile 复用：<see cref="OnGround"/> = <c>active</c>、
+/// <see cref="Target"/> 仅用于 <c>HasTarget</c> 标志；重力在内核侧固定 0.08。
 /// </remarks>
 public struct EntitySnapshot
 {

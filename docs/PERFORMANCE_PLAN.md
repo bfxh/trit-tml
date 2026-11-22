@@ -1,7 +1,7 @@
 # 性能与内存优化方案：加载链路 + Rust 三进制/二进制编码
 
 > **状态**：方案文档，本轮不含任何代码改动。
-> **基线数据来源**：2026-11-17 02:08–02:13 的 `tModLoader-Logs/client.log`，以及本机已装模组体积扫描。
+> **基线数据来源**：2026-11-17 02:08–02:21 的 `tModLoader-Logs/client.log`（34,141 行 / 3.94 MB），以及本机已装模组体积扫描。
 > **前置文档**：[TAKEOVER_PLAN.md](./TAKEOVER_PLAN.md)（接管档位）、[ABI.md](./ABI.md)（线协议）。
 
 ---
@@ -61,22 +61,35 @@
 | 指标 | 数值 |
 |---|---|
 | tML 进程物理内存 | 2.1 – 2.4 GB |
-| tML 虚拟内存 | 3.0 – 3.1 GB |
-| 全系统进程占用 | 12.7 – 12.8 GB |
-| 系统可用 | **2.6 GB** |
+| tML 虚拟内存 | 3.0 – 5.7 GB（装载期峰值 5.7 GB） |
+| 全系统进程占用 | 12.5 – 12.8 GB |
+| 全系统虚拟内存 | **18.5 – 21.2 GB**（已超 15.4 GB 装机内存） |
+| 系统可用 | **2.6 – 2.8 GB** |
 | 物理内存总量 | 15.4 GB |
 | Mods 目录总占用 | 0.17 GB（含子目录 `ImproveGame`） |
 | 单文件最大 | `CalamityEntropyLegacy.tmod` **169.68 MB** |
 
-按加载会话统计的模组内存：
+日志中的 4 个内存快照（`RAM physical` / `RAM virtual` 行）：
 
-| 会话 | Top 模组 |
-|---|---|
-| 02:09:48 | TritRuntimeMod **4.4 MB** |
-| 02:12:04 | FargowiltasSouls **224.2 MB**、NecromancerRise 45.3 MB、Fargowiltas 12.4 MB |
-| 02:13:46 | NecromancerRise 54.2 MB、HEROsMod 9.5 MB、Luminance 5.3 MB |
+| 时刻 | 日志行 | tML 物理 | tML 虚拟 | 全进程物理 | 全进程虚拟 | 系统可用 |
+|---|---|---|---|---|---|---|
+| 02:09:05 | L2133–2135 | 2.3 GB | 5.7 GB | 12.5 GB | 21.2 GB | 2.8 GB |
+| 02:09:48 | L5408–5410 | 2.2 GB | 3.0 GB | 12.7 GB | 18.6 GB | 2.6 GB |
+| 02:12:04 | L7628–7630 | 2.1 GB | 3.0 GB | 12.8 GB | 18.6 GB | — |
+| 02:13:46 | L9867–9869 | 2.4 GB | 3.1 GB | 12.8 GB | 18.5 GB | 2.6 GB |
 
-**结论**：模组加起来最多约 280 MB，tML 的 2.2 GB 里大头是**原版资源 + FNA/音频 + JIT 代码 + 世界数据**。所以「内存臃肿」的第一责任方在系统侧（12.7 GB 全进程），第二责任方是**同时加载的大 mod 组合**，不在本模组。
+四次快照都伴随 `Total system memory usage exceeds installed physical memory` 告警；另有一次 `RAM usage has increased: 3.2 GB`（L7711，世界生成阶段）。
+
+按加载会话统计的模组内存（`Mods using the most RAM` 行）：
+
+| 会话 | 日志行 | Top 模组 |
+|---|---|---|
+| 02:09:05 | L2132 | **CalamityMod 3.1 GB**、CatalystMod 504.9 MB、CalamityEntropyLegacy 327.2 MB |
+| 02:09:48 | L5407 | TritRuntimeMod **4.4 MB** |
+| 02:12:04 | L7627 | FargowiltasSouls **224.2 MB**、NecromancerRise 45.3 MB、Fargowiltas 12.4 MB |
+| 02:13:46 | L9866 | NecromancerRise 54.2 MB、HEROsMod 9.5 MB、Luminance 5.3 MB |
+
+**结论**：CalamityMod 的 3.1 GB 是**提交内存**口径（大于 tML 物理占用 2.3 GB，说明部分已换出），一家就超过其余所有模组总和；模组 RAM 合计约 3.5 GB。tML 的 2.2 GB 物理内存里大头是**原版资源 + FNA/音频 + JIT 代码 + 世界数据**。所以「内存臃肿」的第一责任方在系统侧（12.5–12.8 GB 全进程、虚拟内存超装机），第二责任方是**同时加载的大 mod 组合**，不在本模组。
 
 > 换机建议（最直接）：24 核 / 15.4 GB 属于「CPU 过剩、内存偏紧」的典型配置。开 tML + Calamity 全家桶时，浏览器/Electron 应用会直接抢走 6–10 GB。先把可用内存拉到 4 GB 以上，比任何代码优化都有效。
 
@@ -87,11 +100,14 @@
 | `Mod Load Completed` | 4 次（3 次重载） | 全程未重启进程 |
 | tML 物理内存 | 2.1 GB → **2.4 GB** | 3 次重载净增约 300 MB |
 | tML 虚拟内存 | 3.0 GB → 3.1 GB | 同上 |
-| `AssemblyLoadContext still using memory` | **99 条 = 33 个模组 × 3 次** | 每次热重载整套模组程序集都卸不掉 |
-| 本模组日志占比 | **24,285 / 34,141 行 = 71.1%** | 7 分钟写出 3.85 MB，其中「派发」23,877 行 |
+| `AssemblyLoadContext still using memory` | **99 条 = ALC 70 + mod class 29**，去重 **33 个模组** | 三轮分别 32 / 32 / 35 条，名单高度重合 |
+| 本模组日志占比 | **24,285 / 34,141 行 = 71.1%**（2.46 / 3.94 MB = 64.3%） | 7 分钟写出 3.94 MB，其中「派发」23,877 行 |
+| 「派发」日志 | 23,877 行、均长 100.4 字符、**约 2.42 MB** | 频率约 **56 行/秒、5.8 KB/s**，每 tick ≈ 1.5 条 |
+| 日志分配估算 | **6–8 MB 瞬时 UTF-16 字符串** | 每行一次插值 + 一次同步写盘，全在主线程 |
 | 校准样本 | `autoSamples=1892`、`autoConsistent=1465` | 一致率 **77.4%**（未达 95% 升级线） |
 | 日志上限 | `maxLogEntries=1048576` | 按 5 B/条 ≈ **5 MB** 常驻 |
 | 详细日志开关 | `verboseLogging=true`、`logJobResults=true` | 逐 tick 打日志的直接原因 |
+| GC / 托管堆 / OOM 记录 | **0 条** | 日志未记录 Gen0/1/2 与堆大小，无法定量判断碎片 |
 
 两个新结论：
 
@@ -149,8 +165,10 @@
 
 | 模组 | `.tmod` | 加载后 RAM | 备注 |
 |---|---|---|---|
-| CalamityEntropyLegacy | 169.68 MB | — | 单文件最大，扫描/解包成本高 |
-| FargowiltasSouls | 小 | **224.2 MB** | 内存第一大户 |
+| CalamityMod | 大 | **3.1 GB**（提交内存） | 一家超过其余总和，部分已换出 |
+| CatalystMod | — | **504.9 MB** | Calamity 系依赖 |
+| CalamityEntropyLegacy | 169.68 MB | 327.2 MB | 单文件最大，扫描/解包成本高 |
+| FargowiltasSouls | 小 | **224.2 MB** | 内存第二大户 |
 | NecromancerRise | 小 | 45.3 / 54.2 MB | 稳定中高位 |
 | Fargowiltas | 小 | 12.4 MB | — |
 | HEROsMod | 0.06 MB | 9.5 MB | 体积小、内存不小 |
@@ -309,27 +327,33 @@ pub fn pack5(t: &[Ternary]) -> Vec<u8> {
 
 ### 5.3 世界投影：`BTreeMap` → 分页 SoA
 
-`LaneMap` 的键是 `(kind << 28) | (slot << 12) | field`，天然稀疏，不能直接当数组下标。推荐两级结构：
+`LaneMap` 的键是 `(kind << 28) | (slot << 12) | field`。生产字段只有 1..=9、种类只有
+1..=3，所以不需要通用 `HashMap` 索引，直接按「种类 × 字段」切 27 个平面：
 
 ```rust
-/// 第一级：把稀疏 key 映成稠密 lane id（只在建表/销毁时更新）。
-struct LaneIndex {
-    key_to_id: HashMap<u32, u32>,   // 仅结构变化时改动
-    id_to_key: Vec<u32>,
+/// 每个平面按 slot 分页：128 slot × 2 bit = 256 bit = 4 × u64 = 32 B/页。
+struct Plane {
+    pages: Vec<Option<Box<[u64; 4]>>>,   // 惰性分配
 }
 
-/// 第二级：按 lane id 连续存放 2-bit 值，分页避免扩容拷贝。
 struct TritWorld {
-    lanes: LaneIndex,
-    pages: Vec<Box<[u64; 16]>>,    // 每页 1024 trits = 256 B
+    fast: [[Plane; 9]; 3],               // [kind-1][field-1]
+    overflow: BTreeMap<u32, u8>,         // kind ∉ 1..=3 或 field ∉ 1..=9
+    len: usize,
+    serial: u64,                         // 结构版本（新增车道/清空时递增）
 }
 ```
 
 要点：
 
-- **热路径不再有树**：`get/set` 是两次索引 + 位运算，无指针追逐、无分配。
-- **fork 不再整份 clone**：fork 只需 `Vec<Box<[u64]>>` 的 `clone`（连续内存 memcpy，比 B 树快一个数量级），或直接用 `Arc<[u64]>` + 写时复制。
-- `history: BTreeMap<u32, Vec<bool>>` 改为**按 lane id 的环形位图**（`Vec<u64>` + head 索引），彻底消除每键 `Vec` 分配。
+- **`0b11` 作缺失哨兵**：`Ternary` 只占 0/1/2，2 bit 的第四种编码天然表示「车道不存在」，
+  不需要额外的存在位图。
+- **热路径不再有树**：`get/set` 是页索引 + 位运算，无指针追逐、无分配（页只在首次写入时分配）。
+- **fork 不再持有世界值**：预测只依赖键集；fork 仅在 `serial` 变化时用复用的 `Vec<u32>`
+  重建键集，值完全不复制。原实现里从未被读取的 `snapshot` 字段已删除。
+- `history` 改为每键一个内联 `u64` 环形位图（`bits/len/head/window`），与 `divergences`
+  合并进同一个 B 树节点，彻底消除每键 `Vec` 分配。
+- 实测：1 万车道 `allocated_bytes()` = **4048 B**（旧约 100 KB）。
 
 ### 5.4 `STATE_PUSH` v2：83 B → ≤ 32 B
 
@@ -359,20 +383,20 @@ v2 布局（量化 + 位域 + 按需字段）：
 u8  kind
 u16 slot                // 槽位上限 65535，足够
 u16 type                // NPC/Projectile 类型 < 65535
-i16 vel_x_q             // vel × 256，±128 px/tick 精度 1/256
+i16 vel_x_q             // vel × 256，±128 px/tick，精度 1/256
 i16 vel_y_q
-i16 pos_dx_q            // 相对玩家/镜头中心的偏移，绝对位置由 C# 侧补
-i16 pos_dy_q
 i8  dir
 u8  flags               // bit0 on_ground, bit1 tile_below, bit2 active, bit3 has_target
-i16 target_dist_q
+i16 walk_speed_q        // × 256（引擎的 slime 分支会消费）
+u16 target_dist_q       // × 4，u16 覆盖 16383 px
 u8  ai_mask             // 哪几个 ai 槽非零
-[i16; popcount(ai_mask)] // 量化后的 ai 值
+[i16; popcount(ai_mask)] // ai × 16，覆盖 ±2048 的计时器
 ```
 
-- 固定部分 **17 B**；多数 NPC 只用到 2 个 ai 槽 → 平均 **21 B**，比 83 B **↓ 75%**。
-- 可选「增量模式」：每 tick 只发变了的实体，配一个 `BitSet`（200 实体 = 25 B），世界静止时接近 0 字节。
-- `life/life_max/walk_speed` 由内核按 `type` 查表推导，不必每帧传输。
+- 定长部分 **16 B**；多数 NPC 只用到 2 个 ai 槽 → 平均 **20 B**，比 83 B **↓ 76%**。
+- `position/life/life_max/target 槽值/ai[2..7]` 引擎不消费，直接不传。
+- 载荷变长后不再做 `count × 83` 长度预检，改为逐条解析 + 结尾必须恰好耗尽；截断或多余字节一律 `InvalidInput`，且不改动已有状态表。
+- 可选「增量模式」仍是 P2 的事：每 tick 只发变了的实体，配一个 `BitSet`（200 实体 = 25 B）。
 
 配套的 Rust 侧存储也换掉 `BTreeMap`：
 

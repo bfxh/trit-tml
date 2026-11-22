@@ -6,7 +6,7 @@
 //! - 它**从不持有** Player / NPC / Tile 等 Unity/tModLoader 对象；
 //! - 所有真实状态修改由 C# 在游戏主线程提交。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -25,6 +25,7 @@ use crate::scan::{ScanRequest, normalize_owner};
 use crate::snapshot::{DiffEntry, Snapshot, diff_worlds, encode_diff, encode_world};
 use crate::txn::{TxnLog, TxnTable};
 use crate::wire::{self, Reader, Writer, op, query};
+use crate::world::TritWorld;
 
 /// 世界车道数上限（防无界增长吃内存）。
 pub const MAX_WORLD_LANES: usize = 1 << 20;
@@ -277,8 +278,8 @@ pub struct TritRuntime {
     router: EventRouter,
     log: TxnLog,
     txns: TxnTable,
-    /// 世界投影：车道键 → 三进制值。
-    world: BTreeMap<u32, Ternary>,
+    /// 世界投影：车道键 → 三进制值（2-bit 分页存储）。
+    world: TritWorld,
     snapshots: BTreeMap<u64, Snapshot>,
     next_snapshot_id: u64,
     prng: DeterministicPrng,
@@ -298,6 +299,8 @@ pub struct TritRuntime {
     /// TritEnginePort 的实体状态表（`STATE_PUSH` 每 tick 整批替换）。
     /// 空表 = 引擎不参与，`ACTION_PLAN` 全走历史外推。
     entity_states: BTreeMap<(u8, i32), EntityState>,
+    /// 预测输出缓冲：复用容量，稳态零分配。
+    plan_buf: Vec<(u32, Ternary, f32)>,
 }
 
 /// 一条实体状态（STATE_PUSH 推来的）。
@@ -377,43 +380,33 @@ fn merge_engine_predictions(
     fork: &crate::takeover::WorldProjectionFork,
     entity_states: &BTreeMap<(u8, i32), EntityState>,
     tick: u64,
-) -> Vec<(u32, Ternary, f32)> {
-    let historical = fork.predict_all();
+    out: &mut Vec<(u32, Ternary, f32)>,
+) {
+    out.clear();
     if entity_states.is_empty() {
-        return historical;
-    }
-
-    let keys = fork.keys();
-    if keys.is_empty() {
-        return historical;
+        fork.predict_all_into(out);
+        return;
     }
 
     // 引擎 PRNG 按 tick 播种：同 tick 内可复现，且不污染主 PRNG 流。
     let mut rand = trit_engine::prng::Prng::new(tick.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let mut covered = BTreeSet::new();
-    let mut merged: Vec<(u32, Ternary, f32)> = Vec::with_capacity(keys.len());
 
-    for key in keys {
+    // 单遍合并：引擎表态的键直接采用；引擎不表态的键落回历史外推。
+    // 等价于「引擎结果 + 未被引擎覆盖的历史结果」，但不需要临时 BTreeSet 与中间 Vec。
+    for &key in fork.keys() {
         match engine_opinion(entity_states, key, &mut rand) {
-            Some(EngineOpinion::Predict(trit, conf)) => {
-                covered.insert(key);
-                merged.push((key, trit, conf));
+            Some(EngineOpinion::Predict(trit, conf)) => out.push((key, trit, conf)),
+            Some(EngineOpinion::Abstain) => {}
+            None => {
+                let predicted = fork.predict(key).filter(|trit| *trit != Ternary::Unknown);
+                if let Some(trit) = predicted {
+                    out.push((key, trit, fork.confidence_of(key)));
+                }
             }
-            Some(EngineOpinion::Abstain) => {
-                covered.insert(key);
-            }
-            None => {}
         }
     }
 
-    for (key, trit, conf) in historical {
-        if !covered.contains(&key) {
-            merged.push((key, trit, conf));
-        }
-    }
-
-    merged.sort_by_key(|(key, _, _)| *key);
-    merged
+    out.sort_unstable_by_key(|(key, _, _)| *key);
 }
 
 impl TritRuntime {
@@ -421,7 +414,7 @@ impl TritRuntime {
         let pool = Arc::new(JobPool::new(config.parallel, config.gpu));
         // 只有显式配置了 takeover 才创建 fork。保持 Default/桌面/L0 全部零开销。
         let takeover_fork = config.takeover.as_ref().map(|tc| {
-            crate::takeover::WorldProjectionFork::fork_from(&BTreeMap::new(), tc.clone())
+            crate::takeover::WorldProjectionFork::fork_from(&TritWorld::new(), tc.clone())
         });
         Self {
             router: EventRouter::new(config.max_subscribers),
@@ -430,7 +423,7 @@ impl TritRuntime {
             config,
             tick: 0,
             log: TxnLog::new(),
-            world: BTreeMap::new(),
+            world: TritWorld::new(),
             snapshots: BTreeMap::new(),
             next_snapshot_id: 0,
             prng: DeterministicPrng::new(0),
@@ -444,6 +437,7 @@ impl TritRuntime {
             pool,
             takeover_fork,
             entity_states: BTreeMap::new(),
+            plan_buf: Vec::new(),
         }
     }
 
@@ -453,7 +447,7 @@ impl TritRuntime {
     }
 
     /// 世界投影（只读视图）。
-    pub fn world(&self) -> &BTreeMap<u32, Ternary> {
+    pub fn world(&self) -> &TritWorld {
         &self.world
     }
 
@@ -567,7 +561,7 @@ impl TritRuntime {
     /// **`router`（订阅关系）**——订阅属于"模组装载期"，跨存档依然有效；
     /// 清掉它会让调用方手里的 sub id 全部失效，派发静默停止，比多占几 KB 糟得多。
     pub fn reset_session(&mut self) {
-        self.world = BTreeMap::new();
+        self.world = TritWorld::new();
         self.snapshots = BTreeMap::new();
         self.next_snapshot_id = 0;
         // 换实例而不是 clear()：SoA 的 Vec 容量会随实例一起归还给分配器，
@@ -774,19 +768,19 @@ impl TritRuntime {
     /// - 配置了 `prediction_interval_ticks` → 每隔 N tick 才真正预测（中间 tick 返回空）。
     /// - 置信度门禁 / divergence_tolerance 在 fork.predict_all 里自动过滤。
     fn op_predictions(&mut self) -> Result<Vec<u8>, RtError> {
-        let Some(fork) = self.takeover_fork.as_mut() else {
-            // L0：零开销降级
-            let mut w = Writer::new();
-            w.u32(0);
-            return Ok(w.into_vec());
-        };
-
         let interval = self
             .config
             .takeover
             .as_ref()
             .map(|tc| tc.prediction_interval_ticks)
             .unwrap_or(1);
+
+        let Some(fork) = self.takeover_fork.as_mut() else {
+            // L0：零开销降级
+            let mut w = Writer::new();
+            w.u32(0);
+            return Ok(w.into_vec());
+        };
         if interval > 0 && !self.tick.is_multiple_of(interval as u64) {
             // 不在预测窗口 → 返回空（C# 侧跳过）
             let mut w = Writer::new();
@@ -794,13 +788,24 @@ impl TritRuntime {
             return Ok(w.into_vec());
         }
 
-        // 刷新 fork 的世界投影（每次 predictions 调用都 clone 一份当前 world）
+        // 刷新键集（结构未变时直接返回；值不复制）。
         fork.refresh_world(&self.world);
-        let preds = fork.predict_all();
+
+        let Self {
+            takeover_fork,
+            plan_buf,
+            ..
+        } = self;
+        let Some(fork) = takeover_fork.as_ref() else {
+            let mut w = Writer::new();
+            w.u32(0);
+            return Ok(w.into_vec());
+        };
+        fork.predict_all_into(plan_buf);
 
         let mut writer = Writer::new();
-        writer.u32(preds.len() as u32);
-        for (key, trit, _conf) in preds {
+        writer.u32(plan_buf.len() as u32);
+        for &(key, trit, _conf) in plan_buf.iter() {
             writer.u32(key);
             writer.u8(wire::trit_byte(trit));
         }
@@ -808,21 +813,21 @@ impl TritRuntime {
     }
 
     /// `0x1F ACTION_PLAN`：完整 intent 列表 + 置信度。
-    /// 和 op_predictions 复用同一个 fork.predict_all()（避免 clone 世界投影两次），
+    /// 和 op_predictions 复用同一个 fork（避免 clone 世界投影两次），
     /// 区别只在于返回格式多了 `confidence f32(IEEE754)` 每 key 4 字节。
     fn op_action_plan(&mut self) -> Result<Vec<u8>, RtError> {
-        let Some(fork) = self.takeover_fork.as_mut() else {
-            let mut w = Writer::new();
-            w.u32(0);
-            return Ok(w.into_vec());
-        };
-
         let interval = self
             .config
             .takeover
             .as_ref()
             .map(|tc| tc.prediction_interval_ticks)
             .unwrap_or(1);
+
+        let Some(fork) = self.takeover_fork.as_mut() else {
+            let mut w = Writer::new();
+            w.u32(0);
+            return Ok(w.into_vec());
+        };
         if interval > 0 && !self.tick.is_multiple_of(interval as u64) {
             let mut w = Writer::new();
             w.u32(0);
@@ -830,11 +835,24 @@ impl TritRuntime {
         }
 
         fork.refresh_world(&self.world);
-        let preds = merge_engine_predictions(fork, &self.entity_states, self.tick);
+
+        let tick = self.tick;
+        let Self {
+            takeover_fork,
+            entity_states,
+            plan_buf,
+            ..
+        } = self;
+        let Some(fork) = takeover_fork.as_ref() else {
+            let mut w = Writer::new();
+            w.u32(0);
+            return Ok(w.into_vec());
+        };
+        merge_engine_predictions(fork, entity_states, tick, plan_buf);
 
         let mut writer = Writer::new();
-        writer.u32(preds.len() as u32);
-        for (key, trit, conf) in preds {
+        writer.u32(plan_buf.len() as u32);
+        for &(key, trit, conf) in plan_buf.iter() {
             writer.u32(key);
             writer.u8(wire::trit_byte(trit));
             // f32 IEEE754 → u32 little-endian。C# 侧用 BinaryPrimitives.ReadSingleLittleEndian 读回。
@@ -846,87 +864,103 @@ impl TritRuntime {
     /// `0x20 STATE_PUSH`：整批替换实体状态表（TritEnginePort 的输入）。
     ///
     /// 零开销降级：`takeover_fork == None`（L0）直接吞掉载荷，不解析、不建表。
-    /// 载荷损坏（count 与字节数不匹配）→ InvalidInput，且**不改动**已有状态表。
+    /// 载荷损坏（截断 / 多余字节）→ InvalidInput，且**不改动**已有状态表。
     fn op_state_push(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
         if self.takeover_fork.is_none() {
             return Ok(Vec::new());
         }
 
-        let mut reader = Reader::new(payload);
-        let count = reader.u32()? as usize;
-        let expected = count
-            .checked_mul(wire::STATE_RECORD_LEN)
-            .ok_or_else(|| RtError::InvalidInput("STATE_PUSH count 溢出".to_string()))?;
-        let actual = payload.len().saturating_sub(4);
-        if actual != expected {
-            return Err(RtError::InvalidInput(format!(
-                "STATE_PUSH 长度不匹配：count={count} 期望 {expected} 字节，实际 {actual}"
-            )));
-        }
+        let parsed = (|| -> Result<BTreeMap<(u8, i32), EntityState>, RtError> {
+            let mut reader = Reader::new(payload);
+            let count = reader.u32()? as usize;
+            let mut states: BTreeMap<(u8, i32), EntityState> = BTreeMap::new();
 
-        let mut states: BTreeMap<(u8, i32), EntityState> = BTreeMap::new();
-        for _ in 0..count {
-            let kind = reader.u8()?;
-            let slot = reader.i32()?;
-            let entity_type = reader.i32()?;
-            let velocity_x = reader.f32()?;
-            let velocity_y = reader.f32()?;
-            let position_x = reader.f32()?;
-            let position_y = reader.f32()?;
-            let direction = reader.i32()?;
-            let life = reader.i32()?;
-            let life_max = reader.i32()?;
-            let target = reader.i32()?;
-            let mut ai = [0.0f32; 8];
-            for value in &mut ai {
-                *value = reader.f32()?;
-            }
-            let walk_speed = reader.f32()?;
-            let target_distance = reader.f32()?;
-            let tile_below = reader.u8()? != 0;
-            let on_ground = reader.u8()? != 0;
+            for _ in 0..count {
+                let kind = reader.u8()?;
+                let slot = reader.u16()? as i32;
+                let entity_type = reader.u16()? as i32;
+                let velocity_x = wire::dequantize_i16(reader.i16()?, wire::STATE_VELOCITY_SCALE);
+                let velocity_y = wire::dequantize_i16(reader.i16()?, wire::STATE_VELOCITY_SCALE);
+                let direction = reader.i8()? as i32;
+                let flags = reader.u8()?;
+                let walk_speed = wire::dequantize_i16(reader.i16()?, wire::STATE_WALK_SPEED_SCALE);
+                let target_distance =
+                    wire::dequantize_u16(reader.u16()?, wire::STATE_TARGET_DISTANCE_SCALE);
 
-            let state = match kind {
-                crate::takeover::lane::KIND_NPC => EntityState::Npc(trit_engine::npc::NpcState {
-                    npc_type: entity_type,
-                    velocity_x,
-                    velocity_y,
-                    position_x,
-                    position_y,
-                    direction,
-                    life,
-                    life_max,
-                    target,
-                    ai,
-                    walk_speed,
-                    target_distance,
-                    tile_below,
-                    on_ground,
-                }),
-                crate::takeover::lane::KIND_PROJECTILE => {
-                    EntityState::Projectile(trit_engine::projectile::ProjectileState {
-                        proj_type: entity_type,
-                        velocity_x,
-                        velocity_y,
-                        position_x,
-                        position_y,
-                        direction,
-                        ai: [ai[0], ai[1]],
-                        // Projectile 记录里 `on_ground` 字节复用为 `active`
-                        active: on_ground,
-                        tile_below,
-                        target,
-                        gravity: 0.08,
-                    })
+                // ai_mask 的每个置位对应一个 i16 值；未置位表示该槽为 0。
+                let ai_mask = reader.u8()?;
+                let mut ai = [0.0f32; wire::STATE_AI_SLOTS];
+                for (index, value) in ai.iter_mut().enumerate() {
+                    if ai_mask & (1u8 << index) != 0 {
+                        *value = wire::dequantize_i16(reader.i16()?, wire::STATE_AI_SCALE);
+                    }
                 }
-                // Player 等种类暂不参与引擎（字段语义不同），整条忽略。
-                _ => continue,
-            };
-            states.insert((kind, slot), state);
-        }
 
-        self.entity_states = states;
-        Ok(Vec::new())
+                let on_ground = flags & wire::state_flags::ON_GROUND != 0;
+                let tile_below = flags & wire::state_flags::TILE_BELOW != 0;
+                let active = flags & wire::state_flags::ACTIVE != 0;
+                let has_target = flags & wire::state_flags::HAS_TARGET != 0;
+
+                let state = match kind {
+                    crate::takeover::lane::KIND_NPC => {
+                        EntityState::Npc(trit_engine::npc::NpcState {
+                            npc_type: entity_type,
+                            velocity_x,
+                            velocity_y,
+                            position_x: 0.0,
+                            position_y: 0.0,
+                            direction,
+                            life: 0,
+                            life_max: 0,
+                            target: if has_target { 0 } else { -1 },
+                            ai,
+                            walk_speed,
+                            target_distance,
+                            tile_below,
+                            on_ground,
+                        })
+                    }
+                    crate::takeover::lane::KIND_PROJECTILE => {
+                        EntityState::Projectile(trit_engine::projectile::ProjectileState {
+                            proj_type: entity_type,
+                            velocity_x,
+                            velocity_y,
+                            position_x: 0.0,
+                            position_y: 0.0,
+                            direction,
+                            ai: [ai[0], ai[1]],
+                            active,
+                            tile_below,
+                            target: if has_target { 0 } else { -1 },
+                            gravity: 0.08,
+                        })
+                    }
+                    // Player 等种类暂不参与引擎（字段语义不同），整条忽略。
+                    _ => continue,
+                };
+                states.insert((kind, slot), state);
+            }
+
+            if !reader.is_empty() {
+                return Err(RtError::InvalidInput(format!(
+                    "STATE_PUSH 记录后有 {} 字节多余数据",
+                    payload.len() - 4
+                )));
+            }
+            Ok(states)
+        })();
+
+        match parsed {
+            Ok(states) => {
+                self.entity_states = states;
+                Ok(Vec::new())
+            }
+            // 截断统一归类为 InvalidInput，方便 C# 侧区分「载荷非法」与其它解码错误。
+            Err(RtError::Decode(message)) => Err(RtError::InvalidInput(format!(
+                "STATE_PUSH 载荷截断：{message}"
+            ))),
+            Err(error) => Err(error),
+        }
     }
 
     /// `0x1E CONSISTENCY_RECORD`：批量回写置信度对拍结果。
@@ -1184,7 +1218,7 @@ impl TritRuntime {
             .get(&snap_id)
             .ok_or(RtError::SnapshotNotFound(snap_id))?;
         // 只还原世界投影；日志保持只追加，之后可用 replay_from(snap.log_seq) 重做。
-        self.world = snapshot.world()?;
+        self.world = TritWorld::from_map(&snapshot.world()?);
         Ok(Vec::new())
     }
 
@@ -1309,7 +1343,7 @@ impl TritRuntime {
         if self.world.len() + resolved.len() > MAX_WORLD_LANES {
             let new_lanes = resolved
                 .iter()
-                .filter(|intent| !self.world.contains_key(&intent.key))
+                .filter(|intent| !self.world.contains_key(intent.key))
                 .count();
             if self.world.len() + new_lanes > MAX_WORLD_LANES {
                 return Err(RtError::Capacity(format!(
@@ -1328,10 +1362,10 @@ impl TritRuntime {
             if intent.delta == Ternary::Unknown {
                 continue;
             }
-            // `entry` 一次查找同时覆盖「已存在」和「新车道」两种情况：
-            // 原来的 `get` + `insert` 是两次树遍历，每条车道白跑一遍。
-            let slot = self.world.entry(intent.key).or_insert(Ternary::Unknown);
-            *slot = apply_delta(*slot, intent.delta);
+            // 先读当前值（未建车道按 Unknown），再写回落差结果。
+            let current = self.world.get(intent.key).unwrap_or(Ternary::Unknown);
+            self.world
+                .set(intent.key, apply_delta(current, intent.delta));
             self.log.append(&intent);
             applied += 1;
         }
@@ -1496,8 +1530,8 @@ impl TritRuntime {
             // 分字段借用：日志只读、世界只写，Rust 允许同时持有。
             let key = self.log.key_at(index);
             let delta = self.log.delta_at(index);
-            let slot = self.world.entry(key).or_insert(Ternary::Unknown);
-            *slot = apply_delta(*slot, delta);
+            let current = self.world.get(key).unwrap_or(Ternary::Unknown);
+            self.world.set(key, apply_delta(current, delta));
             applied += 1;
         }
         applied
@@ -1589,7 +1623,7 @@ mod tests {
         let mut reader = Reader::new(&out);
         assert_eq!(reader.u32().unwrap(), 1); // applied
         assert_eq!(reader.u64().unwrap(), 1); // log seq
-        assert_eq!(rt.world()[&42], Ternary::True);
+        assert_eq!(rt.world().get(42), Some(Ternary::True));
     }
 
     #[test]
@@ -1685,13 +1719,13 @@ mod tests {
         };
         rt.dispatch(op::ROLLBACK_TO, &rollback).unwrap();
         assert_eq!(rt.world().len(), 2);
-        assert_eq!(rt.world()[&1], Ternary::True);
+        assert_eq!(rt.world().get(1), Some(Ternary::True));
 
         // 重放快照之后的日志，回到回滚前状态。
         let replayed = rt.replay_from(2);
         assert_eq!(replayed, 2);
         assert_eq!(rt.world().len(), 3);
-        assert_eq!(rt.world()[&1], Ternary::Unknown);
+        assert_eq!(rt.world().get(1), Some(Ternary::Unknown));
     }
 
     #[test]
@@ -1934,23 +1968,22 @@ mod tests {
         TritRuntime::new(config)
     }
 
-    /// 造一条 83 字节实体状态记录（顺序与 `wire::STATE_RECORD_LEN` 严格一致）。
+    /// 造一条 STATE_PUSH v2 记录（定长 16 字节 + 0 个 ai 值）。
     fn state_record(kind: u8, slot: i32, entity_type: i32, direction: i32) -> Vec<u8> {
         let mut w = Writer::new();
         w.u8(kind);
-        w.i32(slot);
-        w.i32(entity_type);
-        w.f32(1.0).f32(0.0).f32(0.0).f32(0.0); // velocity_x/y, position_x/y
-        w.i32(direction);
-        w.i32(100).i32(100); // life, life_max
-        w.i32(0); // target
-        for _ in 0..8 {
-            w.f32(0.0); // ai
-        }
-        w.f32(2.0); // walk_speed
-        w.f32(300.0); // target_distance
-        w.u8(1); // tile_below
-        w.u8(1); // on_ground（Projectile 记录里读作 active）
+        w.u16(slot as u16);
+        w.u16(entity_type as u16);
+        w.i16(wire::quantize_i16(1.0, wire::STATE_VELOCITY_SCALE)); // velocity_x
+        w.i16(0); // velocity_y
+        w.i8(direction as i8);
+        w.u8(wire::state_flags::ON_GROUND
+            | wire::state_flags::TILE_BELOW
+            | wire::state_flags::ACTIVE
+            | wire::state_flags::HAS_TARGET);
+        w.i16(wire::quantize_i16(2.0, wire::STATE_WALK_SPEED_SCALE)); // walk_speed
+        w.u16(wire::quantize_u16(300.0, wire::STATE_TARGET_DISTANCE_SCALE)); // target_distance
+        w.u8(0); // ai_mask：本次没有非零 ai
         w.into_vec()
     }
 
