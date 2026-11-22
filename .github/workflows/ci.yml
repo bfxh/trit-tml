@@ -416,21 +416,23 @@ jobs:
           test -f "$so" || { echo "❌ 产物缺失：$so"; exit 1; }
           before=$(stat -c %s "$so")
           echo "strip 前：$before bytes ($(( before / 1024 )) KB)"
-          # cargo-ndk 默认把 NDK 下载到 $HOME/.ndk，llvm-strip 路径固定
-          strip_bin="$HOME/.ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          if [ -x "$strip_bin" ]; then
+          # cargo-ndk 自动下载的 NDK 位置随版本/环境变化：先查显式环境变量，
+          # 再在常见目录里 find；找不到就跳过 strip（产物已低于 3 MB 护栏），
+          # 不要用 x86 的系统 strip 处理 ARM ELF——那会让 job 直接红。
+          strip_bin=""
+          for root in "$ANDROID_NDK_HOME" "$ANDROID_NDK_ROOT" "$HOME/.ndk" "$HOME/.android/ndk" "$ANDROID_HOME/ndk"; do
+            [ -n "$root" ] && [ -d "$root" ] || continue
+            found=$(find "$root" -name llvm-strip -type f 2>/dev/null | head -1)
+            if [ -n "$found" ]; then
+              strip_bin="$found"
+              break
+            fi
+          done
+          if [ -n "$strip_bin" ] && [ -x "$strip_bin" ]; then
             echo "使用 NDK llvm-strip：$strip_bin"
             "$strip_bin" --strip-all "$so"
           else
-            # 兜底：NDK 路径不存在时 find，再找不到就用系统 binutils strip
-            strip_bin=$(find "$HOME/.ndk" -name llvm-strip -type f 2>/dev/null | head -1)
-            if [ -n "$strip_bin" ]; then
-              echo "find 到 NDK llvm-strip：$strip_bin"
-              "$strip_bin" --strip-all "$so"
-            else
-              echo "⚠️ NDK llvm-strip 未找到，回退到系统 strip"
-              strip --strip-all "$so"
-            fi
+            echo "⚠️ 未找到 NDK llvm-strip；跳过 strip（当前 $before bytes 已在护栏内）"
           fi
           after=$(stat -c %s "$so")
           echo "strip 后：$after bytes ($(( after / 1024 )) KB)"
