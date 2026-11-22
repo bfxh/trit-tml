@@ -176,7 +176,8 @@ public sealed class NativeKernelTests : NativeKernelTestBase
         Assert.True(report.Has(CapabilityBits.Prng));
         Assert.True(report.Has(CapabilityBits.Codec));
         Assert.True(report.Has(CapabilityBits.Shadow));
-        Assert.True(report.Has(CapabilityBits.Ai), "默认特性应启用 AI 投票");
+        // 默认特性为空（Android / 体积敏感场景）；AI 投票需显式 --features ai-voting。
+        Assert.False(report.Has(CapabilityBits.Ai), "默认特性不应启用 AI 投票");
     }
 
     [Fact]

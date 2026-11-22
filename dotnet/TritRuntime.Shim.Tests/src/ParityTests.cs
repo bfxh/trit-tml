@@ -54,7 +54,7 @@ public sealed class ParityTests
             Assert.Equal(NativeKernel.ExpectedAbiVersion, nativeCaps.U32());
             Assert.Equal(NativeKernel.MinimumRuntimeVersion, nativeCaps.U32());
             var nativeBits = (CapabilityBits)nativeCaps.U64();
-            Assert.True((nativeBits & CapabilityBits.Ai) != 0);
+            Assert.False((nativeBits & CapabilityBits.Ai) != 0);
             Assert.True((nativeBits & CapabilityBits.Parallel) != 0);
             Assert.True((nativeBits & CapabilityBits.Budget) != 0);
 
