@@ -169,7 +169,7 @@ internal static class NativeLibraryStager
     }
 
     /// <summary>
-    /// 清掉非当前版本的落盘目录。
+    /// 清掉非当前版本的落盘目录，以及旧版「摘要前缀_文件名」的平铺文件。
     /// 摘要目录只增不删，否则每次升级都白留一份 2.5 MB；
     /// 旧目录可能被上一个尚未退出的进程占用，删除失败一律忽略。
     /// </summary>
@@ -187,6 +187,26 @@ internal static class NativeLibraryStager
                 try
                 {
                     Directory.Delete(directory, recursive: true);
+                }
+                catch (Exception)
+                {
+                    // 被占用就下次再清
+                }
+            }
+
+            // 早期版本用「<16 位摘要>_trit_rt.dll」平铺在根目录（当前版本改成摘要子目录）。
+            // 只认这个后缀形态，避免误删用户自己放的文件。
+            string legacySuffix = "_" + FileName();
+            foreach (string file in Directory.EnumerateFiles(root))
+            {
+                if (!Path.GetFileName(file).EndsWith(legacySuffix, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    File.Delete(file);
                 }
                 catch (Exception)
                 {
