@@ -95,7 +95,8 @@ public sealed class RuntimeHostTests
         using var host = RuntimeHost.Create(new RuntimeHostOptions { LibraryPath = path });
         Assert.Equal(KernelMode.Native, host.Mode);
         Assert.Null(host.FallbackReason);
-        Assert.True(host.Supports(CapabilityBits.Ai));
+        // 默认构建不带 ai-voting；这里验的是 native 库本身被加载，不是 AI 位。
+        Assert.False(host.Supports(CapabilityBits.Ai));
     }
 
     [Fact]
