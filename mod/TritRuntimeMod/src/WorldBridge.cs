@@ -62,6 +62,10 @@ internal sealed class WorldBridge
     private readonly List<uint> changedKeys = new(4096);
     private readonly List<TritDelta> changedTrits = new(4096);
 
+    // 单元素发布载荷复用：PublishIf 每 tick 最多 3 次，之前每次都 new[] 一个数组。
+    // shim.Publish 会立即序列化，不会在调用后持有引用。
+    private readonly TritDelta[] singleDelta = new TritDelta[1];
+
     private readonly uint modId;
     private readonly ulong tickSub;
     private readonly ulong npcSub;
@@ -72,6 +76,10 @@ internal sealed class WorldBridge
     private int prevActiveNpc = -1;
     private int prevActiveProjectile = -1;
     private int prevActivePlayer = -1;
+
+    // 上一条 intent 的首个 (sub, event)，仅用于 60 tick 汇总日志。
+    private ulong lastFirstSubId;
+    private uint lastFirstEventId;
 
     // Main.Update 每帧调用一次，而菜单/加载界面没有固定步长（实测可达数千 FPS）。
     // 用 Main.GameUpdateCount（游戏逻辑 tick，固定 60/s）做驱动节流，
@@ -355,9 +363,14 @@ internal sealed class WorldBridge
 
             if (settings.VerboseLogging && tick % 60 == 0)
             {
+                // 只打汇总，不逐条打 intent：游戏内实测每 tick 2–3 条 intent，
+                // 逐条字符串插值 + 写盘会在 7 分钟里产生 2.4 万行 / 2.8 MB 日志。
+                string firstIntent = LastIntentCount > 0
+                    ? $" first=sub{lastFirstSubId}/ev{lastFirstEventId}"
+                    : string.Empty;
                 mod.Logger.Info(
                     $"[trit] tick={tick} lanes={changedTrits.Count} applied={LastApplied} log_seq={LastLogSeq} " +
-                    $"intents={LastIntentCount} npc={activeNpc} proj={activeProjectile} player={activePlayer} " +
+                    $"intents={LastIntentCount}{firstIntent} npc={activeNpc} proj={activeProjectile} player={activePlayer} " +
                     $"npc_ticked={npcTickedCount} proj_ticked={projectileTickedCount}");
             }
 
@@ -702,16 +715,15 @@ internal sealed class WorldBridge
 
         StepResult step = shim.Step((ulong)tick);
         LastIntentCount = step.Intents.Count;
-
-        if (settings.VerboseLogging && LastIntentCount > 0)
+        if (LastIntentCount > 0)
         {
-            for (int i = 0; i < step.Intents.Count; i++)
-            {
-                ActionIntent intent = step.Intents[i];
-                mod.Logger.Info(
-                    $"[trit] 派发 sub={intent.SubId} event={intent.EventId} mod=0x{intent.ModId:X8} tick={tick}");
-            }
+            // 只记第一条用于 60 tick 汇总行（不分配字符串）。
+            lastFirstSubId = step.Intents[0].SubId;
+            lastFirstEventId = step.Intents[0].EventId;
         }
+
+        // 逐条 intent 日志已移除：它不受节流，实测 7 分钟写出 2.4 万行（占日志 71%）。
+        // 汇总信息由 OnTickEnd 的 60 tick 状态行输出（含 first=sub/ev）。
     }
 
     private void PublishIf(uint eventId, int current, int previous)
@@ -722,7 +734,8 @@ internal sealed class WorldBridge
             return;
         }
 
-        shim.Publish(eventId, new[] { delta });
+        singleDelta[0] = delta;
+        shim.Publish(eventId, singleDelta);
     }
 
     private static TritDelta Sign(int current, int previous)

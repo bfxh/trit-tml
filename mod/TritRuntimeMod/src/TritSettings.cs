@@ -253,6 +253,13 @@ public sealed class TritSettings
     public int MemoryCapacityMb { get; set; } = 512;
 
     /// <summary>
+    /// 低内存自动降档：装载时若机器物理内存 &lt; 8 GiB，把任务池预算、日志上限、
+    /// 工作线程数压到省内存档（只降不升）。关闭后完全尊重手写的值。
+    /// </summary>
+    [JsonPropertyName("autoMemoryPreset")]
+    public bool AutoMemoryPreset { get; set; } = true;
+
+    /// <summary>
     /// 事务日志条数上限。**这个值就是回滚窗口**：每 tick 的变化量决定它覆盖多少秒。
     /// </summary>
     /// <remarks>
@@ -528,6 +535,45 @@ public sealed class TritSettings
                 Takeover = TakeoverMode.PatchAfterOrig;
             }
         }
+    }
+
+    /// <summary>
+    /// 按机器物理内存自动降档（只在装载期调用一次，见 <c>TritRuntimeMod.Load</c>）。
+    /// <para>只降不升：玩家已经调得更小的值不会被改大。</para>
+    /// <para>8 GiB 阈值只覆盖真正的低内存机器；16 GB 机器可用内存不足通常是
+    /// 其它进程占用，调模组上限救不了，走"关程序/减 mod"而不是这里。</para>
+    /// </summary>
+    /// <returns>是否实际发生了降档。</returns>
+    public bool ApplyAutoMemoryPreset()
+    {
+        if (!AutoMemoryPreset)
+        {
+            return false;
+        }
+
+        long total = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        if (total <= 0 || total >= 8L * 1024 * 1024 * 1024)
+        {
+            return false;
+        }
+
+        bool changed = false;
+        if (MemoryCapacityMb == 0 || MemoryCapacityMb > 128)
+        {
+            MemoryCapacityMb = 128;
+            changed = true;
+        }
+        if (MaxLogEntries > 262_144)
+        {
+            MaxLogEntries = 262_144;
+            changed = true;
+        }
+        if (WorkerCount == 0 || WorkerCount > 2)
+        {
+            WorkerCount = 2;
+            changed = true;
+        }
+        return changed;
     }
 
     /// <summary>

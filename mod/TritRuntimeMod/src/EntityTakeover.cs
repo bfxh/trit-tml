@@ -45,6 +45,16 @@ internal sealed class EntityTakeover
     /// </summary>
     private Dictionary<ulong, List<(uint Key, byte Delta, float Confidence)>>? kernelFirstCache;
 
+    // ── 热路径复用缓冲 ───────────────────────────────────────────────────────
+    // 目标：稳态 0 托管分配/tick。所有缓冲只在容量不足时扩容，之后一律 Clear 复用。
+    private readonly List<EntitySnapshot> stateBuffer = new(512);
+    private readonly List<(uint Key, bool Consistent)> outcomeBuffer = new(256);
+    private readonly Dictionary<ulong, List<(uint Key, byte Delta, float Confidence)>> bucketBuffer = new();
+    private readonly Stack<List<(uint Key, byte Delta, float Confidence)>> bucketPool = new();
+
+    /// <summary>接管日志的 tick 节流计数器（LogJobResults 开启时每 60 tick 最多一条）。</summary>
+    private int takeoverLogCounter;
+
     /// <summary>本 tick 被 KernelFirst 跳过 orig 的实体数（钩子层计数）。</summary>
     public int KernelFirstTakeoverCount { get; private set; }
 
@@ -187,6 +197,7 @@ internal sealed class EntityTakeover
         KernelFirstTakeoverCount = 0;
         kernelFirstCache = null;
         lastActionPlan = null;
+        ReleaseBuckets();
 
         if (settings.Takeover != TritSettings.TakeoverMode.ReplaceOrig)
         {
@@ -205,7 +216,8 @@ internal sealed class EntityTakeover
             return; // Rust confidence 全不过 / prediction_interval_ticks 门控 / 托管回退
         }
 
-        var buckets = new Dictionary<ulong, List<(uint, byte, float)>>();
+        // 复用分桶表：所有 List 从 bucketPool 租，Clear 后再用。
+        var buckets = bucketBuffer;
         foreach (var (key, delta, conf) in plan)
         {
             if (delta is 0 or > 2) continue;  // 内核弃权
@@ -217,7 +229,9 @@ internal sealed class EntityTakeover
 
             if (!buckets.TryGetValue(bucketKey, out var list))
             {
-                list = new List<(uint, byte, float)>(3);  // 每个实体最多 3 个字段：velX/velY/dir
+                list = bucketPool.Count > 0
+                    ? bucketPool.Pop()
+                    : new List<(uint, byte, float)>(3);  // 每个实体最多 3 个字段：velX/velY/dir
                 buckets[bucketKey] = list;
             }
             list.Add((key, delta, conf));
@@ -227,6 +241,22 @@ internal sealed class EntityTakeover
         {
             kernelFirstCache = buckets;
         }
+    }
+
+    /// <summary>把上一 tick 的分桶 List 归还池子，供下一 tick 复用。</summary>
+    private void ReleaseBuckets()
+    {
+        if (bucketBuffer.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var list in bucketBuffer.Values)
+        {
+            list.Clear();
+            bucketPool.Push(list);
+        }
+        bucketBuffer.Clear();
     }
 
     /// <summary>
@@ -239,7 +269,9 @@ internal sealed class EntityTakeover
     /// </summary>
     private void PushEntityStates()
     {
-        var states = new List<EntitySnapshot>(256);
+        // 复用缓冲：shim.PushEntityStates 立即序列化，不会在调用后持有引用。
+        List<EntitySnapshot> states = stateBuffer;
+        states.Clear();
 
         NPC[] npcs = Main.npc;
         for (int i = 0; i < npcs.Length; i++)
@@ -471,7 +503,9 @@ internal sealed class EntityTakeover
 
         // ── 只对 PatchAfterOrig fallback intent 做对拍 + RecordOutcome ──
         // KernelFirst 实体（confidence >= 0.9999）跳过 orig 没有原版值可对比，不对拍
-        var records = new List<(uint Key, bool Consistent)>(plan.Count);
+        // 复用缓冲：RecordOutcome 立即序列化，不会在调用后持有引用。
+        var records = outcomeBuffer;
+        records.Clear();
 
         foreach (var (key, delta, confidence) in plan)
         {
@@ -523,7 +557,8 @@ internal sealed class EntityTakeover
 
         totalTakeovers += TakeoverCount;
 
-        if (settings.LogJobResults)
+        // 每 60 tick 最多一条：接管热路径不能逐 tick 做字符串插值 + 写盘。
+        if (settings.LogJobResults && (++takeoverLogCounter % 60) == 0)
         {
             if (isKernelFirst && (KernelFirstTakeoverCount > 0 || TakeoverCount > 0))
             {
@@ -564,7 +599,8 @@ internal sealed class EntityTakeover
 
         int recorded = 0;
         int consistent = 0;
-        var records = new List<(uint Key, bool Consistent)>(plan.Count);
+        var records = outcomeBuffer;
+        records.Clear();
 
         foreach (var (key, delta, confidence) in plan)
         {

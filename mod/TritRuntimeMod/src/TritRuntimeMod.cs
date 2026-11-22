@@ -373,6 +373,14 @@ public sealed class TritRuntimeMod : Mod
             Logger.Info("[trit] 设置来源：" + settings.LoadedFrom);
         }
 
+        // P0：低内存机器自动降档（< 8 GiB 才触发，只降不升）。
+        if (settings.ApplyAutoMemoryPreset())
+        {
+            Logger.Info(
+                $"[trit] 低内存预设已启用：memoryCapacityMb={settings.MemoryCapacityMb} " +
+                $"maxLogEntries={settings.MaxLogEntries} workerCount={settings.WorkerCount}");
+        }
+
         // 自动档：装载期先评估一次升级（窗口跨会话累计，重启后可能刚好达标）。
         // 必须在 BuildRuntimeConfigJson / Attach 之前，内核配置要按升级后的档位烘焙。
         autoPilot = new TakeoverAutoPilot(settings);
