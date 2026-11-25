@@ -393,6 +393,9 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
   （史莱姆起跳 / 僵尸追击）；飞行家族不再虚构 `walk_speed.max(1.8)`。
   KernelFirst（ReplaceOrig）写 `velocity.X` 时优先用该值，缺失则退回「保留当前绝对值」。
   旧客户端 / 旧内核双向降级，不升 ABI。
+  上升冲量没有下发（快照里没有跳跃初速，只有方向车道）：若内核预测「向上」而当前
+  `|velocity.Y| < 0.01`（站在地面），该 tick 整只放弃 KernelFirst、交回原版定冲量——
+  否则 `KernelFirstSign` 会把跳跃写成 ±0.1，史莱姆退化成原地抖动。
 - 历史修正：早期注释凭记忆写错过编号（把 4 当成 Eye of Cthulhu、10 当成 Giant Worm Head；
   实际 4 = Unholy Arrow、10 = Purification Powder，已在 `Projectile_IDs` 页核对），
   现已改为「只登记真正有实现分支的类型」，并由 `every_ported_type_has_a_branch` 测试锁定。

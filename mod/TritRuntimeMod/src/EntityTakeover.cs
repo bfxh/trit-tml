@@ -428,6 +428,21 @@ internal sealed class EntityTakeover
         ulong bucketKey = ((ulong)LaneMap.KindNpc << 32) | (uint)npc.whoAmI;
         if (!kernelFirstCache.TryGetValue(bucketKey, out var intents)) return false;
 
+        // 预检：内核预测「向上」，而当前 vertical velocity ≈ 0 —— 说明实体站在地面、
+        // 内核要求起跳。上升冲量的大小不在 STATE_PUSH 快照里（ACTION_PLAN 只有方向
+        // 通道），KernelFirstSign 会把 |vy| 兜成 0.1，史莱姆的跳跃会退化成原地抖动。
+        // 这一 tick 整只放弃接管、让原版定冲量；空中下一 tick 再按当前速度接管。
+        // 必须在写任何字段之前判断，避免半接管（X 已改、Y 没改）。
+        foreach (var (key, delta, _) in intents)
+        {
+            if (delta == 1
+                && LaneMap.FieldOf(key) == LaneMap.FieldVelocityY
+                && Math.Abs(npc.velocity.Y) < GroundJumpVelocityEpsilon)
+            {
+                return false;
+            }
+        }
+
         bool applied = false;
         foreach (var (key, delta, _) in intents)
         {
@@ -463,6 +478,9 @@ internal sealed class EntityTakeover
 
         return applied;
     }
+
+    /// <summary>判定「站在地面」的 vertical velocity 阈值（像素/tick）。</summary>
+    private const float GroundJumpVelocityEpsilon = 0.01f;
 
     /// <summary>
     /// KernelFirst 直接写字段：取内核预测方向的绝对值，确保非零，再乘方向符号。
