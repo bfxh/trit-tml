@@ -128,7 +128,8 @@ pub mod op {
     ///  walk_speed i16, target_distance u16, target_dx i16, target_dy i16,
     ///  ai_mask u8, ai_q i16 * popcount(ai_mask)`。
     ///
-    /// 定长部分 [`STATE_RECORD_FIXED_LEN`] = 20 字节，每个非零 ai 槽再加 2 字节。
+    /// 定长部分 [`STATE_RECORD_FIXED_LEN`](crate::wire::STATE_RECORD_FIXED_LEN) = 20 字节，
+    /// 每个非零 ai 槽再加 2 字节。
     /// `target_dx / target_dy` 是 `实体中心 - 目标中心` 的像素偏移（有符号），
     /// 引擎用它算追踪方向；无目标时为 0。
     /// 位置 / 生命 / target 槽值 / ai[2..8] 引擎不消费，不再传输（旧版每条 83 字节）。
