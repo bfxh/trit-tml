@@ -374,9 +374,12 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
 - 当前覆盖（编号为原版 `NPCID` / `ProjectileID`，含负 ID 体型变体；以 `trit-engine/src/registry.rs` 为准）：
   - 史莱姆跳跃 AI：1、-1..-10、16（12 种）
   - 僵尸地面追击：3、-44 / -45、-54 / -55（5 种）
-  - 飞行追击：2、-37..-43、5、6（10 种）
-  - 弹幕：1 / 2 / 3 / 4 抛物线、128 直线（5 种）
+  - 飞行追击：2、-37..-43、5、6、23、42、49、51、60、93、-65..-56（26 种）
+  - 弹幕：1..5 / 27 / 41 / 81 / 82 / 91 / 103 / 109 / 172 / 240 抛物线、
+    44 / 55 / 83 / 84 / 96 / 100 / 115 / 128 / 258 / 264 / 288 直线（25 种）
   - 刻意不 port：Boss（4 Eye of Cthulhu、50 King Slime）、蠕虫体节（7..15）、骷髅（21、-46..-53）
+- 采样保真：`on_ground` / `tile_below` 取碰撞真值（`npc.collideY` + 脚底 4px 实心检测），
+  史莱姆 / 僵尸 / 飞行追击均按 `target_dx, dy` 转向，不再是「镜像当前速度」。
 - 历史修正：早期表的注释与实际原版 ID 不符（4 = Eye of Cthulhu、5 = Servant of Cthulhu、
   6 = Eater of Souls、10 = Giant Worm Head、14/15 = Eater of Worlds 体节），
   现已改为「只登记真正有实现分支的类型」，并由 `every_ported_type_has_a_branch` 测试锁定。

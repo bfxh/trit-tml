@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using Microsoft.Xna.Framework;
 using TritRuntime.Kernel;
 using Terraria;
 
@@ -302,8 +303,14 @@ internal sealed class EntityTakeover
                 }
             }
 
-            // 站在地面 ≈ 垂直速度归零（tick 开头、AI 之前采样，collideY 还没更新）。
-            bool onGround = Math.Abs(npc.velocity.Y) < 0.01f;
+            // 站在地面：用上一 tick 的垂直碰撞结果（tick 开头、AI 之前采样时 collideY 仍是上次的值）。
+            // 不能用 |velocity.Y| < 0.01 近似 —— 起跳/下落途中瞬时速度可能恰好很小，会把空中误判成地面。
+            bool onGround = npc.collideY;
+            // 脚下有方块：检测脚底往下 4px 的实心碰撞，用来区分「站在平台上」与「悬空边缘」。
+            bool tileBelow = Collision.SolidCollision(
+                new Vector2(npc.position.X, npc.Bottom.Y),
+                npc.width,
+                4);
 
             states.Add(new EntitySnapshot
             {
@@ -351,6 +358,8 @@ internal sealed class EntityTakeover
                 PositionY = projectile.position.Y,
                 Direction = projectile.direction,
                 Life = projectile.timeLeft,
+                // 弹幕没有追踪目标槽：显式 -1，避免默认 0 被当成「有目标」。
+                Target = -1,
                 Ai0 = projectile.ai.Length > 0 ? projectile.ai[0] : 0f,
                 Ai1 = projectile.ai.Length > 1 ? projectile.ai[1] : 0f,
                 // Projectile 记录里 on_ground 复用为 active

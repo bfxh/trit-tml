@@ -6,7 +6,7 @@
 //! 3. 空中：受重力影响往下掉
 //! 4. 撞墙或落地后重新选方向
 
-use crate::npc::{NpcDelta, NpcState, direction_from_vx};
+use crate::npc::{NpcDelta, NpcState, direction_from_vx, sign};
 use crate::prng::Prng;
 
 /// 基础史莱姆 AI step —— 只输出 velocity sign（KernelFirst 方向门只改符号）。
@@ -16,11 +16,16 @@ pub fn step(state: &NpcState, rand: &mut Prng) -> NpcDelta {
 
     if state.on_ground {
         if jump_timer <= 0 {
-            // 该跳了
-            let dir = rand.next_i32(-1, 1);
-            // AI[1] 存上次方向，撞墙就反向
+            // 该跳了：有目标向量时朝目标跳（`target_dx = 实体 - 目标`，取反号）；
+            // 否则随机左右，并沿用「贴墙反向」的历史启发式（ai[1] 存上次方向）。
+            let has_vector = state.target_dx.abs() >= 1.0;
+            let dir = if has_vector {
+                (-sign(state.target_dx)) as i32
+            } else {
+                rand.next_i32(-1, 1)
+            };
             let last_dir = state.ai[1] as i32;
-            let actual_dir = if state.velocity_x == 0.0 && last_dir != 0 {
+            let actual_dir = if !has_vector && state.velocity_x == 0.0 && last_dir != 0 {
                 -last_dir
             } else {
                 dir
@@ -107,5 +112,23 @@ mod tests {
         let mut rand = Prng::new(42);
         let d = step(&s, &mut rand);
         assert_eq!(d.velocity_y_sign, Some(-1.0)); // 向上的符号
+    }
+
+    #[test]
+    fn slime_jumps_toward_target() {
+        // 目标在右侧（target_dx < 0）→ 向右跳，而不是随机左右。
+        let s = NpcState {
+            npc_type: 1,
+            on_ground: true,
+            target: 0,
+            target_dx: -160.0,
+            ..Default::default()
+        };
+
+        let mut rand = Prng::new(99);
+        let d = step(&s, &mut rand);
+        assert_eq!(d.velocity_x_sign, Some(1.0));
+        assert_eq!(d.direction, Some(1));
+        assert_eq!(d.velocity_y_sign, Some(-1.0));
     }
 }

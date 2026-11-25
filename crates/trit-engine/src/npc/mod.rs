@@ -114,8 +114,10 @@ pub fn dispatch(state: &NpcState, rand: &mut Prng) -> NpcDelta {
         1 | -1 | -2 | -3 | -4 | -5 | -6 | -7 | -8 | -9 | -10 | 16 => slime::step(state, rand),
         // 僵尸家族（地面追击）：Zombie / Female Zombie / Raincoat Zombie
         3 | -44 | -45 | -54 | -55 => zombie::step(state, rand),
-        // 飞行追击家族：Demon Eye（含变体）/ Servant of Cthulhu / Eater of Souls
-        2 | -37 | -38 | -39 | -40 | -41 | -42 | -43 | 5 | 6 => flyer::step(state, rand),
+        // 飞行追击家族：Demon Eye（含变体）/ Servant of Cthulhu / Eater of Souls /
+        // Meteor Head / Hornet（含体型变体）/ Cave Bat / Jungle Bat / Hellbat / Giant Bat
+        2 | -37 | -38 | -39 | -40 | -41 | -42 | -43 | 5 | 6 | 23 | 42 | 49 | 51 | 60 | 93 | -65
+        | -64 | -63 | -62 | -61 | -60 | -59 | -58 | -57 | -56 => flyer::step(state, rand),
         // 未 port 的 type 一律 UNSET → 调用方 fallback 历史外推。
         _ => NpcDelta::UNSET,
     }

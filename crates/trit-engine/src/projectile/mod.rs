@@ -74,11 +74,15 @@ pub mod bullet;
 /// 由本模块的 `every_ported_type_has_a_branch` 测试锁定。
 pub fn dispatch(state: &ProjectileState, rand: &mut Prng) -> ProjectileDelta {
     match state.proj_type {
-        // 1 Wooden Arrow / 2 Fire Arrow / 4 Unholy Arrow：抛物线（受重力）。
-        // 3 Shuriken：投掷物，同样受重力、没有追踪——不能套追踪弹逻辑。
-        1..=4 => arrow::step(state, rand),
-        // 128 Frost Blast（敌对直线弹）。
-        128 => bullet::step(state, rand),
+        // 抛物线（受重力）：1 Wooden Arrow / 2 Fire Arrow / 3 Shuriken / 4 Unholy Arrow /
+        // 5 Jester's Arrow / 41 Hellfire Arrow / 81 Wooden Arrow（敌）/ 82 Flaming Arrow（敌）/
+        // 91 Holy Arrow / 103 Cursed Arrow / 109 Snow Ball（敌）/ 172 Frostburn Arrow /
+        // 240 Cannonball（敌）/ 27 Water Bolt（敌，会弹跳）。
+        1..=5 | 27 | 41 | 81 | 82 | 91 | 103 | 109 | 172 | 240 => arrow::step(state, rand),
+        // 直线飞行：44 Demon Sickle / 55 Stinger（敌）/ 83 Eye Laser / 84 Pink Laser /
+        // 96 Cursed Flame（敌）/ 100 Death Laser / 115 Unholy Trident（敌）/
+        // 128 Frost Blast（敌）/ 258 Fireball（敌）/ 264 Rain（敌）/ 288 Golden Shower（敌）。
+        44 | 55 | 83 | 84 | 96 | 100 | 115 | 128 | 258 | 264 | 288 => bullet::step(state, rand),
         _ => ProjectileDelta::UNSET,
     }
 }

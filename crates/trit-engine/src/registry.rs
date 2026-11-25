@@ -15,7 +15,8 @@
 ///   -9 Yellow Slime、-10 Jungle Slime、16 Mother Slime
 /// - 僵尸（地面追击）：3 Zombie、-44 / -45 Female Zombie、-54 / -55 Raincoat Zombie
 /// - 飞行追击：2 Demon Eye、-37..-43 Demon Eye 变体、5 Servant of Cthulhu、
-///   6 Eater of Souls
+///   6 Eater of Souls、23 Meteor Head、42 Hornet（含 -65..-56 体型变体）、
+///   49 Cave Bat、51 Jungle Bat、60 Hellbat、93 Giant Bat
 ///
 /// 刻意不包含：Boss（4 Eye of Cthulhu、50 King Slime）、蠕虫体节（7..15 的
 /// Devourer / Giant Worm / Eater of Worlds）、骷髅（21 及 -46..-53）——
@@ -24,13 +25,23 @@ pub const PORTED_NPC_TYPES: &[i32] = &[
     1, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, 16, // 史莱姆家族
     3, -44, -45, -54, -55, // 僵尸家族
     2, -37, -38, -39, -40, -41, -42, -43, 5, 6, // 飞行追击家族
+    23, 42, 49, 51, 60, 93, // 飞行追击：陨石怪 / 黄蜂 / 蝙蝠系
+    -65, -64, -63, -62, -61, -60, -59, -58, -57, -56, // Hornet 体型变体
 ];
 
 /// 已 port 的 Terraria Projectile type 列表（按 `Terraria.ID.ProjectileID`）。
 ///
-/// - 1 Wooden Arrow / 2 Fire Arrow / 3 Shuriken / 4 Unholy Arrow → 抛物线（受重力）
-/// - 128 Frost Blast（敌对直线弹）
-pub const PORTED_PROJECTILE_TYPES: &[i32] = &[1, 2, 3, 4, 128];
+/// - 抛物线（受重力）：1 Wooden Arrow、2 Fire Arrow、3 Shuriken、4 Unholy Arrow、
+///   5 Jester's Arrow、41 Hellfire Arrow、81 Wooden Arrow（敌）、82 Flaming Arrow（敌）、
+///   91 Holy Arrow、103 Cursed Arrow、109 Snow Ball（敌）、172 Frostburn Arrow、
+///   240 Cannonball（敌）、27 Water Bolt（敌，弹跳）
+/// - 直线：44 Demon Sickle、55 Stinger（敌）、83 Eye Laser、84 Pink Laser、
+///   96 Cursed Flame（敌）、100 Death Laser、115 Unholy Trident（敌）、
+///   128 Frost Blast（敌）、258 Fireball（敌）、264 Rain（敌）、288 Golden Shower（敌）
+pub const PORTED_PROJECTILE_TYPES: &[i32] = &[
+    1, 2, 3, 4, 5, 27, 41, 81, 82, 91, 103, 109, 172, 240, // 抛物线
+    44, 55, 83, 84, 96, 100, 115, 128, 258, 264, 288, // 直线
+];
 
 /// 查这个 NPC type 有没有被 port。
 #[inline]
@@ -54,6 +65,8 @@ mod tests {
         assert!(is_ported_npc_type(-6)); // Black Slime（负 ID 变体）
         assert!(is_ported_npc_type(3)); // Zombie
         assert!(is_ported_npc_type(6)); // Eater of Souls
+        assert!(is_ported_npc_type(49)); // Cave Bat
+        assert!(is_ported_npc_type(-60)); // Little Hornet（体型变体）
         assert!(!is_ported_npc_type(4)); // Eye of Cthulhu（Boss，不 port）
         assert!(!is_ported_npc_type(10)); // Giant Worm Head（体节，不 port）
         assert!(!is_ported_npc_type(99999));
@@ -64,6 +77,8 @@ mod tests {
     fn ported_projectile_checks() {
         assert!(is_ported_projectile_type(1)); // Wooden Arrow
         assert!(is_ported_projectile_type(3)); // Shuriken
+        assert!(is_ported_projectile_type(82)); // Flaming Arrow（敌）
+        assert!(is_ported_projectile_type(100)); // Death Laser（敌）
         assert!(is_ported_projectile_type(128)); // Frost Blast
         assert!(!is_ported_projectile_type(0));
         assert!(!is_ported_projectile_type(99999));
