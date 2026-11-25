@@ -211,6 +211,60 @@ public sealed class NativeKernel : ITritKernel
         }
     }
 
+    /// <summary>
+    /// `ACTION_PLAN`：直接从本线程复用的输出缓冲里解析 intent，**不复制整包响应**。
+    /// </summary>
+    /// <remarks>
+    /// 接管模式每 tick 一次；万级 intent 时整包约 100 KB，旧路径每次
+    /// <c>new byte[100KB]</c>（直接进 LOH）再整段拷一遍。降级与旧解码一致：
+    /// 状态非 OK / 帧非法 / 载荷损坏时只清空 buffer。
+    /// </remarks>
+    public void ReadActionPlanInto(List<(uint Key, byte Delta, float Confidence)> buffer)
+    {
+        var status = SubmitBorrowed(Opcode.ActionPlan, Array.Empty<byte>(), 0, out var payload);
+        if (status != Status.Ok && status != Status.Conflict)
+        {
+            lastError = ReadLastError();
+            buffer.Clear();
+            return;
+        }
+
+        KernelResponseMapper.ToActionPlanInto(payload, buffer);
+    }
+
+    /// <summary>
+    /// 提交并把拆框后的载荷以 span 交回 —— **指向本线程复用缓冲，下一次提交即失效**。
+    /// </summary>
+    /// <remarks>
+    /// 只给「拿到就立刻解析完、不持有」的调用方用；其余路径仍走
+    /// <see cref="Submit(uint, byte[], int)"/>，那里返回的是调用方独占的副本。
+    /// 缓冲区不足时按协议读回所需长度、扩容后重试同一请求。
+    /// </remarks>
+    private int SubmitBorrowed(uint opcode, byte[] payload, int length, out ReadOnlySpan<byte> unframed)
+    {
+        while (true)
+        {
+            var output = scratchOutput ??= new byte[512];
+            var capacity = output.Length;
+            var status = api.Submit(handle, opcode, payload, length, output, capacity);
+            if (status == Status.Buffer && capacity >= 8)
+            {
+                capacity = (int)BinaryPrimitives.ReadUInt64LittleEndian(output) + 16;
+                scratchOutput = new byte[capacity];
+                continue;
+            }
+
+            if (status != Status.Ok && status != Status.Conflict)
+            {
+                unframed = default;
+                return status;
+            }
+
+            unframed = WireFormat.UnframeSpan(output.AsSpan(0, capacity));
+            return status;
+        }
+    }
+
     /// <summary>查询。</summary>
     public KernelResponse Query(byte[] query) => Submit(Opcode.Query, query);
 

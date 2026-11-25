@@ -121,6 +121,12 @@ public sealed class RuntimeShim : IDisposable
     private readonly RuntimeHost host;
     private bool disposed;
 
+    // ── 热路径复用缓冲 ───────────────────────────────────────────────────────
+    // 接管模式每 tick 都会构造同样形状的大载荷（状态推送数百 KB、对拍记录数十 KB），
+    // 复用后只在容量不足时扩容一次，稳态不再逐 tick 产生大块垃圾。
+    private WireWriter? stateWriter;
+    private byte[] outcomePayload = Array.Empty<byte>();
+
     private RuntimeShim(RuntimeHost host)
     {
         this.host = host;
@@ -425,7 +431,13 @@ public sealed class RuntimeShim : IDisposable
 
         // 载荷格式：count u32, [key u32, consistent u8] * n
         int totalBytes = 4 + (list.Count * 5);
-        var payload = new byte[totalBytes];
+        // 复用缓冲：整段 [0, totalBytes) 每次都会重写，submit 是同步读取，不会持有引用。
+        if (outcomePayload.Length < totalBytes)
+        {
+            outcomePayload = new byte[totalBytes];
+        }
+
+        var payload = outcomePayload;
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), (uint)list.Count);
         for (int i = 0; i < list.Count; i++)
         {
@@ -434,7 +446,7 @@ public sealed class RuntimeShim : IDisposable
             payload[offset + 4] = (byte)(list[i].Item2 ? 1 : 0);
         }
 
-        var response = host.Kernel.Submit(Opcode.ConsistencyRecord, payload);
+        var response = host.Kernel.Submit(Opcode.ConsistencyRecord, payload, totalBytes);
         // 托管回退 OpPredictions 返回空 response（无 payload）—— 这里返回 true 让调用方安心
         return response.IsOk || response.Payload.Length == 0;
     }
@@ -452,35 +464,22 @@ public sealed class RuntimeShim : IDisposable
     /// </summary>
     public IReadOnlyList<(uint Key, byte Delta, float Confidence)> GetActionPlan()
     {
-        var response = host.Kernel.Submit(Opcode.ActionPlan, Array.Empty<byte>());
-        if (!response.IsOk || response.Payload.Length < 4)
-        {
-            return Array.Empty<(uint, byte, float)>();
-        }
-
-        var payload = response.Payload;
-        int count = BinaryPrimitives.ReadInt32LittleEndian(payload.AsSpan(0, 4));
-        if (count <= 0) return Array.Empty<(uint, byte, float)>();
-
-        // 每条 = 4 bytes key + 1 byte delta + 4 bytes confidence(f32) = 9 bytes
-        int expected = 4 + (count * 9);
-        if (payload.Length < expected)
-        {
-            return Array.Empty<(uint, byte, float)>();
-        }
-
-        var result = new (uint, byte, float)[count];
-        for (int i = 0; i < count; i++)
-        {
-            int offset = 4 + (i * 9);
-            uint key = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(offset, 4));
-            byte delta = payload[offset + 4];
-            float conf = BinaryPrimitives.ReadSingleLittleEndian(payload.AsSpan(offset + 5, 4));
-            result[i] = (key, delta, conf);
-        }
-
+        var result = new List<(uint Key, byte Delta, float Confidence)>();
+        GetActionPlanInto(result);
         return result;
     }
+
+    /// <summary>
+    /// <see cref="GetActionPlan"/> 的零分配版本：清空 <paramref name="buffer"/> 后填入本 tick 的
+    /// <c>(Key, Delta, Confidence)</c>。校验与降级规则完全一致——response 不 ok / count ≤ 0 /
+    /// 载荷不够时 <paramref name="buffer"/> 保持为空，不会抛异常。
+    /// </summary>
+    /// <remarks>
+    /// 原生内核走「从输出缓冲直接解析」的路径（<see cref="ITritKernel.ReadActionPlanInto"/>），
+    /// 不再把整包响应复制成新数组：万级 intent 时每 tick 省约 100 KB 的 LOH 垃圾。
+    /// </remarks>
+    public void GetActionPlanInto(List<(uint Key, byte Delta, float Confidence)> buffer) =>
+        host.Kernel.ReadActionPlanInto(buffer);
 
     /// <summary>
     /// 推送本 tick 的实体状态快照（Phase 2 TritEnginePort）。
@@ -506,7 +505,10 @@ public sealed class RuntimeShim : IDisposable
             payloadSize += WireFormat.StateRecordFixedLength + (2 * aiSlots);
         }
 
-        var writer = new WireWriter(payloadSize);
+        // 复用同一个 writer：Reserve 只在容量不足时换新数组，写入内容与每次新建完全一致。
+        var writer = stateWriter ??= new WireWriter(payloadSize);
+        writer.Reset();
+        writer.Reserve(payloadSize);
         writer.U32((uint)count);
         for (int i = 0; i < count; i++)
         {
@@ -588,7 +590,7 @@ public sealed class RuntimeShim : IDisposable
             }
         }
 
-        var response = host.Kernel.Submit(Opcode.StatePush, writer.ToArray());
+        var response = host.Kernel.Submit(Opcode.StatePush, writer.RawBuffer, writer.Length);
         return response.IsOk;
     }
 

@@ -299,24 +299,45 @@ impl WorldProjectionFork {
             return;
         }
 
-        // 冷路径：按 key 迁移历史。离开世界结构的键转入 orphans，长期置信度不丢。
-        let mut old = std::mem::take(&mut self.orphans);
-        for (index, &key) in self.keys.iter().enumerate() {
-            if let Some(history) = self.history[index] {
-                old.insert(key, history);
+        // 收集并排序新键集（世界投影按「平面」遍历，不保证全局键序）。
+        let mut new_keys = Vec::with_capacity(snapshot.len());
+        snapshot.for_each(|key, _| new_keys.push(key));
+        new_keys.sort_unstable();
+
+        // 两个键集都升序，双指针一遍就能把历史迁到新键集上。
+        // 旧实现是「把全部旧历史塞进 BTreeMap，再逐键 remove」——一个实体的
+        // 生灭就会触发上万次节点分配/释放，战斗中是常驻的毫秒级开销。
+        let old_keys = std::mem::take(&mut self.keys);
+        let mut old_history = std::mem::take(&mut self.history);
+        let mut history: Vec<Option<KeyHistory>> = Vec::with_capacity(new_keys.len());
+        let mut cursor = 0usize;
+        for &key in &new_keys {
+            // 已被世界移除的旧键：历史转入冷路径字典，长期置信度不丢。
+            while cursor < old_keys.len() && old_keys[cursor] < key {
+                if let Some(kept) = old_history[cursor].take() {
+                    self.orphans.insert(old_keys[cursor], kept);
+                }
+                cursor += 1;
+            }
+            if cursor < old_keys.len() && old_keys[cursor] == key {
+                history.push(old_history[cursor].take());
+                cursor += 1;
+            } else if let Some(kept) = self.orphans.remove(&key) {
+                // 重新进入世界结构的键：从冷路径取回历史。
+                history.push(Some(kept));
+            } else {
+                history.push(None);
             }
         }
-
-        self.keys.clear();
-        snapshot.for_each(|key, _| self.keys.push(key));
-        self.keys.sort_unstable();
-
-        self.history.clear();
-        self.history.reserve(self.keys.len());
-        for &key in &self.keys {
-            self.history.push(old.remove(&key));
+        while cursor < old_keys.len() {
+            if let Some(kept) = old_history[cursor].take() {
+                self.orphans.insert(old_keys[cursor], kept);
+            }
+            cursor += 1;
         }
-        self.orphans = old;
+
+        self.keys = new_keys;
+        self.history = history;
         self.seen_serial = serial;
     }
 
@@ -339,8 +360,8 @@ impl WorldProjectionFork {
                 out.push((key, trit, conf));
             }
         }
-        // keys 已升序，输出天然有序；保留排序以防未来键集来源变化。
-        out.sort_unstable_by_key(|(key, _, _)| *key);
+        // `keys` 恒为升序（`fork_from` / `refresh_world` 都是先排好再赋值），
+        // 输出天然按 key 升序，不需要再排一次。
     }
 
     /// 预测单个键的下一 tick 值（三值：Neg / Zero 弃权 / Pos）。

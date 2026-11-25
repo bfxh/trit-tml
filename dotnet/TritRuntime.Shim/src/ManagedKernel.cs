@@ -909,7 +909,14 @@ public sealed class ManagedKernel : ITritKernel
     }
 
     /// <summary>提交一个 opcode，返回拆框后的载荷。</summary>
-    public KernelResponse Submit(uint opcode, byte[] payload)
+    public KernelResponse Submit(uint opcode, byte[] payload) => SubmitCore(opcode, payload);
+
+    /// <summary>提交一个 opcode（载荷长度显式给出，可复用更大的缓冲）。</summary>
+    public KernelResponse Submit(uint opcode, byte[] payload, int length) =>
+        // 只借用前 length 字节，不再为「大缓冲 + 短载荷」复制一份。
+        SubmitCore(opcode, new ReadOnlyMemory<byte>(payload, 0, length));
+
+    private KernelResponse SubmitCore(uint opcode, ReadOnlyMemory<byte> payload)
     {
         try
         {
@@ -935,6 +942,13 @@ public sealed class ManagedKernel : ITritKernel
             return new KernelResponse(Status.Decode, Array.Empty<byte>());
         }
     }
+
+    /// <summary>
+    /// `ACTION_PLAN`：托管回退没有 fork，没有可输出的 plan —— 与 <c>OpActionPlan</c>
+    /// 返回空帧保持一致，这里只需清空调用方缓冲。
+    /// </summary>
+    public void ReadActionPlanInto(List<(uint Key, byte Delta, float Confidence)> buffer) =>
+        buffer.Clear();
 
     /// <summary>查询。</summary>
     public KernelResponse Query(byte[] query) => Submit(Opcode.Query, query);
@@ -1210,7 +1224,7 @@ public sealed class ManagedKernel : ITritKernel
 
     // ---- opcode 分发：与 Rust TritRuntime::dispatch 逐分支对齐 ----
 
-    private byte[] Dispatch(uint opcode, byte[] payload)
+    private byte[] Dispatch(uint opcode, ReadOnlyMemory<byte> payload)
     {
         if (opcode == 0)
         {
@@ -1265,7 +1279,7 @@ public sealed class ManagedKernel : ITritKernel
     /// 托管回退路径没有 fork，返回 count=0 零开销降级（C# 侧 EntityTakeover 看到空就跳过）。
     private static byte[] OpPredictions() => new byte[4]; // count = 0
 
-    private byte[] OpSessionReset(byte[] payload)
+    private byte[] OpSessionReset(ReadOnlyMemory<byte> payload)
     {
         if (payload.Length != 0)
         {
@@ -1276,7 +1290,7 @@ public sealed class ManagedKernel : ITritKernel
         return Array.Empty<byte>();
     }
 
-    private byte[] OpScanSubmit(byte[] payload)
+    private byte[] OpScanSubmit(ReadOnlyMemory<byte> payload)
     {
         using var document = ParseJsonObject(payload);
         var root = document.RootElement;
@@ -1335,7 +1349,7 @@ public sealed class ManagedKernel : ITritKernel
         return JsonBytes(writer => writer.WriteNumber("job", id));
     }
 
-    private byte[] OpJobPoll(byte[] payload)
+    private byte[] OpJobPoll(ReadOnlyMemory<byte> payload)
     {
         using var document = ParseJsonObject(payload);
         var limit = JsonInt32(document.RootElement, "limit");
@@ -1400,14 +1414,14 @@ public sealed class ManagedKernel : ITritKernel
         });
     }
 
-    private static byte[] OpJobCancel(byte[] payload)
+    private static byte[] OpJobCancel(ReadOnlyMemory<byte> payload)
     {
         using var _ = ParseJsonObject(payload);
         // 托管路径在 SubmitScan 返回前已同步完成；完成结果不可取消。
         return JsonBytes(writer => writer.WriteNumber("cancelled", 0));
     }
 
-    private byte[] OpGpuStatus(byte[] payload)
+    private byte[] OpGpuStatus(ReadOnlyMemory<byte> payload)
     {
         using var document = ParseJsonObject(payload);
         if (document.RootElement.TryGetProperty("policy", out var policyElement)
@@ -1741,9 +1755,9 @@ public sealed class ManagedKernel : ITritKernel
 
     private static int TritValue(byte trit) => trit - 1;
 
-    private static JsonDocument ParseJsonObject(byte[] payload)
+    private static JsonDocument ParseJsonObject(ReadOnlyMemory<byte> payload)
     {
-        var document = JsonDocument.Parse(payload.Length == 0 ? "{}" : Encoding.UTF8.GetString(payload));
+        var document = JsonDocument.Parse(payload.Length == 0 ? "{}" : Encoding.UTF8.GetString(payload.Span));
         if (document.RootElement.ValueKind != JsonValueKind.Object)
         {
             document.Dispose();
@@ -1917,7 +1931,7 @@ public sealed class ManagedKernel : ITritKernel
     private static string JsonText(Action<Utf8JsonWriter> writeProperties) =>
         Encoding.UTF8.GetString(JsonBytes(writeProperties));
 
-    private byte[] OpSubscribe(byte[] payload)
+    private byte[] OpSubscribe(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var modId = reader.U32();
@@ -1946,14 +1960,14 @@ public sealed class ManagedKernel : ITritKernel
         return new WireWriter().U64(subId).ToArray();
     }
 
-    private byte[] OpUnsubscribe(byte[] payload)
+    private byte[] OpUnsubscribe(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         router.Unsubscribe(reader.U64());
         return Array.Empty<byte>();
     }
 
-    private byte[] OpPublish(byte[] payload)
+    private byte[] OpPublish(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var eventId = reader.U32();
@@ -2029,14 +2043,14 @@ public sealed class ManagedKernel : ITritKernel
         }
     }
 
-    private byte[] OpTxnBegin(byte[] payload)
+    private byte[] OpTxnBegin(ReadOnlyMemory<byte> payload)
     {
         _ = new WireReader(payload).U32();
         var txnId = txns.Begin(tick);
         return new WireWriter().U64(txnId).ToArray();
     }
 
-    private byte[] OpTxnSubmit(byte[] payload)
+    private byte[] OpTxnSubmit(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var txnId = reader.U64();
@@ -2055,7 +2069,7 @@ public sealed class ManagedKernel : ITritKernel
         return Array.Empty<byte>();
     }
 
-    private byte[] OpTxnSubmitBatch(byte[] payload)
+    private byte[] OpTxnSubmitBatch(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var txnId = reader.U64();
@@ -2088,7 +2102,7 @@ public sealed class ManagedKernel : ITritKernel
         return Array.Empty<byte>();
     }
 
-    private byte[] OpTxnCommit(byte[] payload)
+    private byte[] OpTxnCommit(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var txnId = reader.U64();
@@ -2102,7 +2116,7 @@ public sealed class ManagedKernel : ITritKernel
     }
 
     /// <summary>一步提交：读一批无事务号的意图，一次仲裁 + 一次落地。</summary>
-    private byte[] OpTxnApply(byte[] payload)
+    private byte[] OpTxnApply(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var count = reader.U32();
@@ -2149,7 +2163,7 @@ public sealed class ManagedKernel : ITritKernel
         }
     }
 
-    private byte[] OpTxnRollback(byte[] payload)
+    private byte[] OpTxnRollback(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         txns.FinishRollback(reader.U64());
@@ -2157,7 +2171,7 @@ public sealed class ManagedKernel : ITritKernel
         return Array.Empty<byte>();
     }
 
-    private byte[] OpArbitrate(byte[] payload)
+    private byte[] OpArbitrate(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var count = reader.Count32();
@@ -2192,7 +2206,7 @@ public sealed class ManagedKernel : ITritKernel
         }
     }
 
-    private byte[] OpQuery(byte[] payload)
+    private byte[] OpQuery(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var queryId = reader.U32();
@@ -2229,7 +2243,7 @@ public sealed class ManagedKernel : ITritKernel
         return writer.ToArray();
     }
 
-    private byte[] OpStep(byte[] payload)
+    private byte[] OpStep(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         tick = reader.U64();
@@ -2252,7 +2266,7 @@ public sealed class ManagedKernel : ITritKernel
         return writer.ToArray();
     }
 
-    private byte[] OpSnapshot(byte[] payload)
+    private byte[] OpSnapshot(ReadOnlyMemory<byte> payload)
     {
         _ = new WireReader(payload).U32();
         nextSnapshotId += 1;
@@ -2278,7 +2292,7 @@ public sealed class ManagedKernel : ITritKernel
         return new WireWriter().U64(id).ToArray();
     }
 
-    private byte[] OpDiff(byte[] payload)
+    private byte[] OpDiff(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var snapA = reader.U64();
@@ -2297,7 +2311,7 @@ public sealed class ManagedKernel : ITritKernel
         return EncodeDiff(DiffWorlds(before.World, after.World));
     }
 
-    private byte[] OpRollbackTo(byte[] payload)
+    private byte[] OpRollbackTo(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var snapId = reader.U64();
@@ -2316,7 +2330,7 @@ public sealed class ManagedKernel : ITritKernel
         return Array.Empty<byte>();
     }
 
-    private byte[] OpPrngNext(byte[] payload)
+    private byte[] OpPrngNext(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var count = reader.Count32();
@@ -2332,7 +2346,7 @@ public sealed class ManagedKernel : ITritKernel
         return new WireWriter().Trits(trits).ToArray();
     }
 
-    private byte[] OpShadowRecord(byte[] payload)
+    private byte[] OpShadowRecord(ReadOnlyMemory<byte> payload)
     {
         var reader = new WireReader(payload);
         var signature = reader.Trits();

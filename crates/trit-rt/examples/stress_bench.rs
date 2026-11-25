@@ -16,7 +16,6 @@
 use trit_core::value::Ternary;
 use trit_rt::runtime::{RuntimeConfig, TritRuntime};
 use trit_rt::wire::{self, Writer};
-
 #[cfg(windows)]
 mod mem {
     use std::ffi::c_void;
@@ -111,6 +110,38 @@ fn arg(args: &[String], name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// 构造一整批 `STATE_PUSH` 载荷（NPC + 弹幕，按 `(kind, slot)` 升序，
+/// 与 mod 的采样顺序一致）。
+fn build_states_payload(npcs: usize, projectiles: usize) -> Vec<u8> {
+    let mut writer = Writer::with_capacity(4 + (npcs + projectiles) * wire::STATE_RECORD_FIXED_LEN);
+    writer.u32((npcs + projectiles) as u32);
+    for slot in 0..npcs {
+        push_state_record(&mut writer, 1, slot as u16, 3);
+    }
+    for slot in 0..projectiles {
+        push_state_record(&mut writer, 2, slot as u16, 1);
+    }
+    writer.into_vec()
+}
+
+/// 写一条 16 字节定长状态记录（ai_mask = 0，不带变长 ai 值）。
+fn push_state_record(writer: &mut Writer, kind: u8, slot: u16, entity_type: u16) {
+    writer
+        .u8(kind)
+        .u16(slot)
+        .u16(entity_type)
+        .i16(wire::quantize_i16(1.5, wire::STATE_VELOCITY_SCALE))
+        .i16(wire::quantize_i16(0.5, wire::STATE_VELOCITY_SCALE))
+        .i8(if slot & 1 == 0 { 1 } else { -1 })
+        .u8(wire::state_flags::ON_GROUND
+            | wire::state_flags::TILE_BELOW
+            | wire::state_flags::ACTIVE
+            | wire::state_flags::HAS_TARGET)
+        .i16(wire::quantize_i16(2.0, wire::STATE_WALK_SPEED_SCALE))
+        .u16(wire::quantize_u16(300.0, wire::STATE_TARGET_DISTANCE_SCALE))
+        .u8(0);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let ticks = arg(&args, "--ticks", 6000);
@@ -124,13 +155,33 @@ fn main() {
     // `--full-tick` 额外付「发布 + Step」这两段（`WorldBridge.PublishAndStep` 的真实序列）：
     // 每 tick 1 条心跳事件，每 7 tick 再发 3 条活动事件（对应实体生灭的稀发节奏）。
     let full_tick = args.iter().any(|a| a == "--full-tick");
+    // `--takeover` 额外付「STATE_PUSH + ACTION_PLAN」这两段（接管模式的真实序列）：
+    // 每 tick 全量推一次实体状态，再取一次带置信度的计划。
+    let takeover = args.iter().any(|a| a == "--takeover");
+    // `--churn N`：每 7 tick 新建 N 个弹幕槽位（各 3 条车道），模拟战斗中
+    // 弹幕不断生灭。世界结构因此每 7 tick 变一次，`refresh_world` 的键集重建
+    // 也从冷路径变成热路径。只在前半程制造，避免世界无限增长。
+    let churn = arg(&args, "--churn", 0);
 
     let lanes = all_lanes(npcs as u32, projectiles as u32, players as u32);
-    let mut runtime = TritRuntime::new(RuntimeConfig::default());
+    let mut config = RuntimeConfig::default();
+    if takeover {
+        config.takeover = Some(trit_rt::takeover::TakeoverConfig {
+            mode: trit_rt::takeover::TakeoverMode::PatchAfterOrig,
+            prediction_interval_ticks: 1,
+            ..trit_rt::takeover::TakeoverConfig::default()
+        });
+    }
+    let mut runtime = TritRuntime::new(config);
+    let states_payload = if takeover {
+        build_states_payload(npcs, projectiles)
+    } else {
+        Vec::new()
+    };
     let mut rng = Rng(0xD1B5_4A32_D192_ED03);
     let base = mem::rss_mb();
     println!(
-        "lanes={} npcs={} proj={} players={} changes/tick={} ticks={} mode={} full_tick={} base_rss={:.1}MB",
+        "lanes={} npcs={} proj={} players={} changes/tick={} ticks={} mode={} full_tick={} takeover={} base_rss={:.1}MB",
         lanes.len(),
         npcs,
         projectiles,
@@ -139,11 +190,18 @@ fn main() {
         ticks,
         if one_step { "one-step" } else { "three-step" },
         full_tick,
+        takeover,
         base.0
     );
 
     let mut payload = Vec::with_capacity(16 + changes * 5);
     let mut begin_failures = 0usize;
+    // 分阶段耗时（微秒）：提交 / 状态推送 / 计划。
+    let mut t_commit = 0.0f64;
+    let mut t_states = 0.0f64;
+    let mut t_plan = 0.0f64;
+    let mut planned_total = 0u64;
+    let mut churn_slot = projectiles;
     let started = std::time::Instant::now();
 
     for tick in 0..ticks {
@@ -153,6 +211,7 @@ fn main() {
         let start = (tick * 31) % span.max(1);
         let slice = &lanes[start..start + changes];
 
+        let commit_started = std::time::Instant::now();
         if one_step {
             let mut writer = Writer::new();
             writer.u32(changes as u32);
@@ -197,6 +256,39 @@ fn main() {
                 runtime
                     .dispatch(wire::op::TXN_COMMIT, &commit)
                     .expect("commit");
+            }
+        }
+        t_commit += commit_started.elapsed().as_secs_f64() * 1e6;
+
+        if churn > 0 && tick % 7 == 0 && tick < ticks / 2 && churn_slot < 65_000 {
+            let mut writer = Writer::with_capacity(4 + churn * 3 * 5);
+            writer.u32((churn * 3) as u32);
+            for _ in 0..churn {
+                let slot = churn_slot as u32;
+                churn_slot += 1;
+                for field in [0x5u32, 0x6, 0x7] {
+                    writer.u32(lane_key(2, slot, field)).u8(2);
+                }
+            }
+            runtime
+                .dispatch(wire::op::TXN_APPLY, &writer.into_vec())
+                .expect("churn");
+        }
+
+        if takeover {
+            let started = std::time::Instant::now();
+            runtime
+                .dispatch(wire::op::STATE_PUSH, &states_payload)
+                .expect("state push");
+            t_states += started.elapsed().as_secs_f64() * 1e6;
+
+            let started = std::time::Instant::now();
+            let plan = runtime
+                .dispatch(wire::op::ACTION_PLAN, b"")
+                .expect("action plan");
+            t_plan += started.elapsed().as_secs_f64() * 1e6;
+            if plan.len() >= 4 {
+                planned_total += u32::from_le_bytes(plan[..4].try_into().unwrap()) as u64;
             }
         }
 
@@ -254,6 +346,15 @@ fn main() {
         elapsed.as_secs_f64() * 1000.0,
         elapsed.as_secs_f64() * 1000.0 / ticks as f64
     );
+    if takeover {
+        println!(
+            "phases per_tick: commit={:.3}ms state_push={:.3}ms action_plan={:.3}ms planned_avg={:.0}",
+            t_commit / ticks as f64 / 1000.0,
+            t_states / ticks as f64 / 1000.0,
+            t_plan / ticks as f64 / 1000.0,
+            planned_total as f64 / ticks as f64
+        );
+    }
 }
 
 fn query_u64(runtime: &mut TritRuntime, kind: u32) -> u64 {

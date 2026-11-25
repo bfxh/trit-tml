@@ -319,67 +319,48 @@ enum EntityState {
     Projectile(trit_engine::projectile::ProjectileState),
 }
 
-/// 引擎对某个车道键的态度。
-#[derive(Debug, Clone, Copy)]
-enum EngineOpinion {
-    /// 引擎不表态（sign=0 静止、或该字段不归引擎管）—— 仍然覆盖历史外推，避免旧结论继续生效。
-    Abstain,
-    /// 引擎给出方向 + 置信度（TritEnginePort 的置信度固定 1.0）。
-    Predict(Ternary, f32),
-}
-
 /// TritEnginePort 输出的置信度：引擎等价逻辑，不靠历史统计。
 const ENGINE_CONFIDENCE: f32 = 1.0;
 
-/// 查引擎对单个车道键的意见。
+/// 一次引擎步进产出的方向信息（**每个实体每 tick 只算一次**）。
 ///
-/// 返回 `None` = 引擎不管这个键（没有状态 / type 未 port / 字段不支持）→ 调用方保留历史外推。
-fn engine_opinion(
-    states: &[((u8, i32), EntityState)],
-    key: u32,
-    rand: &mut trit_engine::prng::Prng,
-) -> Option<EngineOpinion> {
-    use crate::takeover::lane;
+/// 之所以要缓存：一个实体有 3–5 条车道（velocity_x / velocity_y / direction…），
+/// 之前是「每个车道键各跑一次 `npc_ai_step` / `projectile_update_step`」——
+/// 同一 tick 里同一个实体的 AI 被重复算 3–5 遍，而且每次还会各消耗一次引擎
+/// 随机数，导致同一实体的不同字段可能拿到互相矛盾的方向。
+#[derive(Debug, Clone, Copy)]
+struct EngineDelta {
+    velocity_x: Option<f32>,
+    velocity_y: Option<f32>,
+    direction: Option<f32>,
+}
 
-    let kind = lane::kind(key);
-    let slot = lane::slot(key);
-    let field = lane::field(key);
-
-    let index = states
-        .binary_search_by_key(&(kind, slot), |(k, _)| *k)
-        .ok()?;
-    let sign = match &states[index].1 {
+/// 对一个实体跑一次引擎步进；`None` = 引擎不管这个实体（type 未 port）。
+fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Option<EngineDelta> {
+    match state {
         EntityState::Npc(state) => {
             if !trit_engine::is_ported_npc_type(state.npc_type) {
                 return None;
             }
             let delta = trit_engine::npc_ai_step(state, rand);
-            match field {
-                lane::FIELD_VELOCITY_X => delta.velocity_x_sign,
-                lane::FIELD_VELOCITY_Y => delta.velocity_y_sign,
-                lane::FIELD_DIRECTION => delta.direction.map(|dir| dir as f32),
-                _ => None,
-            }
+            Some(EngineDelta {
+                velocity_x: delta.velocity_x_sign,
+                velocity_y: delta.velocity_y_sign,
+                direction: delta.direction.map(|dir| dir as f32),
+            })
         }
         EntityState::Projectile(state) => {
             if !trit_engine::is_ported_projectile_type(state.proj_type) {
                 return None;
             }
             let delta = trit_engine::projectile_update_step(state, rand);
-            match field {
-                lane::FIELD_VELOCITY_X => delta.velocity_x_sign,
-                lane::FIELD_VELOCITY_Y => delta.velocity_y_sign,
-                lane::FIELD_DIRECTION => delta.direction.map(|dir| dir as f32),
-                _ => None,
-            }
+            Some(EngineDelta {
+                velocity_x: delta.velocity_x_sign,
+                velocity_y: delta.velocity_y_sign,
+                direction: delta.direction.map(|dir| dir as f32),
+            })
         }
-    };
-
-    Some(match sign {
-        Some(v) if v > 0.0 => EngineOpinion::Predict(Ternary::True, ENGINE_CONFIDENCE),
-        Some(v) if v < 0.0 => EngineOpinion::Predict(Ternary::False, ENGINE_CONFIDENCE),
-        _ => EngineOpinion::Abstain,
-    })
+    }
 }
 
 /// 双轨预测：TritEnginePort 优先，历史外推兜底。
@@ -394,6 +375,8 @@ fn merge_engine_predictions(
     tick: u64,
     out: &mut Vec<(u32, Ternary, f32)>,
 ) {
+    use crate::takeover::lane;
+
     out.clear();
     if entity_states.is_empty() {
         fork.predict_all_into(out);
@@ -403,25 +386,58 @@ fn merge_engine_predictions(
     // 引擎 PRNG 按 tick 播种：同 tick 内可复现，且不污染主 PRNG 流。
     let mut rand = trit_engine::prng::Prng::new(tick.wrapping_mul(0x9E37_79B9_7F4A_7C15));
 
-    // 单遍合并：引擎表态的键直接采用；引擎不表态的键落回历史外推。
-    // 等价于「引擎结果 + 未被引擎覆盖的历史结果」，但不需要临时 BTreeSet 与中间 Vec。
+    // 两条序列都按 (kind, slot) 升序（键集由 `refresh_world` 排序，
+    // 状态表由 `STATE_PUSH` 排序），所以用单指针前进就能对齐，
+    // 不再对每个键做一次二分查找（一万多键 × log n 次比较）。
+    // 同一实体的多个字段复用同一次步进结果（见 `EngineDelta`）。
+    let mut cursor = 0usize;
+    let mut cached_key: Option<(u8, i32)> = None;
+    let mut cached_delta: Option<EngineDelta> = None;
+
     for &key in fork.keys() {
-        match engine_opinion(entity_states, key, &mut rand) {
-            Some(EngineOpinion::Predict(trit, conf)) => out.push((key, trit, conf)),
-            Some(EngineOpinion::Abstain) => {}
-            None => {
-                // 一次查表同时拿到预测与置信度，避免 predict + confidence_of 两次查树。
-                let predicted = fork
-                    .predict_with_confidence(key)
-                    .filter(|(trit, _)| *trit != Ternary::Unknown);
-                if let Some((trit, confidence)) = predicted {
-                    out.push((key, trit, confidence));
-                }
+        let kind = lane::kind(key);
+        let slot = lane::slot(key);
+        let field = lane::field(key);
+
+        if cached_key != Some((kind, slot)) {
+            cached_key = Some((kind, slot));
+            while cursor < entity_states.len() && entity_states[cursor].0 < (kind, slot) {
+                cursor += 1;
             }
+            cached_delta =
+                if cursor < entity_states.len() && entity_states[cursor].0 == (kind, slot) {
+                    engine_delta(&entity_states[cursor].1, &mut rand)
+                } else {
+                    None
+                };
+        }
+
+        let Some(delta) = cached_delta else {
+            // 引擎不管这个实体 → 落回历史外推（一次查表同时拿到预测与置信度）。
+            let predicted = fork
+                .predict_with_confidence(key)
+                .filter(|(trit, _)| *trit != Ternary::Unknown);
+            if let Some((trit, confidence)) = predicted {
+                out.push((key, trit, confidence));
+            }
+            continue;
+        };
+
+        let sign = match field {
+            lane::FIELD_VELOCITY_X => delta.velocity_x,
+            lane::FIELD_VELOCITY_Y => delta.velocity_y,
+            lane::FIELD_DIRECTION => delta.direction,
+            _ => None,
+        };
+        match sign {
+            Some(v) if v > 0.0 => out.push((key, Ternary::True, ENGINE_CONFIDENCE)),
+            Some(v) if v < 0.0 => out.push((key, Ternary::False, ENGINE_CONFIDENCE)),
+            // 引擎弃权：不输出（同时抑制该键的历史外推结论）。
+            _ => {}
         }
     }
 
-    out.sort_unstable_by_key(|(key, _, _)| *key);
+    // `fork.keys()` 升序 ⇒ 输出天然按 key 升序，无需再排一次。
 }
 
 impl TritRuntime {
@@ -836,7 +852,7 @@ impl TritRuntime {
         };
         fork.predict_all_into(plan_buf);
 
-        let mut writer = Writer::new();
+        let mut writer = Writer::with_capacity(4 + plan_buf.len() * 5);
         writer.u32(plan_buf.len() as u32);
         for &(key, trit, _conf) in plan_buf.iter() {
             writer.u32(key);
@@ -883,7 +899,7 @@ impl TritRuntime {
         };
         merge_engine_predictions(fork, entity_states, tick, plan_buf);
 
-        let mut writer = Writer::new();
+        let mut writer = Writer::with_capacity(4 + plan_buf.len() * 9);
         writer.u32(plan_buf.len() as u32);
         for &(key, trit, conf) in plan_buf.iter() {
             writer.u32(key);
@@ -989,7 +1005,14 @@ impl TritRuntime {
             Ok(()) => {
                 // 排序 + 同键保留后写入的一条（与 `BTreeMap::insert` 语义一致），
                 // 之后 `engine_opinion` 用二分查找，不再每 tick 建树。
-                scratch.sort_unstable_by_key(|((kind, slot), _)| (*kind, *slot));
+                //
+                // 生产端的发送顺序本来就是「先 NPC 再弹幕、各自槽位递增」，
+                // 也就是载荷天然按 (kind, slot) 有序。先做一次 O(n) 有序检查，
+                // 有序就跳过 O(n log n) 排序——战斗高峰每 tick 一万多条记录，
+                // 这个排序是实打实的毫秒级开销。
+                if !scratch.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
+                    scratch.sort_unstable_by_key(|((kind, slot), _)| (*kind, *slot));
+                }
                 let mut write = 0;
                 for read in 0..scratch.len() {
                     if read + 1 < scratch.len() && scratch[read + 1].0 == scratch[read].0 {
@@ -1145,7 +1168,7 @@ impl TritRuntime {
         // 每个 tick 用 (seed, tick) 重新播种 ⇒ 同 tick 同序列。
         self.prng.reseed(self.config.seed, tick);
         let dispatch = self.router.take_dispatch();
-        let mut writer = Writer::new();
+        let mut writer = Writer::with_capacity(4 + dispatch.len() * 16);
         writer.u32(dispatch.len() as u32);
         for sub_id in &dispatch {
             let Some(subscriber) = self.router.get(*sub_id) else {

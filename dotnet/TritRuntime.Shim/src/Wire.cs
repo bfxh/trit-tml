@@ -449,6 +449,33 @@ public static class Wire
         return framed.Slice(4, (int)length).ToArray();
     }
 
+    /// <summary>
+    /// 拆框的<b>零分配</b>版本：直接返回帧内的载荷切片（在同一块缓冲上）。
+    /// 只给「拿到就立刻解析完、不持有」的调用方用；坏帧返回空 span，
+    /// 调用方必须再用 <see cref="IsValidFrame"/> 区分「空载荷」与「坏帧」。
+    /// </summary>
+    public static ReadOnlySpan<byte> UnframeSpan(ReadOnlySpan<byte> framed)
+    {
+        if (!IsValidFrame(framed))
+        {
+            return default;
+        }
+
+        return framed.Slice(4, (int)BinaryPrimitives.ReadUInt32LittleEndian(framed));
+    }
+
+    /// <summary>帧头是否完整声明了载荷长度（坏帧 / 截断帧返回 false）。</summary>
+    public static bool IsValidFrame(ReadOnlySpan<byte> framed)
+    {
+        if (framed.Length < 4)
+        {
+            return false;
+        }
+
+        var length = BinaryPrimitives.ReadUInt32LittleEndian(framed);
+        return framed.Length >= 4L + length;
+    }
+
     internal static int Pow3(int exponent)
     {
         var result = 1;
@@ -493,6 +520,30 @@ public sealed class WireWriter
     public WireWriter(int capacity)
     {
         buffer = capacity > 0 ? new byte[capacity] : new byte[64];
+    }
+
+    /// <summary>已写入的字节数（有效区长度）。</summary>
+    public int Length => position;
+
+    /// <summary>
+    /// 内部缓冲本体（未裁剪到最后写入长度）。只在同一程序集内给「提交即读、不持有引用」的
+    /// 调用方使用，配合 <see cref="Length"/> 传给带长度参数的 Submit。
+    /// </summary>
+    internal byte[] RawBuffer => buffer;
+
+    /// <summary>归零写位置，复用已有缓冲（不清内容，有效区由后续写入长度决定）。</summary>
+    public void Reset() => position = 0;
+
+    /// <summary>
+    /// 确保缓冲至少能装下 <paramref name="capacity"/> 字节。
+    /// 扩容不拷贝旧内容：调用方紧接着会从 0 开始重写整段载荷。
+    /// </summary>
+    public void Reserve(int capacity)
+    {
+        if (buffer.Length < capacity)
+        {
+            buffer = new byte[capacity];
+        }
     }
 
     private void EnsureCapacity(int additional)
@@ -634,10 +685,37 @@ public sealed class WireReader
     private readonly ReadOnlyMemory<byte> buffer;
     private int position;
 
-    /// <summary>构造读取器。</summary>
+    /// <summary>构造读取器（复制一份载荷，语义与旧版一致）。</summary>
     public WireReader(ReadOnlySpan<byte> buffer)
     {
         this.buffer = buffer.ToArray();
+    }
+
+    /// <summary>借用构造：直接读调用方数组，<b>不复制</b>。</summary>
+    /// <remarks>
+    /// 借用语义：读取期间调用方不得修改该数组；<see cref="WireReader"/> 不持有所有权。
+    /// </remarks>
+    public WireReader(byte[] buffer)
+        : this(new ReadOnlyMemory<byte>(buffer))
+    {
+    }
+
+    /// <summary>借用构造：只借用前 <paramref name="length"/> 字节，<b>不复制</b>。</summary>
+    /// <remarks>
+    /// 借用语义：读取期间调用方不得修改该数组；<see cref="WireReader"/> 不持有所有权。
+    /// </remarks>
+    public WireReader(byte[] buffer, int length)
+        : this(new ReadOnlyMemory<byte>(buffer, 0, length))
+    {
+    }
+
+    /// <summary>借用构造：直接读给定的内存切片，<b>不复制</b>。</summary>
+    /// <remarks>
+    /// 借用语义：读取期间调用方不得修改底层数组；<see cref="WireReader"/> 不持有所有权。
+    /// </remarks>
+    public WireReader(ReadOnlyMemory<byte> buffer)
+    {
+        this.buffer = buffer;
     }
 
     /// <summary>剩余未读字节数。</summary>
@@ -720,6 +798,18 @@ public sealed class WireReader
         return value;
     }
 
+    /// <summary>借用定长字节视图（不复制，直接指向内部缓冲）。</summary>
+    /// <remarks>
+    /// 返回的切片直接指向内部缓冲：只在本次读取期间有效，调用方不得长期持有。
+    /// </remarks>
+    public ReadOnlySpan<byte> BytesSpan(int length)
+    {
+        Ensure(length);
+        var value = buffer.Span.Slice(position, length);
+        position += length;
+        return value;
+    }
+
     /// <summary>
     /// 读一个「条数 / 长度」型的 u32，并收敛成非负 <see cref="int"/>。
     /// </summary>
@@ -748,8 +838,7 @@ public sealed class WireReader
     {
         var count = Count32();
         var byteLength = (count + Wire.TritsPerByte - 1) / Wire.TritsPerByte;
-        var bytes = Bytes(byteLength);
-        return Wire.UnpackTrits(bytes, count);
+        return Wire.UnpackTrits(BytesSpan(byteLength), count);
     }
 
     private void Ensure(int count)

@@ -49,6 +49,9 @@ internal sealed class EntityTakeover
     // 目标：稳态 0 托管分配/tick。所有缓冲只在容量不足时扩容，之后一律 Clear 复用。
     private readonly List<EntitySnapshot> stateBuffer = new(512);
     private readonly List<(uint Key, bool Consistent)> outcomeBuffer = new(256);
+
+    /// <summary>ActionPlan 复用缓冲：GetActionPlanInto 清空后重填，不再每 tick 新建数组。</summary>
+    private readonly List<(uint Key, byte Delta, float Confidence)> actionPlanBuffer = new(8192);
     private readonly Dictionary<ulong, List<(uint Key, byte Delta, float Confidence)>> bucketBuffer = new();
     private readonly Stack<List<(uint Key, byte Delta, float Confidence)>> bucketPool = new();
 
@@ -121,7 +124,8 @@ internal sealed class EntityTakeover
         // 校准与 KernelFirst 用同一个采样位置（AI 之前），这样引擎预测描述的是
         // "本 tick 待执行的变化"，tick 末尾才能和原版实际结果对齐。
         PushEntityStates();
-        lastActionPlan = shim.GetActionPlan();
+        shim.GetActionPlanInto(actionPlanBuffer);
+        lastActionPlan = actionPlanBuffer;
         calibrationPending = lastActionPlan.Count > 0;
     }
 
@@ -208,7 +212,8 @@ internal sealed class EntityTakeover
         // 后续 ActionPlan 才能给出原版等价的 delta（confidence 固定 1.0）。
         PushEntityStates();
 
-        var plan = shim.GetActionPlan();
+        shim.GetActionPlanInto(actionPlanBuffer);
+        var plan = actionPlanBuffer;
         lastActionPlan = plan;
 
         if (plan.Count == 0)
@@ -487,7 +492,12 @@ internal sealed class EntityTakeover
         // KernelFirst 模式下 PrepareKernelFirstCache 已经拉过 plan 了（tick 开头），复用；
         // PatchAfterOrig 模式下必须每 tick 现拉（不能用上一 tick 的陈旧 plan）。
         bool isKernelFirst = settings.Takeover == TritSettings.TakeoverMode.ReplaceOrig;
-        var plan = isKernelFirst && lastActionPlan is not null ? lastActionPlan : shim.GetActionPlan();
+        if (!(isKernelFirst && lastActionPlan is not null))
+        {
+            shim.GetActionPlanInto(actionPlanBuffer);
+        }
+
+        var plan = actionPlanBuffer;
         lastActionPlan = plan;
         TakeoverCount = 0;
         RecordedCount = 0;

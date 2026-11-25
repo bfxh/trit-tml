@@ -92,6 +92,25 @@ public interface ITritKernel : IDisposable
     /// <summary>提交一个 opcode（载荷为拆框前的请求体）。</summary>
     KernelResponse Submit(uint opcode, byte[] payload);
 
+    /// <summary>
+    /// 提交一个 opcode，载荷长度显式给出：只读 <paramref name="payload"/> 的前
+    /// <paramref name="length"/> 字节，让调用方可以复用更大的缓冲而不必裁剪出新数组。
+    /// </summary>
+    KernelResponse Submit(uint opcode, byte[] payload, int length);
+
+    /// <summary>
+    /// `ACTION_PLAN`：把本 tick 的 intent 直接读进 <paramref name="buffer"/>（先清空）。
+    /// </summary>
+    /// <remarks>
+    /// 与 <c>Submit(ActionPlan)</c> + 手工解码等价，但**不把整包响应复制成新数组**：
+    /// 接管模式每 tick 调用一次，万级 intent 时响应约 100 KB，旧路径每次都要
+    /// <c>new byte[100KB]</c>（直接进 LOH）再整段拷一遍。
+    ///
+    /// 失败 / 降级（旧原生库不认识该 opcode、托管回退、载荷损坏）时 buffer 保持为空，
+    /// 不抛异常——调用方据此跳过接管即可。
+    /// </remarks>
+    void ReadActionPlanInto(List<(uint Key, byte Delta, float Confidence)> buffer);
+
     /// <summary>查询。</summary>
     KernelResponse Query(byte[] query);
 

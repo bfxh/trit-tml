@@ -1,5 +1,6 @@
 #nullable enable
 
+using System.Buffers.Binary;
 using System.Text.Json;
 using TritRuntime.Wire;
 
@@ -87,6 +88,54 @@ public static class KernelResponseMapper
         }
 
         return new StepResult(intents);
+    }
+
+    /// <summary>
+    /// ACTION_PLAN 载荷 → <c>(key, delta, confidence)</c>，原地填进调用方缓冲。
+    /// 布局：<c>count u32, [key u32, delta u8, confidence f32] * n</c>。
+    /// </summary>
+    /// <remarks>
+    /// 与 <see cref="ToStepResult"/> 不同，这里吃 <see cref="ReadOnlySpan{T}"/>：
+    /// 原生内核直接把输出缓冲里的切片传进来，省掉「整包响应复制成新数组」——
+    /// 万级 intent 时那一份就是约 100 KB，而且每 tick 一次（直接进 LOH）。
+    /// 校验/降级规则与旧的 <c>GetActionPlan</c> 解码完全一致：坏载荷只清空 buffer，不抛异常。
+    /// </remarks>
+    public static void ToActionPlanInto(
+        ReadOnlySpan<byte> payload,
+        List<(uint Key, byte Delta, float Confidence)> buffer)
+    {
+        buffer.Clear();
+        if (payload.Length < 4)
+        {
+            return;
+        }
+
+        // count 是 i32：坏载荷给负数时按「空」处理（与旧解码一致）。
+        int count = BinaryPrimitives.ReadInt32LittleEndian(payload);
+        if (count <= 0)
+        {
+            return;
+        }
+
+        // 用 long 算上界：`count * 9` 在 int 下会溢出成负数，绕过长度检查。
+        if (payload.Length < 4L + (count * 9L))
+        {
+            return;
+        }
+
+        if (buffer.Capacity < count)
+        {
+            buffer.Capacity = count;
+        }
+
+        for (int i = 0; i < count; i++)
+        {
+            int offset = 4 + (i * 9);
+            buffer.Add((
+                BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(offset, 4)),
+                payload[offset + 4],
+                BinaryPrimitives.ReadSingleLittleEndian(payload.Slice(offset + 5, 4))));
+        }
     }
 
     /// <summary>差分 → <c>entry_count u32, [key u32, old u8, new u8] * n</c>。</summary>

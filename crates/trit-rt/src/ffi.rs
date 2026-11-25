@@ -11,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::error::RtError;
 use crate::runtime::{RuntimeConfig, TritRuntime};
-use crate::wire::{Writer, frame_response, op};
+use crate::wire::{Writer, op};
 
 /// ABI 版本：不兼容变更时递增。
 ///
@@ -177,12 +177,20 @@ fn with_entry<T>(
     f(entry)
 }
 
-/// 把响应字节写进调用方缓冲区。
-fn write_out(out: *mut u8, cap: usize, bytes: &[u8]) -> i32 {
-    if out.is_null() || cap < bytes.len() {
+/// 把响应**直接装框**写进调用方缓冲区：`[u32 payload_len][payload]`。
+///
+/// 与「先 `frame_response` 造一份中间 Vec、再整段拷到 `out`」逐字节等价，
+/// 但省掉每响应一次分配 + 一次拷贝——响应路径每 tick 至少 5 次
+/// （4×Publish + 1×Step），战斗高峰还要加 STATE_PUSH / ACTION_PLAN。
+///
+/// 缓冲区协议：装不下时把**所需总长度（含 4 字节帧头）**以 `u64` 小端写进
+/// `out` 前 8 字节（要求 `cap >= 8`）并回 `TT_ERR_BUFFER`。
+fn write_out_framed(out: *mut u8, cap: usize, payload: &[u8]) -> i32 {
+    let total = 4 + payload.len();
+    if out.is_null() || cap < total {
         if !out.is_null() && cap >= 8 {
-            // 空间不足时把所需长度回写，调用方据此扩容。
-            let required = (bytes.len() as u64).to_le_bytes();
+            // 空间不足时把所需长度（含 4 字节帧头）回写，调用方据此扩容。
+            let required = (total as u64).to_le_bytes();
             unsafe {
                 std::ptr::copy_nonoverlapping(required.as_ptr(), out, 8);
             }
@@ -190,7 +198,9 @@ fn write_out(out: *mut u8, cap: usize, bytes: &[u8]) -> i32 {
         return TT_ERR_BUFFER;
     }
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+        let prefix = (payload.len() as u32).to_le_bytes();
+        std::ptr::copy_nonoverlapping(prefix.as_ptr(), out, 4);
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), out.add(4), payload.len());
     }
     TT_OK
 }
@@ -330,8 +340,7 @@ pub unsafe extern "C" fn tt_rt_submit(
     });
     match outcome {
         Ok(Ok(response)) => {
-            let framed = frame_response(&response);
-            let status = write_out(out, cap, &framed);
+            let status = write_out_framed(out, cap, &response);
             if status == TT_ERR_BUFFER {
                 // 装不下：把响应存进待交付槽，调用方扩容后原样取回。
                 let payload = unsafe { payload_slice(payload, len) }.to_vec();
@@ -350,7 +359,7 @@ pub unsafe extern "C" fn tt_rt_submit(
         }
         Ok(Err(error)) => {
             if let Some(diagnostics) = conflict_diagnostics(&error) {
-                let _ = write_out(out, cap, &frame_response(&diagnostics));
+                let _ = write_out_framed(out, cap, &diagnostics);
             }
             error.status_code()
         }
@@ -388,8 +397,7 @@ unsafe fn submit_job_poll(
         // 「出队的 id」严格一致（并发轮询不会互相踩）。
         with_entry(handle, |entry| {
             let (response, ids) = entry.runtime.poll_jobs_peek(bytes)?;
-            let framed = frame_response(&response);
-            let status = write_out(out, cap, &framed);
+            let status = write_out_framed(out, cap, &response);
             if status == TT_OK {
                 // 交付成功：这批结果才算被取走。
                 entry.runtime.commit_jobs(&ids);
@@ -429,8 +437,7 @@ pub unsafe extern "C" fn tt_rt_step(handle: u64, tick: u64, out: *mut u8, cap: u
     });
     match outcome {
         Ok(Ok(response)) => {
-            let framed = frame_response(&response);
-            let status = write_out(out, cap, &framed);
+            let status = write_out_framed(out, cap, &response);
             if status == TT_ERR_BUFFER {
                 let store = std::panic::catch_unwind(|| {
                     with_entry(handle, |entry| {
@@ -483,8 +490,7 @@ pub unsafe extern "C" fn tt_rt_snapshot(handle: u64, out: *mut u8, cap: usize) -
     });
     match outcome {
         Ok(Ok(response)) => {
-            let framed = frame_response(&response);
-            let status = write_out(out, cap, &framed);
+            let status = write_out_framed(out, cap, &response);
             if status == TT_ERR_BUFFER {
                 let store = std::panic::catch_unwind(|| {
                     with_entry(handle, |entry| {
@@ -527,7 +533,7 @@ pub unsafe extern "C" fn tt_rt_diff(
         with_runtime(handle, |runtime| runtime.dispatch(op::DIFF, bytes))
     });
     match outcome {
-        Ok(Ok(response)) => write_out(out, cap, &frame_response(&response)),
+        Ok(Ok(response)) => write_out_framed(out, cap, &response),
         Ok(Err(error)) => error.status_code(),
         Err(_) => TT_ERR_PANIC,
     }
@@ -548,7 +554,7 @@ pub unsafe extern "C" fn tt_rt_predictions(handle: u64, out: *mut u8, cap: usize
         with_runtime(handle, |runtime| runtime.dispatch(op::PREDICTIONS, &[]))
     });
     match outcome {
-        Ok(Ok(response)) => write_out(out, cap, &frame_response(&response)),
+        Ok(Ok(response)) => write_out_framed(out, cap, &response),
         Ok(Err(error)) => error.status_code(),
         Err(_) => TT_ERR_PANIC,
     }
@@ -601,7 +607,7 @@ pub unsafe extern "C" fn tt_rt_action_plan(handle: u64, out: *mut u8, cap: usize
         with_runtime(handle, |runtime| runtime.dispatch(op::ACTION_PLAN, &[]))
     });
     match outcome {
-        Ok(Ok(response)) => write_out(out, cap, &frame_response(&response)),
+        Ok(Ok(response)) => write_out_framed(out, cap, &response),
         Ok(Err(error)) => error.status_code(),
         Err(_) => TT_ERR_PANIC,
     }

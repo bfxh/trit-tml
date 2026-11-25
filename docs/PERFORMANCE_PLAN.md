@@ -504,6 +504,37 @@ Logger.Info($"[trit] 每 tick 托管分配 ≈ {(after - before) / 600.0:F1} B")
 | `STATE_PUSH` | 改为「复用 Vec + 排序去重 + 交换」，`engine_opinion` 用二分查找 | 每 tick 最多 256 次树插入 → 0，稳态零分配 |
 | fork 历史 | `Vec<Option<KeyHistory>>` 与 `keys` 同序；新增 `orphans` 冷路径；`predict_with_confidence` 单次查表 | 预测循环由 `BTreeMap` 指针追逐改为二分 + 连续内存，每键少一次查找 |
 
+### 6.6 第三轮落地（已实现）
+
+聚焦接管热路径（`STATE_PUSH` → `ACTION_PLAN` 每 tick 各一次）与响应装框。
+
+| 项 | 改动 | 依据 / 收益 |
+|---|---|---|
+| 引擎步进去重 | `merge_engine_predictions` 按实体缓存一次 `npc_ai_step` / `projectile_update_step`，同一实体的多个字段复用一个 `EngineDelta` | 一个实体 3–5 条车道，原实现每字段各跑一次 AI（同一 tick 同一实体重复 3–5 遍，且各消耗一次引擎随机数，导致同实体不同字段可能给出矛盾方向） |
+| 预测循环对齐 | `keys` 与 `entity_states` 都按 `(kind, slot)` 升序 → 单指针前进，去掉每键一次二分查找 | 1 万键从「1 万 × log n 次比较」降到 1 万次 |
+| 冗余排序 | `predict_all_into` / `merge_engine_predictions` 末尾的 `sort_unstable_by_key` 删除（`keys` 恒升序，输出天然有序） | 每 tick 两次 O(n log n) |
+| `refresh_world` | 键集重建改为「排序新键集 + 双指针迁移历史」；`orphans` 只承接真正离开世界的键 | 原实现把全部历史塞 `BTreeMap` 再逐键 `remove`：一个弹幕生灭就是上万次节点分配。实测（每 7 tick 新建 3 个弹幕槽位）**0.548 → 0.127 ms/tick** |
+| `STATE_PUSH` | 先做 O(n) 有序检查，有序则跳过排序（生产端本来就是 kind 主序、槽位递增） | 真实数据上 `pdqsort` 已能识别有序段，本项收益小；真正的收益是**乱序输入**不再退化成全量排序 |
+| 响应装框 | FFI 新增 `write_out_framed`：`[u32 len][payload]` 直接写进 `out`，不再经 `frame_response` 的中间 `Vec` | 每个响应省 1 次分配 + 1 次拷贝；每 tick 至少 5 个响应（4×Publish + 1×Step） |
+| `Writer` 预分配 | 新增 `Writer::with_capacity`，`ACTION_PLAN` / `PREDICTIONS` / `STEP` 按精确上界预留 | 万级 intent 时省十几次 realloc 与累计数百 KB 拷贝 |
+| 发布解码 | `Reader::trits` 直接在载荷切片上 `unpack`，不再先 `to_vec` 中间字节缓冲 | `PUBLISH` 每 tick 至少一次，省 1 次分配 + 1 次拷贝 |
+| C# 状态推送 | `WireWriter` 增加 `Length` / `RawBuffer` / `Reset` / `Reserve`；`PushEntityStates` 复用 writer，用带长度的 `Submit` 提交 | 原来每 tick `new WireWriter(数百 KB)` + `ToArray()` 再复制一份，两笔大分配归零 |
+| C# 对拍回写 | `RecordOutcome` 复用 `outcomePayload`（按需扩容），带长度提交 | 上万条记录时 `new byte[~65 KB]`/tick 归零 |
+| C# 计划读取 | `GetActionPlanInto(List<…>)` + `EntityTakeover.actionPlanBuffer` 复用 | 原来每 tick `new (uint,byte,float)[count]`（万级 ≈ 100 KB，直接进 LOH）归零 |
+| C# 响应拆框 | 新增 `Wire.UnframeSpan` / `Wire.IsValidFrame`；`NativeKernel.SubmitBorrowed` 把输出缓冲里的载荷切片直接交给 `KernelResponseMapper.ToActionPlanInto(ReadOnlySpan<byte>, List<…>)` | 原来每次 `Submit` 都用 `Wire.Unframe` 把整包响应复制成新数组：ActionPlan 万级 intent ≈ 100 KB/tick（LOH）。现在整条路径 0 次拷贝、0 次分配；span 只在下一次提交前有效，因此只给「拿到就解析完」的调用方用 |
+| C# 托管回退载荷 | `WireReader` 新增借用构造（`byte[]` / `byte[] + length` / `ReadOnlyMemory<byte>`，不复制）；`ManagedKernel.Dispatch` 与全部 `Op*` 改收 `ReadOnlyMemory<byte>`，`Submit(op, payload, length)` 直接切内存不再 `ToArray`；`Trits()` 改用 `BytesSpan` 直接解包 | 回退路径原先**每个 opcode** 都把整包载荷复制一次（状态推送数百 KB/tick + 对拍数十 KB），现在请求侧 0 次复制；`Bytes()` 仅作兼容保留 |
+
+**实测**（`stress_bench`，13 020 车道、8 000 变化/tick、12 000 tick、`--takeover`、`--full-tick`）：
+
+| 场景 | per_tick | commit | state_push | action_plan |
+|---|---|---|---|---|
+| 稳态（无结构变化，改前） | 0.475 ms | 0.104 ms | 0.048 ms | 0.322 ms |
+| 稳态（改后） | **0.189 ms** | 0.107 ms | 0.049 ms | **0.031 ms** |
+| 弹幕生灭（`--churn 3`，改前） | 0.710 ms | 0.109 ms | 0.050 ms | 0.548 ms |
+| 弹幕生灭（改后） | **0.292 ms** | 0.113 ms | 0.050 ms | **0.127 ms** |
+
+新增基准开关：`--takeover`（每 tick 全量 `STATE_PUSH` + 一次 `ACTION_PLAN`）、`--churn N`（每 7 tick 新建 N 个弹幕槽位，制造真实的结构变化）。
+
 ---
 
 ## 7. 分阶段落地与验收
@@ -581,6 +612,10 @@ Logger.Info($"[trit] 每 tick 托管分配 ≈ {(after - before) / 600.0:F1} B")
 # 1) Rust 长跑内存（已有工具）
 cargo run --release -p trit-rt --example mem_bench -- --ticks 60000
 cargo run --release -p trit-rt --example mem_bench -- --log-entries 262144
+# 接管热路径分阶段耗时（commit / state_push / action_plan）
+cargo run --release -p trit-rt --example stress_bench -- --ticks 12000 --changes 8000 --one-step --full-tick --takeover
+# 加上「弹幕不断生灭」的结构变化（每 7 tick 新建 3 个弹幕槽位）
+cargo run --release -p trit-rt --example stress_bench -- --ticks 12000 --changes 8000 --one-step --full-tick --takeover --churn 3
 
 # 2) C# 托管分配（temp 脚本，不进仓库）
 dotnet-counters monitor -p <tModLoader PID> System.Runtime

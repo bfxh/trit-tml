@@ -311,8 +311,10 @@ impl<'a> Reader<'a> {
     pub fn trits(&mut self) -> Result<Vec<Ternary>, RtError> {
         let count = self.u32()? as usize;
         let byte_len = count.div_ceil(TRITS_PER_BYTE);
-        let bytes = self.bytes(byte_len)?;
-        unpack(&bytes, count).map_err(|e: CodecError| RtError::Decode(e.to_string()))
+        // 直接在载荷切片上解包，不再先 `to_vec` 一份中间字节缓冲：
+        // PUBLISH 每 tick 至少一次，这条路径省掉一次分配 + 一次拷贝。
+        let bytes = self.take(byte_len)?;
+        unpack(bytes, count).map_err(|e: CodecError| RtError::Decode(e.to_string()))
     }
 
     /// 是否还有未读字节。
@@ -330,6 +332,14 @@ pub struct Writer {
 impl Writer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 预分配容量的写入器：响应大小可估算时用它，避免 `extend_from_slice`
+    /// 反复翻倍扩容（ACTION_PLAN 上万个 intent 时是十几次 realloc + 拷贝）。
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn u8(&mut self, value: u8) -> &mut Self {
