@@ -61,7 +61,10 @@ pub fn step(state: &NpcState, rand: &mut Prng) -> NpcDelta {
         velocity_x_sign: Some(vx),
         velocity_y_sign: Some(vy),
         direction: Some(if steer_x != 0.0 { steer_x as i32 } else { dir }),
-        speed_magnitude: Some(state.walk_speed.max(1.8)),
+        // 飞行家族的 `walk_speed.max(1.8)` 只是虚构下限，不是原版速度：
+        // 执行层把它当成绝对速度写进 velocity.X 时，垂直追击（target_dx≈0）
+        // 会被强行加上水平速度。这里明确不给速度大小，只驱动方向。
+        speed_magnitude: None,
     }
 }
 

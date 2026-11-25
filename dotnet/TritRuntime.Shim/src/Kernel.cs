@@ -108,8 +108,13 @@ public interface ITritKernel : IDisposable
     ///
     /// 失败 / 降级（旧原生库不认识该 opcode、托管回退、载荷损坏）时 buffer 保持为空，
     /// 不抛异常——调用方据此跳过接管即可。
+    ///
+    /// <paramref name="speeds"/> 非空时额外接收引擎给出的实体级速度大小
+    /// （`ACTION_PLAN` 尾部可选表，旧 DLL 缺失则为空）。
     /// </remarks>
-    void ReadActionPlanInto(List<(uint Key, byte Delta, float Confidence)> buffer);
+    void ReadActionPlanInto(
+        List<(uint Key, byte Delta, float Confidence)> buffer,
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null);
 
     /// <summary>查询。</summary>
     KernelResponse Query(byte[] query);

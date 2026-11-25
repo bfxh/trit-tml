@@ -477,9 +477,12 @@ public sealed class RuntimeShim : IDisposable
     /// <remarks>
     /// 原生内核走「从输出缓冲直接解析」的路径（<see cref="ITritKernel.ReadActionPlanInto"/>），
     /// 不再把整包响应复制成新数组：万级 intent 时每 tick 省约 100 KB 的 LOH 垃圾。
+    /// <paramref name="speeds"/> 非空时额外接收引擎速度大小（可选尾部表，旧 DLL 为空）。
     /// </remarks>
-    public void GetActionPlanInto(List<(uint Key, byte Delta, float Confidence)> buffer) =>
-        host.Kernel.ReadActionPlanInto(buffer);
+    public void GetActionPlanInto(
+        List<(uint Key, byte Delta, float Confidence)> buffer,
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null) =>
+        host.Kernel.ReadActionPlanInto(buffer, speeds);
 
     /// <summary>
     /// 推送本 tick 的实体状态快照（Phase 2 TritEnginePort）。

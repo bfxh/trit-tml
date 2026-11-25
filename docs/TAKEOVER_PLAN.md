@@ -380,6 +380,11 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
   - 刻意不 port：Boss（4 Eye of Cthulhu、50 King Slime）、蠕虫体节（7..15）、骷髅（21、-46..-53）
 - 采样保真：`on_ground` / `tile_below` 取碰撞真值（`npc.collideY` + 脚底 4px 实心检测），
   史莱姆 / 僵尸 / 飞行追击均按 `target_dx, dy` 转向，不再是「镜像当前速度」。
+- 速度大小消费：三元车道装不下浮点速度，`ACTION_PLAN` 尾部追加可选速度表
+  （`kind u8, slot u16, magnitude f32`），只下发「水平速度即移动速度」的地面家族
+  （史莱姆起跳 / 僵尸追击）；飞行家族不再虚构 `walk_speed.max(1.8)`。
+  KernelFirst（ReplaceOrig）写 `velocity.X` 时优先用该值，缺失则退回「保留当前绝对值」。
+  旧客户端 / 旧内核双向降级，不升 ABI。
 - 历史修正：早期表的注释与实际原版 ID 不符（4 = Eye of Cthulhu、5 = Servant of Cthulhu、
   6 = Eater of Souls、10 = Giant Worm Head、14/15 = Eater of Worlds 体节），
   现已改为「只登记真正有实现分支的类型」，并由 `every_ported_type_has_a_branch` 测试锁定。

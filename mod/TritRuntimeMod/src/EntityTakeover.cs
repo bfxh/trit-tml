@@ -46,6 +46,13 @@ internal sealed class EntityTakeover
     /// </summary>
     private Dictionary<ulong, List<(uint Key, byte Delta, float Confidence)>>? kernelFirstCache;
 
+    /// <summary>
+    /// KernelFirst 速度大小表：`(kind, slot)` → 引擎给出的绝对速度（`ACTION_PLAN` 尾部可选表）。
+    /// <para>车道值只有三值（Neg/Zero/Pos），装不下速度大小；引擎把史莱姆起跳 / 僵尸追击速度
+    /// 单独放在这里。旧 DLL 不下发时为 <see langword="null"/>，`TryApplyKernelFirst*` 退回「只改符号」。</para>
+    /// </summary>
+    private Dictionary<ulong, float>? speedByEntity;
+
     // ── 热路径复用缓冲 ───────────────────────────────────────────────────────
     // 目标：稳态 0 托管分配/tick。所有缓冲只在容量不足时扩容，之后一律 Clear 复用。
     private readonly List<EntitySnapshot> stateBuffer = new(512);
@@ -53,6 +60,12 @@ internal sealed class EntityTakeover
 
     /// <summary>ActionPlan 复用缓冲：GetActionPlanInto 清空后重填，不再每 tick 新建数组。</summary>
     private readonly List<(uint Key, byte Delta, float Confidence)> actionPlanBuffer = new(8192);
+
+    /// <summary>ActionPlan 尾部速度表复用缓冲。</summary>
+    private readonly List<(byte Kind, int Slot, float Magnitude)> actionPlanSpeedBuffer = new(512);
+
+    /// <summary>速度表复用字典（每 tick Clear 后重填，稳态零分配）。</summary>
+    private readonly Dictionary<ulong, float> speedBuffer = new();
     private readonly Dictionary<ulong, List<(uint Key, byte Delta, float Confidence)>> bucketBuffer = new();
     private readonly Stack<List<(uint Key, byte Delta, float Confidence)>> bucketPool = new();
 
@@ -202,6 +215,7 @@ internal sealed class EntityTakeover
         KernelFirstTakeoverCount = 0;
         kernelFirstCache = null;
         lastActionPlan = null;
+        speedByEntity = null;
         ReleaseBuckets();
 
         if (settings.Takeover != TritSettings.TakeoverMode.ReplaceOrig)
@@ -213,13 +227,25 @@ internal sealed class EntityTakeover
         // 后续 ActionPlan 才能给出原版等价的 delta（confidence 固定 1.0）。
         PushEntityStates();
 
-        shim.GetActionPlanInto(actionPlanBuffer);
+        shim.GetActionPlanInto(actionPlanBuffer, actionPlanSpeedBuffer);
         var plan = actionPlanBuffer;
         lastActionPlan = plan;
 
         if (plan.Count == 0)
         {
             return; // Rust confidence 全不过 / prediction_interval_ticks 门控 / 托管回退
+        }
+
+        // 引擎速度大小（可选尾部表）：旧 DLL / 托管回退时为空，退回只改符号。
+        if (actionPlanSpeedBuffer.Count > 0)
+        {
+            speedBuffer.Clear();
+            foreach (var (kind, slot, magnitude) in actionPlanSpeedBuffer)
+            {
+                speedBuffer[((ulong)kind << 32) | (uint)slot] = magnitude;
+            }
+
+            speedByEntity = speedBuffer;
         }
 
         // 复用分桶表：所有 List 从 bucketPool 租，Clear 后再用。
@@ -400,7 +426,11 @@ internal sealed class EntityTakeover
             switch (field)
             {
                 case LaneMap.FieldVelocityX:
-                    npc.velocity.X = KernelFirstSign(fdelta, npc.velocity.X);
+                    // 有引擎速度大小时用它（史莱姆起跳 / 僵尸追击），否则保持当前绝对值。
+                    npc.velocity.X = KernelFirstVelocity(
+                        fdelta,
+                        npc.velocity.X,
+                        SpeedOf(LaneMap.KindNpc, npc.whoAmI));
                     applied = true;
                     break;
                 case LaneMap.FieldVelocityY:
@@ -476,6 +506,30 @@ internal sealed class EntityTakeover
         float abs = currentValue < 0f ? -currentValue : currentValue;
         if (abs < 0.01f) abs = 0.1f;  // 零速度时给个微小初速度
         return sign * abs;
+    }
+
+    /// <summary>
+    /// KernelFirst 水平速度：优先用引擎给出的速度大小；没有（未下发 / 该家族不提供）
+    /// 时退回「保留当前绝对值」。
+    /// </summary>
+    private static float KernelFirstVelocity(float sign, float currentValue, float magnitude)
+    {
+        float abs = magnitude > 0.001f ? magnitude : (currentValue < 0f ? -currentValue : currentValue);
+        if (abs < 0.01f) abs = 0.1f;
+        return sign * abs;
+    }
+
+    /// <summary>查实体级引擎速度大小；没有速度表 / 该实体不在表里返回 0。</summary>
+    private float SpeedOf(uint kind, int slot)
+    {
+        if (speedByEntity is null)
+        {
+            return 0f;
+        }
+
+        return speedByEntity.TryGetValue(((ulong)kind << 32) | (uint)slot, out float magnitude)
+            ? magnitude
+            : 0f;
     }
 
     // ──────────────────────────────────────────────────────────────────────────

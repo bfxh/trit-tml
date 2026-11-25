@@ -220,17 +220,20 @@ public sealed class NativeKernel : ITritKernel
     /// <c>new byte[100KB]</c>（直接进 LOH）再整段拷一遍。降级与旧解码一致：
     /// 状态非 OK / 帧非法 / 载荷损坏时只清空 buffer。
     /// </remarks>
-    public void ReadActionPlanInto(List<(uint Key, byte Delta, float Confidence)> buffer)
+    public void ReadActionPlanInto(
+        List<(uint Key, byte Delta, float Confidence)> buffer,
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null)
     {
         var status = SubmitBorrowed(Opcode.ActionPlan, Array.Empty<byte>(), 0, out var payload);
         if (status != Status.Ok && status != Status.Conflict)
         {
             lastError = ReadLastError();
             buffer.Clear();
+            speeds?.Clear();
             return;
         }
 
-        KernelResponseMapper.ToActionPlanInto(payload, buffer);
+        KernelResponseMapper.ToActionPlanInto(payload, buffer, speeds);
     }
 
     /// <summary>

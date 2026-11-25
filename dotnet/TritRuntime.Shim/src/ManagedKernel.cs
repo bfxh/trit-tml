@@ -947,8 +947,13 @@ public sealed class ManagedKernel : ITritKernel
     /// `ACTION_PLAN`：托管回退没有 fork，没有可输出的 plan —— 与 <c>OpActionPlan</c>
     /// 返回空帧保持一致，这里只需清空调用方缓冲。
     /// </summary>
-    public void ReadActionPlanInto(List<(uint Key, byte Delta, float Confidence)> buffer) =>
+    public void ReadActionPlanInto(
+        List<(uint Key, byte Delta, float Confidence)> buffer,
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null)
+    {
         buffer.Clear();
+        speeds?.Clear();
+    }
 
     /// <summary>查询。</summary>
     public KernelResponse Query(byte[] query) => Submit(Opcode.Query, query);

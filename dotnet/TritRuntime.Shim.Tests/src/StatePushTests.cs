@@ -1,5 +1,6 @@
 #nullable enable
 
+using System.Collections.Generic;
 using TritRuntime.Kernel;
 using TritRuntime.Wire;
 using Xunit;
@@ -157,5 +158,81 @@ public sealed class StatePushTests
         var plan = shim.GetActionPlan().ToDictionary(p => p.Key, p => p);
         Assert.Equal((byte)TritDelta.Neg, plan[vx].Delta);
         Assert.Equal(1.0f, plan[vx].Confidence);
+    }
+
+    /// <summary>
+    /// ACTION_PLAN 尾部速度表：僵尸（地面追击）带上 walk_speed，供 KernelFirst 写绝对速度。
+    /// </summary>
+    [Fact]
+    public void ActionPlanCarriesEngineSpeedMagnitude()
+    {
+        var path = NativeLibraryLocator.Find();
+        if (path is null)
+        {
+            return;
+        }
+
+        using var shim = RuntimeShim.Attach(new RuntimeHostOptions
+        {
+            LibraryPath = path,
+            ConfigJson = TakeoverConfig,
+            AllowDefaultProbing = false,
+        });
+
+        var vx = Lane(EntityKinds.Npc, 5, FieldVelocityX);
+        shim.ApplyBatch(new[] { vx }, new[] { TritDelta.Pos });
+        Assert.True(shim.PushEntityStates(new[] { Zombie() }));
+
+        var plan = new List<(uint Key, byte Delta, float Confidence)>();
+        var speeds = new List<(byte Kind, int Slot, float Magnitude)>();
+        shim.GetActionPlanInto(plan, speeds);
+
+        var entry = Assert.Single(speeds);
+        Assert.Equal(EntityKinds.Npc, entry.Kind);
+        Assert.Equal(5, entry.Slot);
+        Assert.Equal(1.4f, entry.Magnitude, 2); // 量化步长 1/256
+    }
+
+    /// <summary>飞行追击家族不下发速度大小（引擎只对方向有把握）。</summary>
+    [Fact]
+    public void ActionPlanOmitsSpeedForFlyer()
+    {
+        var path = NativeLibraryLocator.Find();
+        if (path is null)
+        {
+            return;
+        }
+
+        using var shim = RuntimeShim.Attach(new RuntimeHostOptions
+        {
+            LibraryPath = path,
+            ConfigJson = TakeoverConfig,
+            AllowDefaultProbing = false,
+        });
+
+        var vx = Lane(EntityKinds.Npc, 5, FieldVelocityX);
+        shim.ApplyBatch(new[] { vx }, new[] { TritDelta.Pos });
+        Assert.True(shim.PushEntityStates(new[]
+        {
+            new EntitySnapshot
+            {
+                Kind = EntityKinds.Npc,
+                Slot = 5,
+                Type = 2, // Demon Eye
+                VelocityX = 2f,
+                Direction = 1,
+                Target = 7,
+                TargetDx = 120f,
+                TargetDy = -80f,
+                WalkSpeed = 1.8f,
+            },
+        }));
+
+        var plan = new List<(uint Key, byte Delta, float Confidence)>();
+        var speeds = new List<(byte Kind, int Slot, float Magnitude)>();
+        shim.GetActionPlanInto(plan, speeds);
+
+        Assert.NotEmpty(plan);
+        Assert.Empty(speeds);
     }
 }

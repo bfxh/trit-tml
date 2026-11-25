@@ -310,6 +310,8 @@ pub struct TritRuntime {
     resolved_buf: Vec<ResolvedIntent>,
     /// 预测输出缓冲：复用容量，稳态零分配。
     plan_buf: Vec<(u32, Ternary, f32)>,
+    /// 引擎速度大小表缓冲（`ACTION_PLAN` 尾部下发）：复用容量，稳态零分配。
+    speed_buf: Vec<(u8, i32, f32)>,
 }
 
 /// 一条实体状态（STATE_PUSH 推来的）。
@@ -333,11 +335,15 @@ struct EngineDelta {
     velocity_x: Option<f32>,
     velocity_y: Option<f32>,
     direction: Option<f32>,
+    /// 引擎建议的速度大小（`speed_magnitude`）。只有「水平速度就是移动速度」的
+    /// 地面家族（史莱姆起跳 / 僵尸地面追击）会给；飞行家族明确不给（见 `flyer::step`）。
+    /// 车道值是 `Ternary` 装不下浮点，所以它单独走 `ACTION_PLAN` 尾部的速度表。
+    speed: Option<f32>,
 }
 
 /// 对一个实体跑一次引擎步进；`None` = 引擎不管这个实体（未 port 或整体弃权）。
 fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Option<EngineDelta> {
-    let (velocity_x, velocity_y, direction) = match state {
+    let (velocity_x, velocity_y, direction, speed) = match state {
         EntityState::Npc(state) => {
             if !trit_engine::is_ported_npc_type(state.npc_type) {
                 return None;
@@ -347,6 +353,7 @@ fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Opti
                 delta.velocity_x_sign,
                 delta.velocity_y_sign,
                 delta.direction,
+                delta.speed_magnitude,
             )
         }
         EntityState::Projectile(state) => {
@@ -358,6 +365,7 @@ fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Opti
                 delta.velocity_x_sign,
                 delta.velocity_y_sign,
                 delta.direction,
+                delta.speed_magnitude,
             )
         }
     };
@@ -372,6 +380,7 @@ fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Opti
         velocity_x,
         velocity_y,
         direction: direction.map(|dir| dir as f32),
+        speed,
     })
 }
 
@@ -382,15 +391,20 @@ fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Opti
 /// - 引擎对该字段弃权（sign=0 或字段不支持）→ 同样覆盖，抑制历史外推的旧结论。
 /// - 引擎对该实体整体弃权（三个方向字段全 `None`）→ 视同未 port，落回历史外推。
 /// - 未 port 的 type / 未 push 的实体 → 保留历史外推结果。
+///
+/// `speeds` 收集引擎给出的实体级速度大小（每个实体每 tick 至多一条），
+/// 由 `ACTION_PLAN` 尾部速度表下发 —— 三元车道装不下浮点，故与方向分离。
 fn merge_engine_predictions(
     fork: &crate::takeover::WorldProjectionFork,
     entity_states: &[((u8, i32), EntityState)],
     tick: u64,
     out: &mut Vec<(u32, Ternary, f32)>,
+    speeds: &mut Vec<(u8, i32, f32)>,
 ) {
     use crate::takeover::lane;
 
     out.clear();
+    speeds.clear();
     if entity_states.is_empty() {
         fork.predict_all_into(out);
         return;
@@ -419,7 +433,12 @@ fn merge_engine_predictions(
             }
             cached_delta =
                 if cursor < entity_states.len() && entity_states[cursor].0 == (kind, slot) {
-                    engine_delta(&entity_states[cursor].1, &mut rand)
+                    let delta = engine_delta(&entity_states[cursor].1, &mut rand);
+                    // 每个实体每 tick 只登记一次速度大小（与方向字段共用同一次步进）。
+                    if let Some(magnitude) = delta.and_then(|delta| delta.speed) {
+                        speeds.push((kind, slot, magnitude));
+                    }
+                    delta
                 } else {
                     None
                 };
@@ -486,6 +505,7 @@ impl TritRuntime {
             batch_buf: Vec::new(),
             resolved_buf: Vec::new(),
             plan_buf: Vec::new(),
+            speed_buf: Vec::new(),
         }
     }
 
@@ -903,6 +923,7 @@ impl TritRuntime {
             takeover_fork,
             entity_states,
             plan_buf,
+            speed_buf,
             ..
         } = self;
         let Some(fork) = takeover_fork.as_ref() else {
@@ -910,15 +931,24 @@ impl TritRuntime {
             w.u32(0);
             return Ok(w.into_vec());
         };
-        merge_engine_predictions(fork, entity_states, tick, plan_buf);
+        merge_engine_predictions(fork, entity_states, tick, plan_buf, speed_buf);
 
-        let mut writer = Writer::with_capacity(4 + plan_buf.len() * 9);
+        let mut writer = Writer::with_capacity(4 + plan_buf.len() * 9 + 4 + speed_buf.len() * 7);
         writer.u32(plan_buf.len() as u32);
         for &(key, trit, conf) in plan_buf.iter() {
             writer.u32(key);
             writer.u8(wire::trit_byte(trit));
             // f32 IEEE754 → u32 little-endian。C# 侧用 BinaryPrimitives.ReadSingleLittleEndian 读回。
             writer.u32(conf.to_bits());
+        }
+
+        // 尾部速度表（向后兼容增量）：`[kind u8, slot u16, magnitude f32] * n`。
+        // 旧客户端只按 count*9 读 intent，多余字节被忽略；新客户端遇到缺失则视为无表。
+        writer.u32(speed_buf.len() as u32);
+        for &(kind, slot, magnitude) in speed_buf.iter() {
+            writer.u8(kind);
+            writer.u16(slot as u16);
+            writer.u32(magnitude.to_bits());
         }
         Ok(writer.into_vec())
     }
@@ -2129,6 +2159,35 @@ mod tests {
         ((kind as u32) << 28) | ((slot as u32) << 12) | field
     }
 
+    /// 解析 ACTION_PLAN 尾部速度表（`[kind u8, slot u16, magnitude f32] * n`）。
+    ///
+    /// 缺失 / 截断一律当空表 —— 与 C# 读取端的降级规则一致。
+    fn read_action_plan_speeds(out: &[u8]) -> Vec<(u8, i32, f32)> {
+        if out.len() < 4 {
+            return Vec::new();
+        }
+        let count = u32::from_le_bytes(out[..4].try_into().unwrap()) as usize;
+        let mut offset = 4 + count * 9;
+        if out.len() < offset + 4 {
+            return Vec::new();
+        }
+        let n = u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if out.len() < offset + n * 7 {
+            return Vec::new();
+        }
+        let mut speeds = Vec::with_capacity(n);
+        for index in 0..n {
+            let base = offset + index * 7;
+            speeds.push((
+                out[base],
+                u16::from_le_bytes([out[base + 1], out[base + 2]]) as i32,
+                f32::from_le_bytes(out[base + 3..base + 7].try_into().unwrap()),
+            ));
+        }
+        speeds
+    }
+
     /// 解析 ACTION_PLAN 响应为 (key, delta, confidence) 列表。
     fn read_action_plan(out: &[u8]) -> Vec<(u32, u8, f32)> {
         let mut r = Reader::new(out);
@@ -2280,5 +2339,69 @@ mod tests {
             .expect("velX 应有引擎预测");
         assert_eq!(entry.1, wire::trit_byte(Ternary::False));
         assert_eq!(entry.2, 1.0);
+    }
+
+    /// 引擎速度大小（speed_magnitude）走 ACTION_PLAN 尾部速度表：
+    /// 僵尸（type 3）地面追击 → 一条 (npc, slot 0, walk_speed)。
+    #[test]
+    fn action_plan_carries_engine_speed_magnitude() {
+        let mut rt = takeover_runtime();
+        let vel_x = lane_key(
+            crate::takeover::lane::KIND_NPC,
+            0,
+            crate::takeover::lane::FIELD_VELOCITY_X,
+        );
+        let mut w = Writer::new();
+        w.u64(0).u32(vel_x).u8(2);
+        rt.dispatch(op::TXN_SUBMIT, &w.into_vec()).unwrap();
+
+        let push = {
+            let mut w = Writer::new();
+            w.u32(1);
+            w.bytes(&state_record(1, 0, 3, 1));
+            w.into_vec()
+        };
+        rt.dispatch(op::STATE_PUSH, &push).unwrap();
+
+        let speeds = read_action_plan_speeds(&rt.dispatch(op::ACTION_PLAN, b"").unwrap());
+        assert_eq!(speeds.len(), 1, "僵尸应有一条速度大小");
+        assert_eq!(speeds[0].0, crate::takeover::lane::KIND_NPC);
+        assert_eq!(speeds[0].1, 0);
+        assert!(
+            (speeds[0].2 - 2.0).abs() < 1e-3,
+            "walk_speed 应原样透传，实际 {}",
+            speeds[0].2
+        );
+    }
+
+    /// 飞行家族与未 port 类型都不下发速度大小：前者没有可信的绝对速度，
+    /// 后者根本不参与引擎。
+    #[test]
+    fn action_plan_omits_speed_for_flyers_and_unported() {
+        for npc_type in [2, 9999] {
+            let mut rt = takeover_runtime();
+            let vel_x = lane_key(
+                crate::takeover::lane::KIND_NPC,
+                0,
+                crate::takeover::lane::FIELD_VELOCITY_X,
+            );
+            let mut w = Writer::new();
+            w.u64(0).u32(vel_x).u8(2);
+            rt.dispatch(op::TXN_SUBMIT, &w.into_vec()).unwrap();
+
+            let push = {
+                let mut w = Writer::new();
+                w.u32(1);
+                w.bytes(&state_record(1, 0, npc_type, 1));
+                w.into_vec()
+            };
+            rt.dispatch(op::STATE_PUSH, &push).unwrap();
+
+            let out = rt.dispatch(op::ACTION_PLAN, b"").unwrap();
+            assert!(
+                read_action_plan_speeds(&out).is_empty(),
+                "type {npc_type} 不应下发速度大小"
+            );
+        }
     }
 }

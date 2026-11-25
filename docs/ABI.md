@@ -57,7 +57,27 @@
 | `0x1A` | `TXN_SUBMIT_BATCH` | 二进制 `txn_id u64, count u32, [key u32, delta u8] * n` | 空 |
 | `0x1B` | `SESSION_RESET` | 空（必须为空） | 空 |
 | `0x1C` | `TXN_APPLY` | 二进制 `count u32, [key u32, delta u8] * n` | 二进制 `applied u32, log_seq u64` |
+| `0x1D` | `PREDICTIONS` | 空 | 二进制 `count u32, [key u32, delta u8] * n` |
+| `0x1E` | `CONSISTENCY_RECORD` | 二进制 `count u32, [key u32, consistent u8] * n` | 空 |
+| `0x1F` | `ACTION_PLAN` | 空 | 二进制 `count u32, [key u32, delta u8, confidence f32] * n` + 可选速度表（见下） |
 | `0x20` | `STATE_PUSH` | 二进制 `count u32, [变长记录] * n`（见下） | 空 |
+
+### `0x1F ACTION_PLAN`
+
+```
+count u32
+[key u32, delta u8, confidence f32(IEEE754)] * count
+mag_count u32                                   # 可选速度表
+[kind u8, slot u16, magnitude f32(IEEE754)] * mag_count
+```
+
+- `delta`：`1` = Neg、`2` = Pos、`0` = 弃权（不构成方向命令）。
+- `confidence`：`1.0` = 引擎等价逻辑；其余为历史外推的对拍一致率。
+- **速度表是可选增量**（Phase 2 追加）：车道值只有三值，装不下 `speed_magnitude` 的浮点值，
+  故按实体（`kind` + `slot`）单独下发。只有「水平速度就是移动速度」的地面家族
+  （史莱姆起跳 / 僵尸地面追击）会出现在表里；飞行家族与弹幕不下发。
+- 兼容性：旧客户端只按 `count * 9` 读 intent，忽略尾部；旧内核不写该段，新客户端视为无表。
+  因此**不递增 ABI 版本**。消费端只在 KernelFirst（ReplaceOrig）写 `velocity.X` 时使用它。
 
 ### `0x20 STATE_PUSH`（v3，ABI 5）
 

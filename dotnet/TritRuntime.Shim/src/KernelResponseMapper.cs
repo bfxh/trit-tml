@@ -92,7 +92,8 @@ public static class KernelResponseMapper
 
     /// <summary>
     /// ACTION_PLAN 载荷 → <c>(key, delta, confidence)</c>，原地填进调用方缓冲。
-    /// 布局：<c>count u32, [key u32, delta u8, confidence f32] * n</c>。
+    /// 布局：<c>count u32, [key u32, delta u8, confidence f32] * n</c>，
+    /// 之后是**可选**速度表 <c>mag_count u32, [kind u8, slot u16, magnitude f32] * m</c>。
     /// </summary>
     /// <remarks>
     /// 与 <see cref="ToStepResult"/> 不同，这里吃 <see cref="ReadOnlySpan{T}"/>：
@@ -102,9 +103,11 @@ public static class KernelResponseMapper
     /// </remarks>
     public static void ToActionPlanInto(
         ReadOnlySpan<byte> payload,
-        List<(uint Key, byte Delta, float Confidence)> buffer)
+        List<(uint Key, byte Delta, float Confidence)> buffer,
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null)
     {
         buffer.Clear();
+        speeds?.Clear();
         if (payload.Length < 4)
         {
             return;
@@ -135,6 +138,39 @@ public static class KernelResponseMapper
                 BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(offset, 4)),
                 payload[offset + 4],
                 BinaryPrimitives.ReadSingleLittleEndian(payload.Slice(offset + 5, 4))));
+        }
+
+        if (speeds is null)
+        {
+            return;
+        }
+
+        // 可选尾部速度表：旧 DLL 没有这一段（长度不够），视为无表；
+        // 旧客户端则只读上面的 count*9 字节，尾部被忽略。两端都能降级。
+        long tail = 4L + (count * 9L);
+        if (payload.Length < tail + 4)
+        {
+            return;
+        }
+
+        int magnitudeCount = BinaryPrimitives.ReadInt32LittleEndian(payload.Slice((int)tail, 4));
+        if (magnitudeCount <= 0 || payload.Length < tail + 4 + (magnitudeCount * 7L))
+        {
+            return;
+        }
+
+        if (speeds.Capacity < magnitudeCount)
+        {
+            speeds.Capacity = magnitudeCount;
+        }
+
+        for (int i = 0; i < magnitudeCount; i++)
+        {
+            int offset = (int)tail + 4 + (i * 7);
+            speeds.Add((
+                payload[offset],
+                BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(offset + 1, 2)),
+                BinaryPrimitives.ReadSingleLittleEndian(payload.Slice(offset + 3, 4))));
         }
     }
 

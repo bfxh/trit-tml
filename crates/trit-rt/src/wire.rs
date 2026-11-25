@@ -115,6 +115,10 @@ pub mod op {
     /// 和 PREDICTIONS(0x1D) 的区别：PREDICTIONS 只返回 (key, delta) 做 Phase 1.5 方向门；
     /// ACTION_PLAN 返回额外 confidence —— C# 侧用它判断 KernelFirst 是否跳过 orig
     /// （ReplaceOrig 需要 ≥ 0.9999，PatchAfterOrig ≥ 0.95）。
+    ///
+    /// 尾部可选速度表：`mag_count u32, [kind u8, slot u16, magnitude f32] * m`。
+    /// 三元车道装不下浮点速度，引擎的速度大小（史莱姆起跳 / 僵尸追击）走这里；
+    /// 旧客户端只读 `count*9` 字节会忽略它，旧内核不写则新客户端视为无表。
     pub const ACTION_PLAN: u32 = 0x1F;
     /// 实体状态推送（Phase 2 TritEnginePort）：把当前世界的完整实体状态喂给内核，
     /// 让 `trit-engine` 能跑原版等价 AI 而不是只做历史外推。
