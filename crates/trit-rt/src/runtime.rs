@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use trit_core::value::Ternary;
 
 use crate::arbiter::{
-    ArbitrationMode, Intent, LaneDispute, ResolvedIntent, apply_delta, arbitrate,
+    ArbitrationMode, Intent, LaneDispute, ResolvedIntent, apply_delta, arbitrate, arbitrate_into,
 };
 use crate::error::RtError;
 use crate::gpu::{GpuConfig, GpuPolicy};
@@ -298,7 +298,16 @@ pub struct TritRuntime {
     takeover_fork: Option<crate::takeover::WorldProjectionFork>,
     /// TritEnginePort 的实体状态表（`STATE_PUSH` 每 tick 整批替换）。
     /// 空表 = 引擎不参与，`ACTION_PLAN` 全走历史外推。
-    entity_states: BTreeMap<(u8, i32), EntityState>,
+    /// 按 `(kind, slot)` 升序排列，用二分查找替代每 tick 重建 `BTreeMap`。
+    entity_states: Vec<((u8, i32), EntityState)>,
+    /// `STATE_PUSH` 的解析暂存：解析成功才与 `entity_states` 交换，
+    /// 载荷非法时旧表原样保留（与 BTreeMap 版本的「全有或全无」一致）。
+    state_scratch: Vec<((u8, i32), EntityState)>,
+    /// 提交路径复用缓冲：解析出的意图、待落地合并批、仲裁结果。
+    /// 稳态（单模组、无悬挂事务）下三者容量都不再增长。
+    parse_buf: Vec<Intent>,
+    batch_buf: Vec<Intent>,
+    resolved_buf: Vec<ResolvedIntent>,
     /// 预测输出缓冲：复用容量，稳态零分配。
     plan_buf: Vec<(u32, Ternary, f32)>,
 }
@@ -326,7 +335,7 @@ const ENGINE_CONFIDENCE: f32 = 1.0;
 ///
 /// 返回 `None` = 引擎不管这个键（没有状态 / type 未 port / 字段不支持）→ 调用方保留历史外推。
 fn engine_opinion(
-    states: &BTreeMap<(u8, i32), EntityState>,
+    states: &[((u8, i32), EntityState)],
     key: u32,
     rand: &mut trit_engine::prng::Prng,
 ) -> Option<EngineOpinion> {
@@ -336,7 +345,10 @@ fn engine_opinion(
     let slot = lane::slot(key);
     let field = lane::field(key);
 
-    let sign = match states.get(&(kind, slot))? {
+    let index = states
+        .binary_search_by_key(&(kind, slot), |(k, _)| *k)
+        .ok()?;
+    let sign = match &states[index].1 {
         EntityState::Npc(state) => {
             if !trit_engine::is_ported_npc_type(state.npc_type) {
                 return None;
@@ -378,7 +390,7 @@ fn engine_opinion(
 /// - 未 port 的 type / 未 push 的实体 → 保留历史外推结果。
 fn merge_engine_predictions(
     fork: &crate::takeover::WorldProjectionFork,
-    entity_states: &BTreeMap<(u8, i32), EntityState>,
+    entity_states: &[((u8, i32), EntityState)],
     tick: u64,
     out: &mut Vec<(u32, Ternary, f32)>,
 ) {
@@ -398,9 +410,12 @@ fn merge_engine_predictions(
             Some(EngineOpinion::Predict(trit, conf)) => out.push((key, trit, conf)),
             Some(EngineOpinion::Abstain) => {}
             None => {
-                let predicted = fork.predict(key).filter(|trit| *trit != Ternary::Unknown);
-                if let Some(trit) = predicted {
-                    out.push((key, trit, fork.confidence_of(key)));
+                // 一次查表同时拿到预测与置信度，避免 predict + confidence_of 两次查树。
+                let predicted = fork
+                    .predict_with_confidence(key)
+                    .filter(|(trit, _)| *trit != Ternary::Unknown);
+                if let Some((trit, confidence)) = predicted {
+                    out.push((key, trit, confidence));
                 }
             }
         }
@@ -436,7 +451,11 @@ impl TritRuntime {
             ai_model: None,
             pool,
             takeover_fork,
-            entity_states: BTreeMap::new(),
+            entity_states: Vec::new(),
+            state_scratch: Vec::new(),
+            parse_buf: Vec::new(),
+            batch_buf: Vec::new(),
+            resolved_buf: Vec::new(),
             plan_buf: Vec::new(),
         }
     }
@@ -572,7 +591,8 @@ impl TritRuntime {
         self.event_payload_trits = 0;
         self.shadow = ShadowLog::default();
         self.prng = DeterministicPrng::new(0);
-        self.entity_states = BTreeMap::new();
+        self.entity_states.clear();
+        self.state_scratch.clear();
         self.tick = 0;
         self.last_error.clear();
         self.pool.reset_session();
@@ -686,28 +706,48 @@ impl TritRuntime {
         let mut reader = Reader::new(payload);
         let txn_id = reader.u64()?;
         let count = reader.u32()? as usize;
-        // 先按声明条数预分配，但设上限：坏载荷里的 count 可能是 0xFFFF_FFFF，
-        // 直接 with_capacity 会当场申请 20GB。
-        let mut intents = Vec::with_capacity(count.min(8192));
-        for _ in 0..count {
-            let key = reader.u32()?;
-            let delta = wire::trit_from_byte(reader.u8()?);
-            intents.push(Intent { txn_id, key, delta });
-        }
-        if intents.is_empty() {
+        self.fill_parse_buf(&mut reader, txn_id, count)?;
+        if self.parse_buf.is_empty() {
             return Ok(Vec::new());
         }
         if txn_id == 0 {
             // 自动提交：整批一次仲裁 + 一次落地（与逐条 submit 的结果等价，
             // 但只付一次调用与一次日志追加）。
-            let (applied, _) = self.commit_intents(&intents, 0)?;
+            let intents = std::mem::take(&mut self.parse_buf);
+            let result = self.commit_intents(&intents, 0);
+            self.parse_buf = intents;
+            let (applied, _) = result?;
             self.stats.intents_applied += applied as u64;
             return Ok(Vec::new());
         }
-        for intent in intents {
-            self.txns.push_intent(txn_id, intent)?;
+        let Self {
+            parse_buf, txns, ..
+        } = self;
+        for intent in parse_buf.iter() {
+            txns.push_intent(txn_id, *intent)?;
         }
         Ok(Vec::new())
+    }
+
+    /// 把 `count` 条 `(key, delta)` 解析进复用缓冲 `parse_buf`。
+    ///
+    /// 容量只增不减；坏载荷里的 `count` 可能是 `0xFFFF_FFFF`，
+    /// 因此预分配上限仍按 8192 夹取（真正插入仍受 payload 长度约束）。
+    fn fill_parse_buf(
+        &mut self,
+        reader: &mut Reader<'_>,
+        txn_id: u64,
+        count: usize,
+    ) -> Result<(), RtError> {
+        let intents = &mut self.parse_buf;
+        intents.clear();
+        intents.reserve(count.min(8192));
+        for _ in 0..count {
+            let key = reader.u32()?;
+            let delta = wire::trit_from_byte(reader.u8()?);
+            intents.push(Intent { txn_id, key, delta });
+        }
+        Ok(())
     }
 
     fn op_txn_commit(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
@@ -732,24 +772,17 @@ impl TritRuntime {
     fn op_txn_apply(&mut self, payload: &[u8]) -> Result<Vec<u8>, RtError> {
         let mut reader = Reader::new(payload);
         let count = reader.u32()? as usize;
-        // 与 op_txn_submit_batch 同样的上限：坏载荷里的 count 可能是 0xFFFF_FFFF。
-        let mut intents = Vec::with_capacity(count.min(8192));
-        for _ in 0..count {
-            let key = reader.u32()?;
-            let delta = wire::trit_from_byte(reader.u8()?);
-            intents.push(Intent {
-                txn_id: 0,
-                key,
-                delta,
-            });
-        }
-        if intents.is_empty() {
+        self.fill_parse_buf(&mut reader, 0, count)?;
+        if self.parse_buf.is_empty() {
             let mut writer = Writer::new();
             writer.u32(0);
             writer.u64(self.log.seq());
             return Ok(writer.into_vec());
         }
-        let (applied, log_seq) = self.commit_intents(&intents, 0)?;
+        let intents = std::mem::take(&mut self.parse_buf);
+        let result = self.commit_intents(&intents, 0);
+        self.parse_buf = intents;
+        let (applied, log_seq) = result?;
         self.stats.intents_applied += applied as u64;
         self.stats.txns_committed += 1;
         let mut writer = Writer::new();
@@ -870,10 +903,12 @@ impl TritRuntime {
             return Ok(Vec::new());
         }
 
-        let parsed = (|| -> Result<BTreeMap<(u8, i32), EntityState>, RtError> {
+        // 解析进复用暂存：成功才与当前表交换，非法载荷不破坏旧表。
+        let mut scratch = std::mem::take(&mut self.state_scratch);
+        scratch.clear();
+        let parsed = (|| -> Result<(), RtError> {
             let mut reader = Reader::new(payload);
             let count = reader.u32()? as usize;
-            let mut states: BTreeMap<(u8, i32), EntityState> = BTreeMap::new();
 
             for _ in 0..count {
                 let kind = reader.u8()?;
@@ -938,7 +973,7 @@ impl TritRuntime {
                     // Player 等种类暂不参与引擎（字段语义不同），整条忽略。
                     _ => continue,
                 };
-                states.insert((kind, slot), state);
+                scratch.push(((kind, slot), state));
             }
 
             if !reader.is_empty() {
@@ -947,19 +982,38 @@ impl TritRuntime {
                     payload.len() - 4
                 )));
             }
-            Ok(states)
+            Ok(())
         })();
 
         match parsed {
-            Ok(states) => {
-                self.entity_states = states;
+            Ok(()) => {
+                // 排序 + 同键保留后写入的一条（与 `BTreeMap::insert` 语义一致），
+                // 之后 `engine_opinion` 用二分查找，不再每 tick 建树。
+                scratch.sort_unstable_by_key(|((kind, slot), _)| (*kind, *slot));
+                let mut write = 0;
+                for read in 0..scratch.len() {
+                    if read + 1 < scratch.len() && scratch[read + 1].0 == scratch[read].0 {
+                        continue;
+                    }
+                    scratch[write] = scratch[read];
+                    write += 1;
+                }
+                scratch.truncate(write);
+                std::mem::swap(&mut self.entity_states, &mut scratch);
+                self.state_scratch = scratch;
                 Ok(Vec::new())
             }
             // 截断统一归类为 InvalidInput，方便 C# 侧区分「载荷非法」与其它解码错误。
-            Err(RtError::Decode(message)) => Err(RtError::InvalidInput(format!(
-                "STATE_PUSH 载荷截断：{message}"
-            ))),
-            Err(error) => Err(error),
+            Err(RtError::Decode(message)) => {
+                self.state_scratch = scratch;
+                Err(RtError::InvalidInput(format!(
+                    "STATE_PUSH 载荷截断：{message}"
+                )))
+            }
+            Err(error) => {
+                self.state_scratch = scratch;
+                Err(error)
+            }
         }
     }
 
@@ -1318,58 +1372,80 @@ impl TritRuntime {
     /// 仲裁范围 = 本批意图 ∪ 其他未关闭事务的待落地意图——跨模组冲突在
     /// **提交时点**暴露，而不是各自落地后才互相覆盖。
     fn commit_intents(&mut self, intents: &[Intent], txn_id: u64) -> Result<(u32, u64), RtError> {
-        let pending = self.txns.pending_intents(txn_id);
-        if intents.is_empty() && pending.is_empty() {
-            return Ok((0, self.log.seq()));
-        }
         // 提交前若日志已逼近硬上限，先压缩（依赖保留的快照锚点驱逐旧记录），
         // 避免只追加日志在无快照或快照稀疏时写满触发容量错误。
         if self.log.len() >= self.config.max_log_entries {
             self.compact_log();
         }
-        let mut batch = Vec::with_capacity(intents.len() + pending.len());
-        batch.extend_from_slice(intents);
-        batch.extend(pending);
-        let resolved: Vec<ResolvedIntent> =
-            arbitrate(&batch, self.arbitration).map_err(|disputes: Vec<LaneDispute>| {
-                RtError::Conflict {
-                    count: disputes.len(),
-                    disputes,
-                }
-            })?;
+
+        let Self {
+            txns,
+            arbitration,
+            world,
+            log,
+            config,
+            batch_buf,
+            resolved_buf,
+            ..
+        } = self;
+
+        // 待落地意图几乎总是空（单模组、无悬挂事务）；此时直接仲裁本批，
+        // 不复制到 batch_buf。
+        batch_buf.clear();
+        txns.pending_intents_into(txn_id, batch_buf);
+        let merged: Option<Vec<Intent>> = if batch_buf.is_empty() {
+            None
+        } else {
+            // 冷路径（存在其他未关闭事务）：本批拼在待落地意图之前。
+            let mut merged = Vec::with_capacity(intents.len() + batch_buf.len());
+            merged.extend_from_slice(intents);
+            merged.extend_from_slice(batch_buf);
+            Some(merged)
+        };
+        let input: &[Intent] = merged.as_deref().unwrap_or(intents);
+        if input.is_empty() {
+            return Ok((0, log.seq()));
+        }
+
+        arbitrate_into(input, *arbitration, resolved_buf).map_err(
+            |disputes: Vec<LaneDispute>| RtError::Conflict {
+                count: disputes.len(),
+                disputes,
+            },
+        )?;
+
         // 先做容量预检，保证「要么全落地，要么全不落地」。
         // 上界（把每条都当新车道）都放得下时直接跳过逐条查表——稳态下世界早就建好，
         // 这一层 8000 条就省掉 8000 次树查找。
-        if self.world.len() + resolved.len() > MAX_WORLD_LANES {
-            let new_lanes = resolved
+        if world.len() + resolved_buf.len() > MAX_WORLD_LANES {
+            let new_lanes = resolved_buf
                 .iter()
-                .filter(|intent| !self.world.contains_key(intent.key))
+                .filter(|intent| !world.contains_key(intent.key))
                 .count();
-            if self.world.len() + new_lanes > MAX_WORLD_LANES {
+            if world.len() + new_lanes > MAX_WORLD_LANES {
                 return Err(RtError::Capacity(format!(
                     "世界车道数将达到上限 {MAX_WORLD_LANES}"
                 )));
             }
         }
-        if self.log.is_full(self.config.max_log_entries) {
+        if log.is_full(config.max_log_entries) {
             return Err(RtError::Capacity(format!(
                 "事务日志达到上限 {} 条",
-                self.config.max_log_entries
+                config.max_log_entries
             )));
         }
         let mut applied = 0u32;
-        for intent in resolved {
+        for intent in resolved_buf.iter() {
             if intent.delta == Ternary::Unknown {
                 continue;
             }
             // 先读当前值（未建车道按 Unknown），再写回落差结果。
-            let current = self.world.get(intent.key).unwrap_or(Ternary::Unknown);
-            self.world
-                .set(intent.key, apply_delta(current, intent.delta));
-            self.log.append(&intent);
+            let current = world.get(intent.key).unwrap_or(Ternary::Unknown);
+            world.set(intent.key, apply_delta(current, intent.delta));
+            log.append(intent);
             applied += 1;
         }
-        Ok((applied, self.log.seq()))
+        Ok((applied, log.seq()))
     }
 
     // ---- v2：并行任务池 / GPU / 全局预算（opcode 0x14..0x19，载荷与响应都是 JSON）----

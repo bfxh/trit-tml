@@ -437,6 +437,8 @@ struct EntityTable {
 
 ### 5.7 临时分配回收
 
+> 2026-11-25：下表前三项与 `op_action_plan` 缓冲已在 P1 第二轮落地，详见 §6.5。
+
 | 位置 | 现状 | 改法 |
 |---|---|---|
 | `predict_all()` | 每次返回新 `Vec` | 传入 `&mut Vec<...>` 复用；或写入 `ActionPlanBuf` 结构体 |
@@ -476,7 +478,8 @@ long after = GC.GetAllocatedBytesForCurrentThread();
 Logger.Info($"[trit] 每 tick 托管分配 ≈ {(after - before) / 600.0:F1} B");
 ```
 
-验收线：**< 64 B/tick**（允许偶发装箱）。当前预计在 **10–20 KB/tick** 量级，差距 2–3 个数量级。
+验收线：**< 64 B/tick**（允许偶发装箱）。第二轮（§6.5）落地后，稳态预计 **< 1 KB/tick**；
+剩余大头是 Rust 侧按意图条数增长的容器，以及每 60 tick 一次的汇总日志字符串。
 
 ### 6.3 Hook 层
 
@@ -490,6 +493,16 @@ Logger.Info($"[trit] 每 tick 托管分配 ≈ {(after - before) / 600.0:F1} B")
 ### 6.4 设置写盘
 
 `TakeoverAutoPilot.Persist` 目前按 `PersistIntervalSeconds = 3600` 节流，可接受；但 `Flush()` 在 `ResetWorldSession` 与 `Teardown` 都会触发，**退出世界时可能连续写两次**。建议加「dirty 标记」，无变化不写。
+
+### 6.5 第二轮落地（已实现）
+
+| 项 | 改动 | 依据 / 收益 |
+|---|---|---|
+| Rust 提交路径 | `parse_buf` / `batch_buf` / `resolved_buf` 三块复用；无悬挂事务时不再把本批拷进 `batch`；新增 `arbitrate_into` 原地写结果 | 1600 条/tick 时省约 **64 KB/tick**（≈3.8 MB/s）临时 Vec；稳态 0 次分配 |
+| C# 请求体 | `Requests.*Into` + 线程静态 `requestScratch`：`TXN_APPLY` / `TXN_SUBMIT_BATCH` / `PUBLISH` / `STEP` 不再每次 `new` 载荷数组 | 批量提交 **8 KB/tick** 与若干小数组归零 |
+| 采样裁剪 | 只采 `active` / `velocity.x,y` / `direction`；`position` / `life` / `lifeMax` / `mana` 在全仓库没有读取方，停止写入 | 意图量在其变动场景下约 **−50~70%**，世界车道与快照同比缩小；`trit scan` 的输入相应变少 |
+| `STATE_PUSH` | 改为「复用 Vec + 排序去重 + 交换」，`engine_opinion` 用二分查找 | 每 tick 最多 256 次树插入 → 0，稳态零分配 |
+| fork 历史 | `Vec<Option<KeyHistory>>` 与 `keys` 同序；新增 `orphans` 冷路径；`predict_with_confidence` 单次查表 | 预测循环由 `BTreeMap` 指针追逐改为二分 + 连续内存，每键少一次查找 |
 
 ---
 

@@ -220,6 +220,36 @@ fn window_of(config: &TakeoverConfig) -> u32 {
     config.confidence_window.clamp(1, 64)
 }
 
+/// 单键历史的置信度（0..1）；样本不足 5 个返回 0（永远弃权）。
+fn confidence_of_history(history: &KeyHistory) -> f32 {
+    let samples = history.ring.samples();
+    if samples < 5 {
+        return 0.0;
+    }
+    history.ring.matches() as f32 / samples as f32
+}
+
+/// 单键历史外推：不一致超标 / 置信度不足 / 样本不足 → 弃权（`Unknown`）。
+fn predict_from(history: &KeyHistory, config: &TakeoverConfig) -> (Ternary, f32) {
+    let confidence = confidence_of_history(history);
+    if history.divergences >= config.divergence_tolerance
+        || confidence < config.confidence_threshold
+        || history.ring.samples() < 3
+    {
+        return (Ternary::Unknown, confidence);
+    }
+    let positives = history.ring.matches();
+    let negatives = history.ring.samples() - positives;
+    let trit = if negatives == 0 {
+        Ternary::True
+    } else if positives == 0 {
+        Ternary::False
+    } else {
+        Ternary::Unknown // 震荡
+    };
+    (trit, confidence)
+}
+
 /// 世界投影 fork：键集 + 历史外推预测。
 ///
 /// 每个键维护过去 `confidence_window` 次「内核预测 vs 原版实际」结果（环形位图）。
@@ -229,8 +259,14 @@ pub struct WorldProjectionFork {
     /// 已观察键集（升序，用于 predict_all 遍历）。
     keys: Vec<u32>,
 
-    /// 每个键的对拍历史与不一致计数。
-    history: BTreeMap<u32, KeyHistory>,
+    /// 与 `keys` 同下标的对拍历史（`None` = 该键尚无样本）。
+    /// 用向量而不是 `BTreeMap`：预测每 tick 对全部键查一次，二分查找比树遍历
+    /// 更缓存友好，且不需要任何节点分配。
+    history: Vec<Option<KeyHistory>>,
+
+    /// 在进入键集之前就记录了结果的键（工具 / 测试的冷路径）。
+    /// 生产流量不会走到：对拍结果的键一定来自已存在的世界车道。
+    orphans: BTreeMap<u32, KeyHistory>,
 
     /// 配置（阈值 / 窗口 / 间隔）。
     config: TakeoverConfig,
@@ -245,9 +281,11 @@ impl WorldProjectionFork {
         let mut keys = Vec::with_capacity(snapshot.len());
         snapshot.for_each(|key, _| keys.push(key));
         keys.sort_unstable();
+        let history = vec![None; keys.len()];
         Self {
             keys,
-            history: BTreeMap::new(),
+            history,
+            orphans: BTreeMap::new(),
             config,
             seen_serial: snapshot.structure_serial(),
         }
@@ -260,9 +298,25 @@ impl WorldProjectionFork {
         if serial == self.seen_serial {
             return;
         }
+
+        // 冷路径：按 key 迁移历史。离开世界结构的键转入 orphans，长期置信度不丢。
+        let mut old = std::mem::take(&mut self.orphans);
+        for (index, &key) in self.keys.iter().enumerate() {
+            if let Some(history) = self.history[index] {
+                old.insert(key, history);
+            }
+        }
+
         self.keys.clear();
         snapshot.for_each(|key, _| self.keys.push(key));
         self.keys.sort_unstable();
+
+        self.history.clear();
+        self.history.reserve(self.keys.len());
+        for &key in &self.keys {
+            self.history.push(old.remove(&key));
+        }
+        self.orphans = old;
         self.seen_serial = serial;
     }
 
@@ -276,61 +330,35 @@ impl WorldProjectionFork {
     /// 复用调用方缓冲：稳态不再分配。
     pub fn predict_all_into(&self, out: &mut Vec<(u32, Ternary, f32)>) {
         out.clear();
-        for &key in &self.keys {
-            let Some(trit) = self.predict(key) else {
+        for (index, &key) in self.keys.iter().enumerate() {
+            let Some(history) = self.history[index] else {
                 continue;
             };
+            let (trit, conf) = predict_from(&history, &self.config);
             if trit != Ternary::Unknown {
-                out.push((key, trit, self.confidence_of(key)));
+                out.push((key, trit, conf));
             }
         }
+        // keys 已升序，输出天然有序；保留排序以防未来键集来源变化。
         out.sort_unstable_by_key(|(key, _, _)| *key);
     }
 
     /// 预测单个键的下一 tick 值（三值：Neg / Zero 弃权 / Pos）。
     pub fn predict(&self, key: u32) -> Option<Ternary> {
-        // 置信度门禁：不一致次数超标 → 永远弃权
-        if self
-            .history
-            .get(&key)
-            .map(|h| h.divergences >= self.config.divergence_tolerance)
-            .unwrap_or(false)
-        {
-            return Some(Ternary::Unknown);
-        }
+        self.predict_with_confidence(key).map(|(trit, _)| trit)
+    }
 
-        let conf = self.confidence_of(key);
-        if conf < self.config.confidence_threshold {
-            return Some(Ternary::Unknown);
-        }
-
-        // 历史外推：全部 Pos → Pos，全部 Neg → Neg，否则震荡。
-        let hist = self.history.get(&key)?;
-        if hist.ring.samples() < 3 {
-            return Some(Ternary::Unknown); // 样本太少
-        }
-
-        let pos = hist.ring.matches();
-        let neg = hist.ring.samples() - pos;
-        if neg == 0 {
-            Some(Ternary::True)
-        } else if pos == 0 {
-            Some(Ternary::False)
-        } else {
-            Some(Ternary::Unknown) // 震荡
-        }
+    /// 单次查表同时给出预测与置信度（调用方通常两者都要，避免二次查找）。
+    pub fn predict_with_confidence(&self, key: u32) -> Option<(Ternary, f32)> {
+        let history = self.history_of(&key)?;
+        Some(predict_from(history, &self.config))
     }
 
     /// 置信度（0..1）。历史样本不足 5 个时返回 0（永远弃权）。
     pub fn confidence_of(&self, key: u32) -> f32 {
-        let Some(hist) = self.history.get(&key) else {
-            return 0.0;
-        };
-        let samples = hist.ring.samples();
-        if samples < 5 {
-            return 0.0;
-        }
-        hist.ring.matches() as f32 / samples as f32
+        self.history_of(&key)
+            .map(confidence_of_history)
+            .unwrap_or(0.0)
     }
 
     /// 记录一次「内核预测 vs 原版实际」的对拍结果。
@@ -338,13 +366,26 @@ impl WorldProjectionFork {
     /// `consistent = true` 表示内核预测的 trit 和原版观察到的结果一致。
     pub fn record_outcome(&mut self, key: u32, consistent: bool) {
         let window = window_of(&self.config);
-        let hist = self
-            .history
-            .entry(key)
-            .or_insert_with(|| KeyHistory::new(window));
-        hist.ring.push(consistent);
+        let history = match self.keys.binary_search(&key) {
+            Ok(index) => self.history[index].get_or_insert_with(|| KeyHistory::new(window)),
+            // 键不在当前世界结构里（工具 / 测试）：走冷路径字典，语义保持不变。
+            Err(_) => self
+                .orphans
+                .entry(key)
+                .or_insert_with(|| KeyHistory::new(window)),
+        };
+        history.ring.push(consistent);
         if !consistent {
-            hist.divergences = hist.divergences.saturating_add(1);
+            history.divergences = history.divergences.saturating_add(1);
+        }
+    }
+
+    /// 按 key 查历史：先在 `keys` 二分，未命中再看冷路径字典。
+    #[inline]
+    fn history_of(&self, key: &u32) -> Option<&KeyHistory> {
+        match self.keys.binary_search(key) {
+            Ok(index) => self.history[index].as_ref(),
+            Err(_) => self.orphans.get(key),
         }
     }
 

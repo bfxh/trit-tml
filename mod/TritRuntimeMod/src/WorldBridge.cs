@@ -66,6 +66,9 @@ internal sealed class WorldBridge
     // shim.Publish 会立即序列化，不会在调用后持有引用。
     private readonly TritDelta[] singleDelta = new TritDelta[1];
 
+    // 心跳发布载荷（3 个三值）复用：原来每 tick 都 new[] 一个 3 元素数组。
+    private readonly TritDelta[] heartbeat = new TritDelta[3];
+
     private readonly uint modId;
     private readonly ulong tickSub;
     private readonly ulong npcSub;
@@ -447,32 +450,22 @@ internal sealed class WorldBridge
                 continue;
             }
 
-            // 每个字段只读一次：原来「比较时读一遍、写回时再读一遍」，
-            // 每个实体每 tick 多付 7 次属性读 + 4 次 float→int 转换。
+            // 只采样被消费的字段：接管层（EntityTakeover）读 velocity / direction，
+            // 引擎 STATE_PUSH 自带 type / ai / target / on_ground 等。
+            // 位置、life、lifeMax、mana 在全仓库没有任何读取方，而上位字段（position）
+            // 恰好每 tick 都在变——采它们只会把意图量放大数倍、把世界车道与快照撑大。
             bool present = state.Present;
-            int life = npc.life;
-            int lifeMax = npc.lifeMax;
-            int x = (int)npc.position.X;
-            int y = (int)npc.position.Y;
             int vx = (int)npc.velocity.X;
             int vy = (int)npc.velocity.Y;
             int dir = npc.direction;
 
             EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldActive, 1, present && state.Active ? 1 : 0, present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldLife, life, state.Life, present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldLifeMax, lifeMax, state.LifeMax, present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldPositionX, x, state.X, present);
-            EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldPositionY, y, state.Y, present);
             EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldVelocityX, vx, state.Vx, present);
             EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldVelocityY, vy, state.Vy, present);
             EmitDelta(LaneMap.KindNpc, i, LaneMap.FieldDirection, dir, state.Dir, present);
 
             state.Present = true;
             state.Active = true;
-            state.Life = life;
-            state.LifeMax = lifeMax;
-            state.X = x;
-            state.Y = y;
             state.Vx = vx;
             state.Vy = vy;
             state.Dir = dir;
@@ -525,23 +518,17 @@ internal sealed class WorldBridge
             }
 
             bool present = state.Present;
-            int x = (int)projectile.position.X;
-            int y = (int)projectile.position.Y;
             int vx = (int)projectile.velocity.X;
             int vy = (int)projectile.velocity.Y;
             int dir = projectile.direction;
 
             EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldActive, 1, present && state.Active ? 1 : 0, present);
-            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldPositionX, x, state.X, present);
-            EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldPositionY, y, state.Y, present);
             EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldVelocityX, vx, state.Vx, present);
             EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldVelocityY, vy, state.Vy, present);
             EmitDelta(LaneMap.KindProjectile, i, LaneMap.FieldDirection, dir, state.Dir, present);
 
             state.Present = true;
             state.Active = true;
-            state.X = x;
-            state.Y = y;
             state.Vx = vx;
             state.Vy = vy;
             state.Dir = dir;
@@ -594,32 +581,17 @@ internal sealed class WorldBridge
             }
 
             bool present = state.Present;
-            int life = player.statLife;
-            int lifeMax = player.statLifeMax2;
-            int mana = player.statMana;
-            int x = (int)player.position.X;
-            int y = (int)player.position.Y;
             int vx = (int)player.velocity.X;
             int vy = (int)player.velocity.Y;
             int dir = player.direction;
 
             EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldActive, 1, present && state.Active ? 1 : 0, present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldLife, life, state.Life, present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldLifeMax, lifeMax, state.LifeMax, present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldMana, mana, state.Mana, present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldPositionX, x, state.X, present);
-            EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldPositionY, y, state.Y, present);
             EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldVelocityX, vx, state.Vx, present);
             EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldVelocityY, vy, state.Vy, present);
             EmitDelta(LaneMap.KindPlayer, i, LaneMap.FieldDirection, dir, state.Dir, present);
 
             state.Present = true;
             state.Active = true;
-            state.Life = life;
-            state.LifeMax = lifeMax;
-            state.Mana = mana;
-            state.X = x;
-            state.Y = y;
             state.Vx = vx;
             state.Vy = vy;
             state.Dir = dir;
@@ -700,12 +672,9 @@ internal sealed class WorldBridge
 
     private void PublishAndStep(int activeNpc, int activeProjectile, int activePlayer)
     {
-        TritDelta[] heartbeat =
-        {
-            Sign(activeNpc, prevActiveNpc),
-            Sign(activeProjectile, prevActiveProjectile),
-            Sign(activePlayer, prevActivePlayer),
-        };
+        heartbeat[0] = Sign(activeNpc, prevActiveNpc);
+        heartbeat[1] = Sign(activeProjectile, prevActiveProjectile);
+        heartbeat[2] = Sign(activePlayer, prevActivePlayer);
 
         shim.Publish(EventTick, heartbeat);
 
@@ -1017,16 +986,11 @@ internal sealed class WorldBridge
         return hash;
     }
 
-    /// <summary>单实体上一 tick 的采样快照。</summary>
+    /// <summary>单实体上一 tick 的采样快照（只保留会被消费的字段）。</summary>
     private struct EntityState
     {
         public bool Present;
         public bool Active;
-        public int Life;
-        public int LifeMax;
-        public int Mana;
-        public int X;
-        public int Y;
         public int Vx;
         public int Vy;
         public int Dir;

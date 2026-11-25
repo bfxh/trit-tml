@@ -148,23 +148,49 @@ public sealed class NativeKernel : ITritKernel
     /// <summary>
     /// 每线程复用的响应缓冲。
     ///
-    /// 每 tick 至少三次 <see cref="Submit"/>（Begin / SubmitBatch / Commit），
+    /// 每 tick 至少三次 <see cref="Submit(uint, byte[])"/>（Begin / SubmitBatch / Commit），
     /// 原本每次 <c>new byte[512]</c>，60 tick/s 就是每秒 180 个短命数组、约 90KB
     /// 垃圾，纯粹喂给 GC。复用与 <see cref="WireFormat.Unframe"/> 一起看是安全的：
     /// Unframe 返回的是新数组，缓冲内容不会渗出。按线程分桶是因为
-    /// <see cref="Submit"/> 没有加锁，跨线程共享会被别的调用覆盖。
+    /// <see cref="Submit(uint, byte[])"/> 没有加锁，跨线程共享会被别的调用覆盖。
     /// </summary>
     [ThreadStatic]
     private static byte[]? scratchOutput;
 
+    /// <summary>
+    /// 每线程复用的请求缓冲。
+    ///
+    /// 每 tick 的载荷（批量提交可达 8 KB）原本每次都 `new byte[...]`；
+    /// 复用它之后稳态只剩一次 <c>Array.Clear</c>。与 <see cref="scratchOutput"/>
+    /// 一样按线程分桶：<see cref="Submit(uint, byte[])"/> 没有加锁。
+    /// </summary>
+    [ThreadStatic]
+    private static byte[]? requestScratch;
+
+    /// <summary>取一块至少 <paramref name="required"/> 字节的复用请求缓冲。</summary>
+    private static byte[] RequestScratch(int required)
+    {
+        var buffer = requestScratch;
+        if (buffer is null || buffer.Length < required)
+        {
+            buffer = new byte[Math.Max(required, 256)];
+            requestScratch = buffer;
+        }
+
+        return buffer;
+    }
+
     /// <summary>提交一个 opcode，返回拆框后的载荷。</summary>
-    public KernelResponse Submit(uint opcode, byte[] payload)
+    public KernelResponse Submit(uint opcode, byte[] payload) => Submit(opcode, payload, payload.Length);
+
+    /// <summary>提交一个 opcode（载荷长度显式给出，可复用更大的缓冲）。</summary>
+    public KernelResponse Submit(uint opcode, byte[] payload, int length)
     {
         while (true)
         {
             var output = scratchOutput ??= new byte[512];
             var capacity = output.Length;
-            var status = api.Submit(handle, opcode, payload, payload.Length, output, capacity);
+            var status = api.Submit(handle, opcode, payload, length, output, capacity);
             if (status == Status.Buffer && capacity >= 8)
             {
                 // 协议：所需长度已写进 output 前 8 字节。
@@ -195,7 +221,9 @@ public sealed class NativeKernel : ITritKernel
     /// <summary>step。</summary>
     public StepResult Step(ulong tick)
     {
-        var response = Submit(Opcode.Step, Requests.Step(tick));
+        var buffer = RequestScratch(Requests.StepLength);
+        int length = Requests.StepInto(buffer, tick);
+        var response = Submit(Opcode.Step, buffer, length);
         return KernelResponseMapper.ToStepResult(response);
     }
 
@@ -215,7 +243,9 @@ public sealed class NativeKernel : ITritKernel
     /// <summary>发布。</summary>
     public uint Publish(uint eventId, TritDelta[] payload)
     {
-        var response = Submit(Opcode.Publish, Requests.Publish(eventId, payload));
+        var buffer = RequestScratch(Requests.PublishLength(payload.Length));
+        int length = Requests.PublishInto(buffer, eventId, payload);
+        var response = Submit(Opcode.Publish, buffer, length);
         return KernelResponseMapper.ToU32(response);
     }
 
@@ -240,7 +270,9 @@ public sealed class NativeKernel : ITritKernel
             return;
         }
 
-        Submit(Opcode.TxnSubmitBatch, Requests.TxnSubmitBatch(txnId, keys, deltas));
+        var buffer = RequestScratch(Requests.TxnSubmitBatchLength(keys.Count));
+        int length = Requests.TxnSubmitBatchInto(buffer, txnId, keys, deltas);
+        Submit(Opcode.TxnSubmitBatch, buffer, length);
     }
 
     /// <summary>提交事务。</summary>
@@ -265,7 +297,9 @@ public sealed class NativeKernel : ITritKernel
 
         try
         {
-            var response = Submit(Opcode.TxnApply, Requests.TxnApply(keys, deltas));
+            var buffer = RequestScratch(Requests.TxnApplyLength(keys.Count));
+            int length = Requests.TxnApplyInto(buffer, keys, deltas);
+            var response = Submit(Opcode.TxnApply, buffer, length);
             return KernelResponseMapper.ToCommitResult(response);
         }
         catch (KernelException ex) when (ex.Status == TritRuntime.Wire.Status.BadOp)

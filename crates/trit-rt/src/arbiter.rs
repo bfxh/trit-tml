@@ -98,17 +98,29 @@ pub fn arbitrate(
     intents: &[Intent],
     mode: ArbitrationMode,
 ) -> Result<Vec<ResolvedIntent>, Vec<LaneDispute>> {
-    if let Some(resolved) = resolve_sorted_unique(intents) {
-        return Ok(resolved);
+    let mut resolved = Vec::new();
+    arbitrate_into(intents, mode, &mut resolved)?;
+    Ok(resolved)
+}
+
+/// 与 [`arbitrate`] 等价，但把结果写进调用方缓冲：稳态下（键升序唯一）零分配。
+pub fn arbitrate_into(
+    intents: &[Intent],
+    mode: ArbitrationMode,
+    out: &mut Vec<ResolvedIntent>,
+) -> Result<(), Vec<LaneDispute>> {
+    if resolve_sorted_unique_into(intents, out) {
+        return Ok(());
     }
     let lanes = group_by_key(intents);
     match mode {
-        ArbitrationMode::Strict => arbitrate_strict(&lanes),
-        ArbitrationMode::Majority => arbitrate_majority(&lanes),
+        ArbitrationMode::Strict => arbitrate_strict(&lanes, out),
+        ArbitrationMode::Majority => arbitrate_majority(&lanes, out),
     }
 }
 
-/// 键已升序且唯一时的直通解析；不满足条件返回 `None`，交回分组路径。
+/// 键已升序且唯一时的直通解析，结果写进 `out`；不满足条件返回 `false`，
+/// 清空 `out` 并交回分组路径。
 ///
 /// 为什么要这条快路：`group_by_key` 对每条车道都要建一个 `Vec`，并对每个键做一次
 /// `BTreeMap` 插入。每 tick 8000 条变化就是 8000 次堆分配 + 8000 次树查找，
@@ -117,43 +129,49 @@ pub fn arbitrate(
 /// 为什么不破坏语义：单驱动车道在两种模式下都没有争议可言——
 /// - `Strict` 只会把弃权（`Unknown`）滤掉；
 /// - `Majority` 对弃权会按「平局」判争议，所以这里一遇到弃权就退回慢路，交给原逻辑。
-fn resolve_sorted_unique(intents: &[Intent]) -> Option<Vec<ResolvedIntent>> {
-    let mut resolved: Vec<ResolvedIntent> = Vec::with_capacity(intents.len());
+fn resolve_sorted_unique_into(intents: &[Intent], out: &mut Vec<ResolvedIntent>) -> bool {
+    out.clear();
+    out.reserve(intents.len());
     let mut previous: Option<u32> = None;
     for intent in intents {
         if intent.delta == Ternary::Unknown {
-            return None;
+            out.clear();
+            return false;
         }
         if previous.is_some_and(|prev| intent.key <= prev) {
-            return None;
+            out.clear();
+            return false;
         }
         previous = Some(intent.key);
-        resolved.push(ResolvedIntent {
+        out.push(ResolvedIntent {
             key: intent.key,
             delta: intent.delta,
         });
     }
-    Some(resolved)
+    true
 }
 
 /// 严格模式：走 trit-core 的多驱动总线解析。
 fn arbitrate_strict(
     lanes: &[(u32, Vec<&Intent>)],
-) -> Result<Vec<ResolvedIntent>, Vec<LaneDispute>> {
+    out: &mut Vec<ResolvedIntent>,
+) -> Result<(), Vec<LaneDispute>> {
     let bus_input: Vec<Vec<TriStateDriver>> = lanes
         .iter()
         .map(|(_, intents)| intents.iter().map(|intent| driver_of(intent)).collect())
         .collect();
     match resolve_drivers(&bus_input) {
         Ok(bus) => {
-            let resolved = lanes
-                .iter()
-                .zip(bus.values.iter())
-                .filter_map(|((key, _), value)| {
-                    trit_of(*value).map(|delta| ResolvedIntent { key: *key, delta })
-                })
-                .collect();
-            Ok(resolved)
+            out.clear();
+            out.extend(
+                lanes
+                    .iter()
+                    .zip(bus.values.iter())
+                    .filter_map(|((key, _), value)| {
+                        trit_of(*value).map(|delta| ResolvedIntent { key: *key, delta })
+                    }),
+            );
+            Ok(())
         }
         Err(conflicts) => {
             let disputes = conflicts
@@ -184,8 +202,10 @@ fn arbitrate_strict(
 /// 多数模式：-1/+1 计票，平局争议。
 fn arbitrate_majority(
     lanes: &[(u32, Vec<&Intent>)],
-) -> Result<Vec<ResolvedIntent>, Vec<LaneDispute>> {
-    let mut resolved = Vec::with_capacity(lanes.len());
+    out: &mut Vec<ResolvedIntent>,
+) -> Result<(), Vec<LaneDispute>> {
+    out.clear();
+    out.reserve(lanes.len());
     let mut disputes = Vec::new();
     for (key, intents) in lanes {
         let negatives = intents
@@ -197,11 +217,11 @@ fn arbitrate_majority(
             .filter(|intent| intent.delta == Ternary::True)
             .count();
         match positives.cmp(&negatives) {
-            std::cmp::Ordering::Greater => resolved.push(ResolvedIntent {
+            std::cmp::Ordering::Greater => out.push(ResolvedIntent {
                 key: *key,
                 delta: Ternary::True,
             }),
-            std::cmp::Ordering::Less => resolved.push(ResolvedIntent {
+            std::cmp::Ordering::Less => out.push(ResolvedIntent {
                 key: *key,
                 delta: Ternary::False,
             }),
@@ -216,9 +236,10 @@ fn arbitrate_majority(
         }
     }
     if disputes.is_empty() {
-        resolved.sort_by_key(|intent| intent.key);
-        Ok(resolved)
+        out.sort_by_key(|intent| intent.key);
+        Ok(())
     } else {
+        out.clear();
         disputes.sort_by_key(|dispute| dispute.key);
         Err(disputes)
     }
@@ -264,6 +285,25 @@ mod tests {
                 arbitrate(&sorted, mode).unwrap(),
                 arbitrate(&shuffled, mode).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn arbitrate_into_matches_arbitrate_and_reuses_buffer() {
+        let intents = [
+            intent(1, 10, Ternary::True),
+            intent(1, 20, Ternary::False),
+            intent(1, 30, Ternary::True),
+        ];
+        let mut out = Vec::with_capacity(64);
+        let capacity = out.capacity();
+
+        for _ in 0..3 {
+            for mode in [ArbitrationMode::Strict, ArbitrationMode::Majority] {
+                arbitrate_into(&intents, mode, &mut out).unwrap();
+                assert_eq!(out, arbitrate(&intents, mode).unwrap());
+                assert_eq!(out.capacity(), capacity, "复用缓冲不应扩容");
+            }
         }
     }
 

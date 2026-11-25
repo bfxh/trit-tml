@@ -1,8 +1,10 @@
 #nullable enable
 
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Text.Json;
 using TritRuntime.Wire;
+using WireFormat = TritRuntime.Wire.Wire;
 
 namespace TritRuntime.Kernel;
 
@@ -83,6 +85,110 @@ public static class Requests
         }
 
         return writer.ToArray();
+    }
+
+    /// <summary>批量提交的载荷长度。</summary>
+    public static int TxnSubmitBatchLength(int count) => 12 + count * 5;
+
+    /// <summary>批量提交，写进调用方缓冲（不分配）；与 <see cref="TxnSubmitBatch"/> 逐字节一致。</summary>
+    public static int TxnSubmitBatchInto(
+        Span<byte> dest,
+        ulong txnId,
+        IReadOnlyList<uint> keys,
+        IReadOnlyList<TritDelta> deltas)
+    {
+        if (keys.Count != deltas.Count)
+        {
+            throw new ArgumentException("批量提交的 keys 与 deltas 条数必须一致", nameof(deltas));
+        }
+
+        int length = TxnSubmitBatchLength(keys.Count);
+        if (dest.Length < length)
+        {
+            throw new ArgumentException("缓冲不足以容纳批量提交载荷", nameof(dest));
+        }
+
+        BinaryPrimitives.WriteUInt64LittleEndian(dest, txnId);
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(8), (uint)keys.Count);
+        int offset = 12;
+        for (int i = 0; i < keys.Count; i++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(offset), keys[i]);
+            dest[offset + 4] = (byte)deltas[i];
+            offset += 5;
+        }
+
+        return length;
+    }
+
+    /// <summary>一步提交整批的载荷长度。</summary>
+    public static int TxnApplyLength(int count) => 4 + count * 5;
+
+    /// <summary>
+    /// 一步提交整批，写进调用方缓冲（不分配）。
+    /// 返回写入长度；缓冲不足抛 <see cref="ArgumentException"/>。
+    /// 与 <see cref="TxnApply"/> 逐字节一致（原生路径复用它省掉每 tick 的载荷数组）。
+    /// </summary>
+    public static int TxnApplyInto(Span<byte> dest, IReadOnlyList<uint> keys, IReadOnlyList<TritDelta> deltas)
+    {
+        if (keys.Count != deltas.Count)
+        {
+            throw new ArgumentException("批量提交的 keys 与 deltas 条数必须一致", nameof(deltas));
+        }
+
+        int length = TxnApplyLength(keys.Count);
+        if (dest.Length < length)
+        {
+            throw new ArgumentException("缓冲不足以容纳批量提交载荷", nameof(dest));
+        }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(dest, (uint)keys.Count);
+        int offset = 4;
+        for (int i = 0; i < keys.Count; i++)
+        {
+            BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(offset), keys[i]);
+            dest[offset + 4] = (byte)deltas[i];
+            offset += 5;
+        }
+
+        return length;
+    }
+
+    /// <summary>推进一个 tick 的载荷长度（<c>u64 tick</c>）。</summary>
+    public const int StepLength = 8;
+
+    /// <summary>推进一个 tick，写进调用方缓冲（长度 <see cref="StepLength"/>）。</summary>
+    public static int StepInto(Span<byte> dest, ulong tick)
+    {
+        BinaryPrimitives.WriteUInt64LittleEndian(dest, tick);
+        return StepLength;
+    }
+
+    /// <summary>发布事件的载荷长度。</summary>
+    public static int PublishLength(int tritCount) =>
+        8 + (tritCount + WireFormat.TritsPerByte - 1) / WireFormat.TritsPerByte;
+
+    /// <summary>发布事件，写进调用方缓冲（不分配）；与 <see cref="Publish"/> 逐字节一致。</summary>
+    public static int PublishInto(Span<byte> dest, uint eventId, TritDelta[] payload)
+    {
+        int length = PublishLength(payload.Length);
+        if (dest.Length < length)
+        {
+            throw new ArgumentException("缓冲不足以容纳发布载荷", nameof(dest));
+        }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(dest, eventId);
+        BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(4), (uint)payload.Length);
+        int packedLen = length - 8;
+        dest.Slice(8, packedLen).Clear();
+        for (int i = 0; i < payload.Length; i++)
+        {
+            int digit = (int)payload[i];
+            dest[8 + i / WireFormat.TritsPerByte] +=
+                (byte)(digit * WireFormat.Pow3(i % WireFormat.TritsPerByte));
+        }
+
+        return length;
     }
 
     /// <summary>仲裁：<c>count u32, [txn_id u64, key u32, delta u8] * n</c>。</summary>

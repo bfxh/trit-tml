@@ -316,11 +316,18 @@ impl TxnTable {
 
     /// 除 `exclude` 外所有未关闭事务的待落地意图（提交时做跨事务仲裁）。
     pub fn pending_intents(&self, exclude: u64) -> Vec<Intent> {
-        self.txns
-            .values()
-            .filter(|txn| txn.id != exclude && txn.state == TxnState::Open)
-            .flat_map(|txn| txn.intents.iter().copied())
-            .collect()
+        let mut out = Vec::new();
+        self.pending_intents_into(exclude, &mut out);
+        out
+    }
+
+    /// 与 [`Self::pending_intents`] 等价，但追加到调用方缓冲：无悬挂事务时不分配。
+    pub fn pending_intents_into(&self, exclude: u64, out: &mut Vec<Intent>) {
+        for txn in self.txns.values() {
+            if txn.id != exclude && txn.state == TxnState::Open {
+                out.extend_from_slice(&txn.intents);
+            }
+        }
     }
 
     /// 累计提交数。

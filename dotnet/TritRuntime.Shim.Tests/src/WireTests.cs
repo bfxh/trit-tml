@@ -49,6 +49,35 @@ public sealed class WireTests
     }
 
     [Fact]
+    public void BufferedRequestEncodersMatchArrayEncoders()
+    {
+        // 原生路径改用复用缓冲（*Into），字节必须与托管路径的数组版本完全一致，
+        // 否则影子差分会对同一份逻辑请求报假分歧。
+        var keys = new uint[] { 10, 20, 30 };
+        var deltas = new[] { TritDelta.Pos, TritDelta.Neg, TritDelta.Pos };
+        var buffer = new byte[256];
+
+        int applyLength = Requests.TxnApplyInto(buffer, keys, deltas);
+        Assert.Equal(Requests.TxnApply(keys, deltas), buffer[..applyLength]);
+
+        int batchLength = Requests.TxnSubmitBatchInto(buffer, 7, keys, deltas);
+        Assert.Equal(Requests.TxnSubmitBatch(7, keys, deltas), buffer[..batchLength]);
+
+        int stepLength = Requests.StepInto(buffer, 12_345);
+        Assert.Equal(Requests.Step(12_345), buffer[..stepLength]);
+
+        foreach (var payload in new[]
+                 {
+                     new[] { TritDelta.Pos },
+                     new[] { TritDelta.Pos, TritDelta.Zero, TritDelta.Neg },
+                 })
+        {
+            int publishLength = Requests.PublishInto(buffer, 9, payload);
+            Assert.Equal(Requests.Publish(9, payload), buffer[..publishLength]);
+        }
+    }
+
+    [Fact]
     public void PackingUsesLittleEndianTritOrder()
     {
         // 首字节 = t0 + 3*t1 + 9*t2 + 27*t3 + 81*t4。
