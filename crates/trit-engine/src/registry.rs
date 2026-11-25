@@ -38,6 +38,15 @@ pub const PORTED_NPC_TYPES: &[i32] = &[
 /// - 直线：44 Demon Sickle、55 Stinger（敌）、83 Eye Laser、84 Pink Laser、
 ///   96 Cursed Flame（敌）、100 Death Laser、115 Unholy Trident（敌）、
 ///   128 Frost Blast（敌）、258 Fireball（敌）、264 Rain（敌）、288 Golden Shower（敌）
+///
+/// **分类依据与其局限**：terraria.wiki.gg 的 `Projectile_IDs` 页只有 ID / 名称 /
+/// 来源，没有任何运动学字段，所以「抛物线 / 直线」无法逐条从 wiki 证实。
+/// 这里的两类只是「`Projectile.gravity > 0` / `= 0`」的近似归属，以下几类行为
+/// 没有建模，属于明确近似：27 Water Bolt 与 258 Fireball 会反弹、
+/// 44 Demon Sickle 会追踪玩家。对拍若在这些弹幕上持续分歧，应优先怀疑此处。
+///
+/// 另：弹幕目前不做 KernelFirst（跳过 `Projectile.Update` 会丢位置积分 / 重力 /
+/// 碰撞 / `timeLeft`），只参与预测与对拍，见 `mod/TritRuntimeMod/src/EntityTakeover.cs`。
 pub const PORTED_PROJECTILE_TYPES: &[i32] = &[
     1, 2, 3, 4, 5, 27, 41, 81, 82, 91, 103, 109, 172, 240, // 抛物线
     44, 55, 83, 84, 96, 100, 115, 128, 258, 264, 288, // 直线

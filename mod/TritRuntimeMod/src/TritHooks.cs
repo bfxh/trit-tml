@@ -96,19 +96,8 @@ internal sealed class TritHooks
         {
             projectileUpdate = (orig, self, i) =>
             {
-                // KernelFirst: confidence >= 0.9999 的弹幕跳过 orig 直接写字段
-                if (KernelFirstActive)
-                {
-                    var takeover = mod.Takeover;
-                    if (takeover?.TryApplyKernelFirstToProjectile(self) == true)
-                    {
-                        // KernelFirst 接管成功 —— 不调 orig(self, i)，只做观测计数
-                        Guarded("On_Projectile.Update", bridge.NoteProjectileUpdate);
-                        return;
-                    }
-                }
-
-                // PatchAfterOrig / ObserveOnly / KernelFirst fallback: 正常走 orig + 观测
+                // 弹幕永远走 orig：Projectile.Update 本身就是位置积分 / 重力 / 碰撞 / timeLeft，
+                // 跳过它会让弹幕原地悬停（NPC 只跳过 NPC.AI，位置由 Main.UpdateNPC 负责，故不冲突）。
                 orig(self, i);
                 Guarded("On_Projectile.Update", bridge.NoteProjectileUpdate);
             };

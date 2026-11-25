@@ -247,6 +247,132 @@ jobs:
         run: cargo run -q --release -p trit-rt --example stress_bench -- --npcs 50 --projectiles 30 --players 10 --changes 100 --ticks 100
 
   # ────────────────────────────────────────────────────────────────────────
+  # 4d) 体积护栏：发布形态的原生库体积不能悄悄涨。
+  #     为什么单独一格：native 格只产出制品、没有体积断言（只有 Android 那格
+  #     有 3 MB 护栏）；而体积事故几乎都是「可选重依赖漏进默认特性」
+  #     （trit-net ~500 KB、wgpu 数 MB）——cargo test / clippy 都发现不了，
+  #     只有量产物才看得见。
+  #     阈值依据（对照实测）：Linux .so release 1143 KB / release-mobile 1126 KB，
+  #     Windows dll release 1904 KB / mobile 1652 KB（见 docs/DESKTOP_NATIVE_SWAP.md）。
+  #     绝对上限留到 ~2.2 倍当前体积，只用来兜「整块重依赖被拉进来」这类事故；
+  #     更精确的成因拦截是上面的依赖树断言（trit-net / wgpu 不许出现在默认特性）。
+  #     只跑 ubuntu：三平台产物体积同量级，Linux runner 最快。
+  # ────────────────────────────────────────────────────────────────────────
+  size-guard:
+    name: size guard (release ×2 + mobile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: size-guard
+
+      - name: 默认特性不得引入可选重依赖
+        shell: bash
+        run: |
+          tree=$(cargo tree -p trit-rt -e normal --prefix none)
+          if echo "$tree" | grep -qE '^(trit-net|wgpu|naga) '; then
+            echo "❌ 默认特性里出现了可选重依赖，产物体积会暴涨："
+            echo "$tree" | grep -E '^(trit-net|wgpu|naga) '
+            echo "    检查 crates/trit-rt/Cargo.toml 的 default 是否被改成非空"
+            exit 1
+          fi
+          echo "✅ 默认特性只含必需依赖"
+
+      - name: build release（默认特性）
+        run: cargo build --release -p trit-rt --locked
+
+      - name: 体积 · release（默认特性）
+        id: rel
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib=target/release/libtrit_rt.so
+          test -f "$lib" || { echo "❌ 产物缺失：$lib"; exit 1; }
+          bytes=$(stat -c %s "$lib")
+          kb=$(( (bytes + 1023) / 1024 ))   # 向上取整，护栏不被 1 KB 小数绕过
+          echo "kb=$kb" >> "$GITHUB_OUTPUT"
+          limit=2560                        # 2.5 MiB（当前 1143 KB）
+          echo "release（默认特性）：${kb} KB，上限 ${limit} KB"
+          if [ "$kb" -gt "$limit" ]; then
+            echo "❌ 产物体积超限。常见原因：默认特性被改、wgpu/trit-net 漏进来、strip 失效"
+            exit 1
+          fi
+
+      - name: build release（--no-default-features）
+        run: cargo build --release -p trit-rt --locked --no-default-features
+
+      - name: 体积 · release（--no-default-features）
+        id: nodef
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib=target/release/libtrit_rt.so
+          test -f "$lib" || { echo "❌ 产物缺失：$lib"; exit 1; }
+          bytes=$(stat -c %s "$lib")
+          kb=$(( (bytes + 1023) / 1024 ))
+          echo "kb=$kb" >> "$GITHUB_OUTPUT"
+          rel=${{ steps.rel.outputs.kb }}
+          echo "release（--no-default-features）：${kb} KB（默认特性 ${rel} KB）"
+          # 关掉默认特性只可能变小或持平；变大说明特性开关接反了。
+          if [ "$kb" -gt "$rel" ]; then
+            echo "❌ 关掉默认特性后产物反而变大（${kb} KB > ${rel} KB）"
+            exit 1
+          fi
+
+      - name: build release-mobile（--no-default-features）
+        run: cargo build --profile release-mobile --no-default-features -p trit-rt --locked
+
+      - name: strip + 体积 · release-mobile
+        id: mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib=target/release-mobile/libtrit_rt.so
+          test -f "$lib" || { echo "❌ 产物缺失：$lib"; exit 1; }
+          if command -v strip >/dev/null 2>&1; then
+            strip --strip-all "$lib"
+          elif command -v llvm-strip >/dev/null 2>&1; then
+            llvm-strip --strip-all "$lib"
+          fi
+          bytes=$(stat -c %s "$lib")
+          kb=$(( (bytes + 1023) / 1024 ))
+          echo "kb=$kb" >> "$GITHUB_OUTPUT"
+          limit=2400                        # docs/TAKEOVER_PLAN.md §7 的 L2 体积预算
+          rel=${{ steps.rel.outputs.kb }}
+          echo "release-mobile（strip 后）：${kb} KB，上限 ${limit} KB"
+          if [ "$kb" -gt "$limit" ]; then
+            echo "❌ 体积优先档超限：fat LTO / opt-level=z / module strip 是否生效？"
+            exit 1
+          fi
+          # 体积优先档必须真的更小，否则 profile 配置没起作用。
+          if [ "$kb" -ge "$rel" ]; then
+            echo "❌ release-mobile（${kb} KB）没有比 release（${rel} KB）更小"
+            exit 1
+          fi
+
+      - name: 汇总
+        shell: bash
+        run: |
+          {
+            echo "### 原生库体积（libtrit_rt.so）"
+            echo ""
+            echo "| 构建 | 体积 | 上限 |"
+            echo "|---|---|---|"
+            echo "| release（默认） | ${{ steps.rel.outputs.kb }} KB | 2560 KB |"
+            echo "| release（--no-default-features） | ${{ steps.nodef.outputs.kb }} KB | ≤ 默认 |"
+            echo "| release-mobile（strip 后） | ${{ steps.mobile.outputs.kb }} KB | 2400 KB |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ────────────────────────────────────────────────────────────────────────
   # 5) 覆盖率：cargo-llvm-cov。失败不阻塞合并（覆盖率工具本身偶发与新版
   #    rustc/llvm 不兼容），但结果会作为制品留档，长期看趋势。
   # ────────────────────────────────────────────────────────────────────────
@@ -601,6 +727,7 @@ jobs:
       - gpu
       - rustdoc
       - examples-smoke
+      - size-guard
       - native
       - dotnet
       - csharp-nullable
@@ -613,13 +740,15 @@ jobs:
           echo "gpu        = ${{ needs.gpu.result }}"
           echo "rustdoc    = ${{ needs.rustdoc.result }}"
           echo "examples   = ${{ needs.examples-smoke.result }}"
+          echo "size       = ${{ needs.size-guard.result }}"
           echo "native     = ${{ needs.native.result }}"
           echo "dotnet     = ${{ needs.dotnet.result }}"
           echo "nullable   = ${{ needs.csharp-nullable.result }}"
           for r in "${{ needs.lint.result }}" "${{ needs.rust-test.result }}" \
                    "${{ needs.msrv.result }}" "${{ needs.gpu.result }}" \
                    "${{ needs.rustdoc.result }}" "${{ needs.examples-smoke.result }}" \
-                   "${{ needs.native.result }}" "${{ needs.dotnet.result }}" \
+                   "${{ needs.size-guard.result }}" "${{ needs.native.result }}" \
+                   "${{ needs.dotnet.result }}" \
                    "${{ needs.csharp-nullable.result }}"; do
             if [ "$r" != "success" ]; then
               echo "有 job 未通过：$r"

@@ -4,7 +4,9 @@ use crate::prng::Prng;
 use crate::projectile::{ProjectileDelta, ProjectileState, direction_from_vx};
 
 pub fn step(state: &ProjectileState, _rand: &mut Prng) -> ProjectileDelta {
-    // Bullet 保持发射方向，速度逐渐衰减（但 KernelFirst 只关方向门，衰减不影响 sign）
+    // 无重力直线：velocity 每 tick 不变，方向即当前方向。
+    // 追踪（44 Demon Sickle）/ 弹跳（258 Golem Fireball）没有单独建模，
+    // 由注册表注释标注为近似。
     let vx_dir = direction_from_vx(state.velocity_x);
     let vy_dir = direction_from_vx(state.velocity_y);
 

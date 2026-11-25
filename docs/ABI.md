@@ -78,6 +78,8 @@ mag_count u32                                   # 可选速度表
   （史莱姆起跳 / 僵尸地面追击）会出现在表里；飞行家族与弹幕不下发。
 - 兼容性：旧客户端只按 `count * 9` 读 intent，忽略尾部；旧内核不写该段，新客户端视为无表。
   因此**不递增 ABI 版本**。消费端只在 KernelFirst（ReplaceOrig）写 `velocity.X` 时使用它。
+- 只对 **NPC** 生效：`Projectile.Update` 自带位置积分 / 重力 / 碰撞 / `timeLeft`，
+  跳过它会让弹幕原地悬停，所以弹幕 intent 只参与对拍与方向门，不做 KernelFirst。
 
 ### `0x20 STATE_PUSH`（v3，ABI 5）
 

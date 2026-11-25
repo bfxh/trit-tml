@@ -5,13 +5,13 @@ trit-tml 模组的原生内核（trit_rt.dll / libtrit_rt.so / libtrit_rt.dylib�
 
 | 版本 | 构建 profile | 体积（Windows 实测） | 特点 |
 |---|---|---|---|
-| **release**（默认） | thin LTO + opt-level=3 | **2330 KB** | 性能优先，桌面默认打包 |
-| **release-mobile** | fat LTO + opt-level=z + codegen-units=1 + strip + no-default-features | **1652 KB** | 体积优先（-29%），性能差 ~2% |
+| **release**（默认） | thin LTO + opt-level=3 | **1904 KB** | 性能优先，桌面默认打包 |
+| **release-mobile** | fat LTO + opt-level=z + codegen-units=1 + strip + no-default-features | **1652 KB** | 体积优先（-13%），性能差 ~2% |
 
 两者 **FFI ABI 完全一致**、**行为完全一致**——可以随时互相替换，
 模组代码不感知，不会崩游戏。
 
-如果你在意模组总下载体积（release-mobile 能省 ~678 KB），或者用的是低配
+如果你在意模组总下载体积（release-mobile 能省 ~252 KB），或者用的是低配
 笔记本、想让常驻内存更紧凑，就换成 release-mobile 版。
 
 ---
@@ -159,7 +159,7 @@ Android 用 NDK clang 链接、bionic libc；桌面 Linux/macOS 用 gcc/clang + 
 
 **Q: 性能差多少？**
 A: 实测 release-mobile 比 release 慢 **~2%**（桌面 CPU 位并行扫描 n=1 窗口），
-人类玩家感知不到。省下的 678 KB 体积在弱网下载或磁盘紧张时可能更重要。
+人类玩家感知不到。省下的 252 KB 体积在弱网下载或磁盘紧张时可能更重要。
 
 **Q: macOS Intel 能用 Apple Silicon 的 dylib 吗？**
 A: 不行，架构不兼容。Intel Mac 下载 `trit-rt-mobile-macos-latest` 时如果

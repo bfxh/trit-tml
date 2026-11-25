@@ -18,13 +18,19 @@ namespace TritRuntimeMod;
 /// <item><c>PatchAfterOrig</c>（Android 默认）：orig 先跑 → 对拍 → RecordOutcome → Apply
 ///   confidence ≥ 0.95 才 apply（方向门）</item>
 /// <item><c>ReplaceOrig</c>（KernelFirst 完整版，Android only）：
-///   <b>Per-NPC / Per-Projectile 粒度跳过 orig(self)</b> —— 只对 confidence ≥ 0.9999
-///   的实体跳过 orig，直接写内核预测方向；其他实体正常走 PatchAfterOrig fallback</item>
+///   <b>Per-NPC 粒度跳过 orig(self)</b> —— 只对 confidence ≥ 0.9999 的 NPC 跳过 orig，
+///   直接写内核预测方向；其他实体正常走 PatchAfterOrig fallback</item>
 /// </list>
 /// <para>
 /// KernelFirst 架构：tick 开头 PreUpdateEntities() 预拉 ActionPlan + 按 slot 分桶缓存；
-/// On_NPC.AI / On_Projectile.Update 钩子内查缓存，confidence ≥ 0.9999 的实体跳过 orig 直接写。
+/// On_NPC.AI 钩子内查缓存，confidence ≥ 0.9999 的 NPC 跳过 orig 直接写。
 /// 对拍策略：KernelFirst 实体跳过（没有原版值可比）；PatchAfterOrig fallback 正常对拍 + RecordOutcome。
+/// </para>
+/// <para>
+/// <b>弹幕刻意不做 KernelFirst</b>：NPC 的位置积分由 `Main.UpdateNPC` 在 `NPC.AI` 之外完成，
+/// 跳过 `NPC.AI` 只丢决策；而 `Projectile.Update` 本身就是整段物理（位置积分、重力、
+/// 碰撞、`timeLeft` 递减）。跳过它会让被接管的弹幕原地悬停、永不消失。
+/// 因此弹幕只参与预测 / 对拍（PatchAfterOrig），不进入 KernelFirst 缓存。
 /// </para>
 /// </remarks>
 internal sealed class EntityTakeover
@@ -206,7 +212,8 @@ internal sealed class EntityTakeover
     // ──────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// tick 开头预拉 ActionPlan 并按 slot 分桶缓存，供 On_NPC.AI / On_Projectile.Update 钩子查询。
+    /// tick 开头预拉 ActionPlan 并按 slot 分桶缓存，供 On_NPC.AI 钩子查询。
+    /// <para>只缓存 NPC —— 弹幕跳过 <c>Projectile.Update</c> 会丢物理，见类型注释。</para>
     /// <para>由 TritWorldSystem.PreUpdateEntities() 驱动，保证在实体 AI 之前完成。</para>
     /// <para>ReplaceOrig 模式下每 tick 一次；非 ReplaceOrig 模式下空操作（return）。</para>
     /// </summary>
@@ -256,6 +263,10 @@ internal sealed class EntityTakeover
             if (conf < ReplaceOrigConfidenceMin) continue;  // KernelFirst 门槛
 
             uint kind = LaneMap.KindOf(key);
+            // 弹幕不接管：跳过 Projectile.Update 会丢掉位置积分 / 重力 / 碰撞 / timeLeft，
+            // 弹幕会原地悬停。弹幕 intent 仍会在 AfterOrig 里对拍 + 方向门。
+            if (kind != LaneMap.KindNpc) continue;
+
             int slot = LaneMap.SlotOf(key);
             ulong bucketKey = ((ulong)kind << 32) | (uint)slot;
 
@@ -439,50 +450,6 @@ internal sealed class EntityTakeover
                     break;
                 case LaneMap.FieldDirection:
                     npc.direction = delta == 2 ? 1 : -1;
-                    applied = true;
-                    break;
-            }
-        }
-
-        if (applied)
-        {
-            KernelFirstTakeoverCount++;
-            totalKernelFirst++;
-        }
-
-        return applied;
-    }
-
-    /// <summary>
-    /// Projectile 版。见 <see cref="TryApplyKernelFirstToNpc"/>。
-    /// </summary>
-    public bool TryApplyKernelFirstToProjectile(Projectile proj)
-    {
-        if (settings.Takeover != TritSettings.TakeoverMode.ReplaceOrig) return false;
-        if (kernelFirstCache is null) return false;
-        if (proj is null || !proj.active) return false;
-
-        ulong bucketKey = ((ulong)LaneMap.KindProjectile << 32) | (uint)proj.whoAmI;
-        if (!kernelFirstCache.TryGetValue(bucketKey, out var intents)) return false;
-
-        bool applied = false;
-        foreach (var (key, delta, _) in intents)
-        {
-            uint field = LaneMap.FieldOf(key);
-            float fdelta = delta == 2 ? +1f : -1f;
-
-            switch (field)
-            {
-                case LaneMap.FieldVelocityX:
-                    proj.velocity.X = KernelFirstSign(fdelta, proj.velocity.X);
-                    applied = true;
-                    break;
-                case LaneMap.FieldVelocityY:
-                    proj.velocity.Y = KernelFirstSign(fdelta, proj.velocity.Y);
-                    applied = true;
-                    break;
-                case LaneMap.FieldDirection:
-                    proj.direction = delta == 2 ? 1 : -1;
                     applied = true;
                     break;
             }

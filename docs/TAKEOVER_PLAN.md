@@ -351,7 +351,7 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
 | **安全** | 接管者写入只改 Terraria 公开字段，不碰私有/反射 | 代码审计 + Mono.TypeNameChecker |
 | **回滚** | 触发熔断后 1 tick 内回到纯观测，无副作用 | 手动改 settings.json + 观察日志 |
 | **兼容** | 至少 20 个热门 tML 模组环境下接管不崩 | 模组依赖矩阵测试 |
-| **体积** | L2 release-mobile + no-default-features ≤ 2400 KB | CI 已有体积护栏 |
+| **体积** | L2 release-mobile + no-default-features ≤ 2400 KB；release ≤ 3072 KB | CI `size-guard`（release ×2 + mobile，含「默认特性不得引入 trit-net/wgpu」的依赖树断言） |
 | **三端** | Windows / Linux / macOS / Android 行为一致 | 跨平台 CI matrix |
 
 ---
@@ -378,6 +378,14 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
   - 弹幕：1..5 / 27 / 41 / 81 / 82 / 91 / 103 / 109 / 172 / 240 抛物线、
     44 / 55 / 83 / 84 / 96 / 100 / 115 / 128 / 258 / 264 / 288 直线（25 种）
   - 刻意不 port：Boss（4 Eye of Cthulhu、50 King Slime）、蠕虫体节（7..15）、骷髅（21、-46..-53）
+  - 弹幕分类依据与局限：`Projectile_IDs` 页无运动学字段，「抛物线 / 直线」只能按
+    `gravity > 0 / = 0` 近似归属；27 Water Bolt、258 Golem Fireball 的反弹与
+    44 Demon Sickle 的追踪未建模，属明确近似。
+  - 弹幕不做 KernelFirst：`Projectile.Update` 本身就是位置积分 / 重力 / 碰撞 /
+    `timeLeft`，跳过 orig 会让弹幕悬停。弹幕仅参与预测与对拍；只有 NPC 走
+    「跳过 `NPC.AI`」（位置由 `Main.UpdateNPC` 负责）。
+  - 抛物线分支按 `velocity.y + gravity` 预测**下一 tick** 的符号，顶点处翻转；
+    重力值取自状态快照（当前固定 0.08，尚未按 type 采样）。
 - 采样保真：`on_ground` / `tile_below` 取碰撞真值（`npc.collideY` + 脚底 4px 实心检测），
   史莱姆 / 僵尸 / 飞行追击均按 `target_dx, dy` 转向，不再是「镜像当前速度」。
 - 速度大小消费：三元车道装不下浮点速度，`ACTION_PLAN` 尾部追加可选速度表
@@ -385,8 +393,8 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
   （史莱姆起跳 / 僵尸追击）；飞行家族不再虚构 `walk_speed.max(1.8)`。
   KernelFirst（ReplaceOrig）写 `velocity.X` 时优先用该值，缺失则退回「保留当前绝对值」。
   旧客户端 / 旧内核双向降级，不升 ABI。
-- 历史修正：早期表的注释与实际原版 ID 不符（4 = Eye of Cthulhu、5 = Servant of Cthulhu、
-  6 = Eater of Souls、10 = Giant Worm Head、14/15 = Eater of Worlds 体节），
+- 历史修正：早期注释凭记忆写错过编号（把 4 当成 Eye of Cthulhu、10 当成 Giant Worm Head；
+  实际 4 = Unholy Arrow、10 = Purification Powder，已在 `Projectile_IDs` 页核对），
   现已改为「只登记真正有实现分支的类型」，并由 `every_ported_type_has_a_branch` 测试锁定。
 - **验收**：L2 下原版 AI CPU 降到 0（已跳过）；整体 CPU 使用率降 40-60%
 
