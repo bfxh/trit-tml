@@ -80,8 +80,12 @@ mag_count u32                                   # 可选速度表
   因此**不递增 ABI 版本**。消费端只在 KernelFirst（ReplaceOrig）写 `velocity.X` 时使用它。
 - 只对 **NPC** 生效：`Projectile.Update` 自带位置积分 / 重力 / 碰撞 / `timeLeft`，
   跳过它会让弹幕原地悬停，所以弹幕 intent 只参与对拍与方向门，不做 KernelFirst。
-- 速度表只有**水平**速度（跳跃/追击的移动速度）。上升冲量没有对应字段，因此
-  预测「向上」且当前 `|velocity.Y| < 0.01` 时，消费端放弃该 tick 的 KernelFirst。
+- 速度表只有**水平**速度（跳跃/追击的移动速度）。两条「没有幅度来源」的降级规则都在
+  消费端、写字段之前判定，命中即整只放弃该 tick 的 KernelFirst（交回原版定幅度）：
+  - **Y 轴**：快照与计划都不带 vertical 速度大小，因此只要 `|velocity.Y| < 0.01`，
+    无论内核预测向上（起跳冲量）还是向下，都不接管；
+  - **X 轴**：该实体不在速度表里（`magnitude` 缺失）且 `|velocity.X| < 0.01` 时不接管 ——
+    否则飞行家族会被写成 ±0.1 卡在原地，原版本会逐 tick 加速。
 
 ### `0x20 STATE_PUSH`（v3，ABI 5）
 

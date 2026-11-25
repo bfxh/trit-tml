@@ -428,16 +428,30 @@ internal sealed class EntityTakeover
         ulong bucketKey = ((ulong)LaneMap.KindNpc << 32) | (uint)npc.whoAmI;
         if (!kernelFirstCache.TryGetValue(bucketKey, out var intents)) return false;
 
-        // 预检：内核预测「向上」，而当前 vertical velocity ≈ 0 —— 说明实体站在地面、
-        // 内核要求起跳。上升冲量的大小不在 STATE_PUSH 快照里（ACTION_PLAN 只有方向
-        // 通道），KernelFirstSign 会把 |vy| 兜成 0.1，史莱姆的跳跃会退化成原地抖动。
-        // 这一 tick 整只放弃接管、让原版定冲量；空中下一 tick 再按当前速度接管。
+        // 预检（幅度兜底）：通道只有方向、没有幅度的情形，静止时不能靠 0.1 兜底。
+        //
+        // Y 轴：STATE_PUSH 与 ACTION_PLAN 都不携带 vertical 速度大小。当前 |vy| ≈ 0 时，
+        //   无论内核预测向上（起跳，需要冲量）还是向下（下坠/下落攻击），写出去的都只是
+        //   ±0.1 —— 史莱姆退化成原地抖动，下坠实体变成"慢慢飘"。这一 tick 整只放弃接管，
+        //   让原版定冲量；下一 tick 速度非零后再按当前速度接管。
+        // X 轴：速度表（ACTION_PLAN 尾部）只有「水平速度就是移动速度」的地面家族。
+        //   该实体不在表里且 |vx| ≈ 0 时，KernelFirstVelocity 同样会兜成 0.1 并跳过 orig，
+        //   飞行家族会被卡在原地（原版本会逐 tick 加速）。此时也交回原版。
+        //
         // 必须在写任何字段之前判断，避免半接管（X 已改、Y 没改）。
+        float speedMagnitude = SpeedOf(LaneMap.KindNpc, npc.whoAmI);
         foreach (var (key, delta, _) in intents)
         {
-            if (delta == 1
-                && LaneMap.FieldOf(key) == LaneMap.FieldVelocityY
+            uint field = LaneMap.FieldOf(key);
+            if (field == LaneMap.FieldVelocityY
                 && Math.Abs(npc.velocity.Y) < GroundJumpVelocityEpsilon)
+            {
+                return false;
+            }
+
+            if (field == LaneMap.FieldVelocityX
+                && speedMagnitude <= 0f
+                && Math.Abs(npc.velocity.X) < GroundJumpVelocityEpsilon)
             {
                 return false;
             }
@@ -456,7 +470,7 @@ internal sealed class EntityTakeover
                     npc.velocity.X = KernelFirstVelocity(
                         fdelta,
                         npc.velocity.X,
-                        SpeedOf(LaneMap.KindNpc, npc.whoAmI));
+                        speedMagnitude);
                     applied = true;
                     break;
                 case LaneMap.FieldVelocityY:
@@ -484,18 +498,22 @@ internal sealed class EntityTakeover
 
     /// <summary>
     /// KernelFirst 直接写字段：取内核预测方向的绝对值，确保非零，再乘方向符号。
-    /// velocity=0 时内核预测方向本身，给个微小初速度让实体"看起来动起来"。
+    /// <para>
+    /// <c>0.1</c> 只是最后兜底 —— 正常路径已被 <see cref="TryApplyKernelFirstToNpc"/> 的
+    /// 预检挡在前面（Y 轴静止时整只放弃接管），不应再出现「静止却预测移动」被写成 ±0.1。
+    /// </para>
     /// </summary>
     private static float KernelFirstSign(float sign, float currentValue)
     {
         float abs = currentValue < 0f ? -currentValue : currentValue;
-        if (abs < 0.01f) abs = 0.1f;  // 零速度时给个微小初速度
+        if (abs < 0.01f) abs = 0.1f;  // 兜底：预检失效时的最小非零位移
         return sign * abs;
     }
 
     /// <summary>
     /// KernelFirst 水平速度：优先用引擎给出的速度大小；没有（未下发 / 该家族不提供）
     /// 时退回「保留当前绝对值」。
+    /// <para>速度表缺失且当前静止的情形同样由调用方预检挡下，不会走到 0.1 兜底。</para>
     /// </summary>
     private static float KernelFirstVelocity(float sign, float currentValue, float magnitude)
     {
