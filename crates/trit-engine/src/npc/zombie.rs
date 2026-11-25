@@ -6,7 +6,7 @@
 //! 3. 贴脸时小跳
 //! 4. 落地后继续追击
 
-use crate::npc::{NpcDelta, NpcState, direction_from_vx};
+use crate::npc::{NpcDelta, NpcState, direction_from_vx, sign};
 use crate::prng::Prng;
 
 pub fn step(state: &NpcState, _rand: &mut Prng) -> NpcDelta {
@@ -36,8 +36,13 @@ pub fn step(state: &NpcState, _rand: &mut Prng) -> NpcDelta {
         };
     }
 
-    // 在地上 —— 沿当前朝向追击；需要跳时给向上的垂直速度
-    let dir_f = state.direction as f32;
+    // 在地上 —— 朝目标方向追击；没有目标向量时沿用当前朝向。
+    // `target_dx = 实体 - 目标`，目标在左则 dx > 0 → 向左（-1）。
+    let dir_f = if state.target_dx.abs() >= 1.0 {
+        -sign(state.target_dx)
+    } else {
+        state.direction as f32
+    };
     let vy_sign = if !state.tile_below || state.target_distance < 50.0 {
         -1.0 // 脚下悬空 / 贴脸 → 跳
     } else {
@@ -47,7 +52,7 @@ pub fn step(state: &NpcState, _rand: &mut Prng) -> NpcDelta {
     NpcDelta {
         velocity_x_sign: Some(dir_f),
         velocity_y_sign: Some(vy_sign),
-        direction: Some(state.direction),
+        direction: Some(dir_f as i32),
         speed_magnitude: Some(state.walk_speed),
     }
 }
@@ -100,5 +105,25 @@ mod tests {
         let d = step(&s, &mut rand);
         assert_eq!(d.velocity_x_sign, Some(0.0));
         assert_eq!(d.velocity_y_sign, Some(0.0));
+    }
+
+    #[test]
+    fn zombie_steers_by_target_dx() {
+        // 目标在右侧（dx < 0）→ 向右（+1），即使当前朝向是左。
+        let s = NpcState {
+            npc_type: 3,
+            on_ground: true,
+            tile_below: true,
+            target: 0,
+            target_distance: 300.0,
+            target_dx: -120.0,
+            direction: -1,
+            ..Default::default()
+        };
+
+        let mut rand = Prng::new(1);
+        let d = step(&s, &mut rand);
+        assert_eq!(d.velocity_x_sign, Some(1.0));
+        assert_eq!(d.direction, Some(1));
     }
 }

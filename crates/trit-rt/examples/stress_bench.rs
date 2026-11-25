@@ -124,7 +124,7 @@ fn build_states_payload(npcs: usize, projectiles: usize) -> Vec<u8> {
     writer.into_vec()
 }
 
-/// 写一条 16 字节定长状态记录（ai_mask = 0，不带变长 ai 值）。
+/// 写一条 20 字节定长状态记录（ai_mask = 0，不带变长 ai 值）。
 fn push_state_record(writer: &mut Writer, kind: u8, slot: u16, entity_type: u16) {
     writer
         .u8(kind)
@@ -139,6 +139,12 @@ fn push_state_record(writer: &mut Writer, kind: u8, slot: u16, entity_type: u16)
             | wire::state_flags::HAS_TARGET)
         .i16(wire::quantize_i16(2.0, wire::STATE_WALK_SPEED_SCALE))
         .u16(wire::quantize_u16(300.0, wire::STATE_TARGET_DISTANCE_SCALE))
+        // 目标向量：交替左右，覆盖「按偏移转向」的解析分支。
+        .i16(wire::quantize_i16(
+            if slot & 1 == 0 { -300.0 } else { 300.0 },
+            wire::STATE_TARGET_DELTA_SCALE,
+        ))
+        .i16(0)
         .u8(0);
 }
 

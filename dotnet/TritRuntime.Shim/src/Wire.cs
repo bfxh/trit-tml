@@ -327,10 +327,10 @@ public static class Wire
     /// <summary>
     /// STATE_PUSH 单条实体状态记录的<b>定长部分</b>，与 Rust <c>wire::STATE_RECORD_FIXED_LEN</c> 一致：
     /// <c>kind u8(1) + slot u16(2) + type u16(2) + vel_x/vel_y i16(4) + dir i8(1) + flags u8(1)
-    /// + walk_speed i16(2) + target_distance u16(2) + ai_mask u8(1) = 16</c>。
+    /// + walk_speed i16(2) + target_distance u16(2) + target_dx/target_dy i16(4) + ai_mask u8(1) = 20</c>。
     /// 每个非零 ai 槽再加一个 <c>i16</c>。
     /// </summary>
-    public const int StateRecordFixedLength = 16;
+    public const int StateRecordFixedLength = 20;
 
     /// <summary>ai 槽数量（<c>ai_mask</c> 的位宽）。</summary>
     public const int StateAiSlots = 8;
@@ -346,6 +346,9 @@ public static class Wire
 
     /// <summary>target_distance 量化比例（<c>q = round(d * 4)</c>）。</summary>
     public const float StateTargetDistanceScale = 4f;
+
+    /// <summary>target_dx / target_dy 量化比例（<c>q = round(v * 4)</c>，i16 约 ±8191 px）。</summary>
+    public const float StateTargetDeltaScale = 4f;
 
     /// <summary>量化到 <see cref="short"/>（四舍五入 + 饱和；NaN → 0），与 Rust <c>quantize_i16</c> 一致。</summary>
     public static short QuantizeI16(float value, float scale)

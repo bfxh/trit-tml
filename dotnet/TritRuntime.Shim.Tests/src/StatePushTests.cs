@@ -117,4 +117,45 @@ public sealed class StatePushTests
         Assert.True(shim.PushEntityStates(Array.Empty<EntitySnapshot>()));
         Assert.Empty(shim.GetActionPlan());
     }
+
+    [Fact]
+    public void TargetOffsetSteersFlyerTowardPlayer()
+    {
+        var path = NativeLibraryLocator.Find();
+        if (path is null)
+        {
+            return;
+        }
+
+        using var shim = RuntimeShim.Attach(new RuntimeHostOptions
+        {
+            LibraryPath = path,
+            ConfigJson = TakeoverConfig,
+            AllowDefaultProbing = false,
+        });
+
+        var vx = Lane(EntityKinds.Npc, 5, FieldVelocityX);
+        shim.ApplyBatch(new[] { vx }, new[] { TritDelta.Pos });
+
+        // Demon Eye（type 2）：当前朝右飞，但目标在左上方（dx > 0、dy < 0）。
+        Assert.True(shim.PushEntityStates(new[]
+        {
+            new EntitySnapshot
+            {
+                Kind = EntityKinds.Npc,
+                Slot = 5,
+                Type = 2,
+                VelocityX = 2f,
+                Direction = 1,
+                Target = 7,
+                TargetDx = 120f,
+                TargetDy = -80f,
+                WalkSpeed = 1.8f,
+            },
+        }));
+
+        var plan = shim.GetActionPlan().ToDictionary(p => p.Key, p => p);
+        Assert.Equal((byte)TritDelta.Neg, plan[vx].Delta);
+        Assert.Equal(1.0f, plan[vx].Confidence);
+    }
 }

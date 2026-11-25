@@ -6,7 +6,7 @@
 `out` 前 8 字节（要求 `cap >= 8`）并回 `TT_ERR_BUFFER`，调用方扩容后重试即可。
 成功时响应统一装框 `[u32 payload_len][payload]`。
 
-- `ABI_VERSION = 4`（v2 并行任务池 / GPU / 全局预算；v3 批量事务；v4 `STATE_PUSH` 量化变长记录）
+- `ABI_VERSION = 5`（v2 并行任务池 / GPU / 全局预算；v3 批量事务；v4 `STATE_PUSH` 量化变长记录；v5 新增目标偏移）
 - `RUNTIME_VERSION = 0x00_01_00_00`
 
 ## 状态码
@@ -41,6 +41,7 @@
 | v2 | 新增并行任务池 / GPU / 全局预算（opcode `0x14..0x19`，JSON 载荷） |
 | **v3** | 新增 `0x1A TXN_SUBMIT_BATCH`；C# 壳每 tick 都依赖它，故版本号必须递增——v2 的 DLL 与本壳混装时每次批量提交都会拿到 `TT_ERR_BAD_OP`，表现为「模组每 tick 失败、钩子被熔断」。壳在装载期就比对版本，不符直接退回托管内核（功能完整，只是慢）。`0x1B SESSION_RESET` 同属 v3，但它是**可选**操作，没有为它单独递增版本。 |
 | **v4** | `0x20 STATE_PUSH` 改为量化变长记录（16 B 定长 + 每个非零 ai 槽 2 B）。旧 DLL 会把新载荷当 83 B 定长解析，必须由壳在装载期挡下。 |
+| **v5** | `0x20 STATE_PUSH` 记录新增 `target_dx / target_dy`（定长 16 → 20 B），引擎据此算追踪朝向。v4 的 DLL 会按旧布局整体错位解析，必须由壳在装载期挡下。 |
 
 ## opcode 表
 
@@ -58,13 +59,15 @@
 | `0x1C` | `TXN_APPLY` | 二进制 `count u32, [key u32, delta u8] * n` | 二进制 `applied u32, log_seq u64` |
 | `0x20` | `STATE_PUSH` | 二进制 `count u32, [变长记录] * n`（见下） | 空 |
 
-### `0x20 STATE_PUSH`（v2，ABI 4）
+### `0x20 STATE_PUSH`（v3，ABI 5）
 
 每条记录：`kind u8 | slot u16 | type u16 | vel_x i16 | vel_y i16 | dir i8 | flags u8 |
-walk_speed i16 | target_distance u16 | ai_mask u8 | ai_q i16 × popcount(ai_mask)`。
+walk_speed i16 | target_distance u16 | target_dx i16 | target_dy i16 | ai_mask u8 |
+ai_q i16 × popcount(ai_mask)`。
 
-- 定长部分 **16 B**，常见 2 个非零 ai 槽 → **20 B**（旧版 83 B）。
-- 量化：velocity / walk_speed `×256`，ai `×16`，target_distance `×4`；均为四舍五入 + 饱和。
+- 定长部分 **20 B**，常见 2 个非零 ai 槽 → **24 B**（旧版 83 B，v4 为 20 B）。
+- 量化：velocity / walk_speed `×256`，ai `×16`，target_distance `×4`，target_dx / target_dy `×4`；均为四舍五入 + 饱和。
+- `target_dx / target_dy` = `实体中心 - 目标中心`（像素，i16 约 ±8191 px）；无目标时写 0。
 - `flags`：bit0 `on_ground`、bit1 `tile_below`、bit2 `active`（Projectile）、bit3 `has_target`。
 - 位置、life、life_max、target 槽值、ai[2..7] 引擎不消费，不传输。
 - 整批替换上一 tick 的状态表；截断或多余字节返回 `TT_ERR_ARG` 且不改动已有表。

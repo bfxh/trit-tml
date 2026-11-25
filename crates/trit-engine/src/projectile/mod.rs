@@ -20,6 +20,10 @@ pub struct ProjectileState {
     pub tile_below: bool,
     /// 追踪目标索引（-1 无目标）
     pub target: i32,
+    /// 目标相对弹幕的水平像素偏移（`弹幕中心.X - 目标中心.X`）；0 = 无目标/未知。
+    pub target_dx: f32,
+    /// 目标相对弹幕的垂直像素偏移。
+    pub target_dy: f32,
     pub gravity: f32,
 }
 
@@ -36,6 +40,8 @@ impl Default for ProjectileState {
             active: true,
             tile_below: false,
             target: -1,
+            target_dx: 0.0,
+            target_dy: 0.0,
             gravity: 0.08,
         }
     }
@@ -61,16 +67,40 @@ impl ProjectileDelta {
 
 pub mod arrow;
 pub mod bullet;
-pub mod rocket;
 
 /// 顶层 dispatch —— 按 proj_type 分发给 port 分支。
+///
+/// 分支集合必须与 [`crate::registry::PORTED_PROJECTILE_TYPES`] 完全一致，
+/// 由本模块的 `every_ported_type_has_a_branch` 测试锁定。
 pub fn dispatch(state: &ProjectileState, rand: &mut Prng) -> ProjectileDelta {
     match state.proj_type {
-        1 => bullet::step(state, rand),
-        2 => arrow::step(state, rand),
-        3 => rocket::step(state, rand),
-        // 128 Bullet（Terraria.ProjectileID.Bullet = 128）
+        // 1 Wooden Arrow / 2 Fire Arrow / 4 Unholy Arrow：抛物线（受重力）。
+        // 3 Shuriken：投掷物，同样受重力、没有追踪——不能套追踪弹逻辑。
+        1..=4 => arrow::step(state, rand),
+        // 128 Frost Blast（敌对直线弹）。
         128 => bullet::step(state, rand),
         _ => ProjectileDelta::UNSET,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 不变量：registry 说「已 port」的每个弹幕 type 都必须真有实现分支。
+    #[test]
+    fn every_ported_type_has_a_branch() {
+        for &proj_type in crate::registry::PORTED_PROJECTILE_TYPES {
+            let state = ProjectileState {
+                proj_type,
+                ..Default::default()
+            };
+            let delta = dispatch(&state, &mut Prng::new(1));
+            assert_ne!(
+                delta,
+                ProjectileDelta::UNSET,
+                "type {proj_type} 在 registry 里但无实现"
+            );
+        }
     }
 }

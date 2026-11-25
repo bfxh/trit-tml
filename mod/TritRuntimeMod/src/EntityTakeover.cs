@@ -268,7 +268,7 @@ internal sealed class EntityTakeover
     /// 把当前世界所有 active NPC / Projectile 的状态推给内核（TritEnginePort 的输入）。
     /// <para>内核按 <c>whoAmI</c> 槽位建表、整批替换，所以每 tick 必须传全量。</para>
     /// <para>
-    /// 引擎只关心方向（velocity / direction），这里推的是物理量原值，
+    /// 引擎只关心方向与目标偏移（velocity / direction / target_dx,dy），这里推的是物理量原值，
     /// 由内核侧的 ported 逻辑自己算符号 —— C# 不再重复实现原版 AI。
     /// </para>
     /// </summary>
@@ -289,14 +289,16 @@ internal sealed class EntityTakeover
 
             bool hasTarget = npc.HasValidTarget;
             float targetDistance = 0f;
+            float targetDx = 0f;
+            float targetDy = 0f;
             if (hasTarget)
             {
                 Player target = Main.player[npc.target];
                 if (target is not null && target.active)
                 {
-                    float dx = npc.Center.X - target.Center.X;
-                    float dy = npc.Center.Y - target.Center.Y;
-                    targetDistance = (float)Math.Sqrt((dx * dx) + (dy * dy));
+                    targetDx = npc.Center.X - target.Center.X;
+                    targetDy = npc.Center.Y - target.Center.Y;
+                    targetDistance = (float)Math.Sqrt((targetDx * targetDx) + (targetDy * targetDy));
                 }
             }
 
@@ -322,6 +324,8 @@ internal sealed class EntityTakeover
                 Ai3 = npc.ai.Length > 3 ? npc.ai[3] : 0f,
                 WalkSpeed = Math.Abs(npc.velocity.X),
                 TargetDistance = targetDistance,
+                TargetDx = targetDx,
+                TargetDy = targetDy,
                 TileBelow = onGround,
                 OnGround = onGround,
             });

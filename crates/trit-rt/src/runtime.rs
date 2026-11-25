@@ -335,39 +335,52 @@ struct EngineDelta {
     direction: Option<f32>,
 }
 
-/// 对一个实体跑一次引擎步进；`None` = 引擎不管这个实体（type 未 port）。
+/// 对一个实体跑一次引擎步进；`None` = 引擎不管这个实体（未 port 或整体弃权）。
 fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Option<EngineDelta> {
-    match state {
+    let (velocity_x, velocity_y, direction) = match state {
         EntityState::Npc(state) => {
             if !trit_engine::is_ported_npc_type(state.npc_type) {
                 return None;
             }
             let delta = trit_engine::npc_ai_step(state, rand);
-            Some(EngineDelta {
-                velocity_x: delta.velocity_x_sign,
-                velocity_y: delta.velocity_y_sign,
-                direction: delta.direction.map(|dir| dir as f32),
-            })
+            (
+                delta.velocity_x_sign,
+                delta.velocity_y_sign,
+                delta.direction,
+            )
         }
         EntityState::Projectile(state) => {
             if !trit_engine::is_ported_projectile_type(state.proj_type) {
                 return None;
             }
             let delta = trit_engine::projectile_update_step(state, rand);
-            Some(EngineDelta {
-                velocity_x: delta.velocity_x_sign,
-                velocity_y: delta.velocity_y_sign,
-                direction: delta.direction.map(|dir| dir as f32),
-            })
+            (
+                delta.velocity_x_sign,
+                delta.velocity_y_sign,
+                delta.direction,
+            )
         }
+    };
+
+    // 三个方向字段全 `None` = 引擎对该实体整体弃权（分支未实现 / 状态无法判断）。
+    // 这种情况必须返回 `None` 落回历史外推，而不是返回一个空 delta ——
+    // 后者会「什么都不输出，还抑制掉历史外推」，比不 port 更差。
+    if velocity_x.is_none() && velocity_y.is_none() && direction.is_none() {
+        return None;
     }
+    Some(EngineDelta {
+        velocity_x,
+        velocity_y,
+        direction: direction.map(|dir| dir as f32),
+    })
 }
 
 /// 双轨预测：TritEnginePort 优先，历史外推兜底。
 ///
 /// - 实体状态表为空（未 push / 托管回退 / 旧原生库）→ 纯历史外推，行为与 Phase 1 一致。
 /// - 已 port 的 type → 引擎算出的 sign（confidence 1.0），覆盖同 key 的历史外推结果。
-/// - 引擎对该 key 弃权（sign=0 或字段不支持）→ 同样覆盖，抑制历史外推的旧结论。
+/// - 引擎对该字段弃权（sign=0 或字段不支持）→ 同样覆盖，抑制历史外推的旧结论。
+/// - 引擎对该实体整体弃权（三个方向字段全 `None`）→ 视同未 port，落回历史外推。
 /// - 未 port 的 type / 未 push 的实体 → 保留历史外推结果。
 fn merge_engine_predictions(
     fork: &crate::takeover::WorldProjectionFork,
@@ -937,6 +950,8 @@ impl TritRuntime {
                 let walk_speed = wire::dequantize_i16(reader.i16()?, wire::STATE_WALK_SPEED_SCALE);
                 let target_distance =
                     wire::dequantize_u16(reader.u16()?, wire::STATE_TARGET_DISTANCE_SCALE);
+                let target_dx = wire::dequantize_i16(reader.i16()?, wire::STATE_TARGET_DELTA_SCALE);
+                let target_dy = wire::dequantize_i16(reader.i16()?, wire::STATE_TARGET_DELTA_SCALE);
 
                 // ai_mask 的每个置位对应一个 i16 值；未置位表示该槽为 0。
                 let ai_mask = reader.u8()?;
@@ -967,6 +982,8 @@ impl TritRuntime {
                             ai,
                             walk_speed,
                             target_distance,
+                            target_dx: if has_target { target_dx } else { 0.0 },
+                            target_dy: if has_target { target_dy } else { 0.0 },
                             tile_below,
                             on_ground,
                         })
@@ -983,6 +1000,8 @@ impl TritRuntime {
                             active,
                             tile_below,
                             target: if has_target { 0 } else { -1 },
+                            target_dx: if has_target { target_dx } else { 0.0 },
+                            target_dy: if has_target { target_dy } else { 0.0 },
                             gravity: 0.08,
                         })
                     }
@@ -2067,8 +2086,20 @@ mod tests {
         TritRuntime::new(config)
     }
 
-    /// 造一条 STATE_PUSH v2 记录（定长 16 字节 + 0 个 ai 值）。
+    /// 造一条 STATE_PUSH 记录（定长 20 字节 + 0 个 ai 值）。
     fn state_record(kind: u8, slot: i32, entity_type: i32, direction: i32) -> Vec<u8> {
+        state_record_steering(kind, slot, entity_type, direction, 0.0, 0.0)
+    }
+
+    /// 同上，附带目标偏移（`target_dx / target_dy`）。
+    fn state_record_steering(
+        kind: u8,
+        slot: i32,
+        entity_type: i32,
+        direction: i32,
+        target_dx: f32,
+        target_dy: f32,
+    ) -> Vec<u8> {
         let mut w = Writer::new();
         w.u8(kind);
         w.u16(slot as u16);
@@ -2082,6 +2113,14 @@ mod tests {
             | wire::state_flags::HAS_TARGET);
         w.i16(wire::quantize_i16(2.0, wire::STATE_WALK_SPEED_SCALE)); // walk_speed
         w.u16(wire::quantize_u16(300.0, wire::STATE_TARGET_DISTANCE_SCALE)); // target_distance
+        w.i16(wire::quantize_i16(
+            target_dx,
+            wire::STATE_TARGET_DELTA_SCALE,
+        ));
+        w.i16(wire::quantize_i16(
+            target_dy,
+            wire::STATE_TARGET_DELTA_SCALE,
+        ));
         w.u8(0); // ai_mask：本次没有非零 ai
         w.into_vec()
     }
@@ -2210,5 +2249,36 @@ mod tests {
         rt.dispatch(op::STATE_PUSH, &push).unwrap();
 
         assert!(read_action_plan(&rt.dispatch(op::ACTION_PLAN, b"").unwrap()).is_empty());
+    }
+
+    /// 目标偏移参与转向：Demon Eye（type 2）目标在左（dx > 0）→ velX 预测 Neg，
+    /// 即使它当前朝右飞。验证 v5 新增字段真的进了引擎状态。
+    #[test]
+    fn target_offset_steers_engine_prediction() {
+        let mut rt = takeover_runtime();
+        let vel_x = lane_key(
+            crate::takeover::lane::KIND_NPC,
+            0,
+            crate::takeover::lane::FIELD_VELOCITY_X,
+        );
+        let mut w = Writer::new();
+        w.u64(0).u32(vel_x).u8(2);
+        rt.dispatch(op::TXN_SUBMIT, &w.into_vec()).unwrap();
+
+        let push = {
+            let mut w = Writer::new();
+            w.u32(1);
+            w.bytes(&state_record_steering(1, 0, 2, 1, 120.0, -80.0));
+            w.into_vec()
+        };
+        rt.dispatch(op::STATE_PUSH, &push).unwrap();
+
+        let preds = read_action_plan(&rt.dispatch(op::ACTION_PLAN, b"").unwrap());
+        let entry = preds
+            .iter()
+            .find(|(key, _, _)| *key == vel_x)
+            .expect("velX 应有引擎预测");
+        assert_eq!(entry.1, wire::trit_byte(Ternary::False));
+        assert_eq!(entry.2, 1.0);
     }
 }

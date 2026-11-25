@@ -23,7 +23,12 @@ use crate::wire::{Writer, op};
 /// 算了：v2 的老 DLL 会让每次批量提交拿到 `BAD_OP`，于是每 tick 都失败、
 /// 钩子被熔断，表象是「模组忽然完全没作用」。递增后这种混装会在装载期被
 /// 版本检查挡下，干净地退回托管内核（功能完整，只是慢）。
-pub const ABI_VERSION: u32 = 4;
+///
+/// v4：`0x20 STATE_PUSH` 改为量化变长记录（16 B 定长 + 每个非零 ai 槽 2 B）。
+///
+/// v5：`STATE_PUSH` 记录新增 `target_dx / target_dy`（定长 16 → 20 B），
+/// 让引擎能算追踪方向。v4 的 DLL 会按旧布局整体错位解析，必须递增版本挡下。
+pub const ABI_VERSION: u32 = 5;
 
 /// 运行时版本：`0x00_MM_mm_pp`（0.1.0）。
 pub const RUNTIME_VERSION: u32 = 0x00_01_00_00;

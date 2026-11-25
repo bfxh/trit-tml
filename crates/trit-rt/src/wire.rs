@@ -121,9 +121,12 @@ pub mod op {
     ///
     /// 载荷：`count u32, [record] * n`，每条 record 变长：
     /// `kind u8, slot u16, type u16, vel_x i16, vel_y i16, dir i8, flags u8,
-    ///  walk_speed i16, target_distance u16, ai_mask u8, ai_q i16 * popcount(ai_mask)`。
+    ///  walk_speed i16, target_distance u16, target_dx i16, target_dy i16,
+    ///  ai_mask u8, ai_q i16 * popcount(ai_mask)`。
     ///
-    /// 定长部分 [`STATE_RECORD_FIXED_LEN`] = 16 字节，每个非零 ai 槽再加 2 字节。
+    /// 定长部分 [`STATE_RECORD_FIXED_LEN`] = 20 字节，每个非零 ai 槽再加 2 字节。
+    /// `target_dx / target_dy` 是 `实体中心 - 目标中心` 的像素偏移（有符号），
+    /// 引擎用它算追踪方向；无目标时为 0。
     /// 位置 / 生命 / target 槽值 / ai[2..8] 引擎不消费，不再传输（旧版每条 83 字节）。
     ///
     /// 响应：空。整批**替换**上一 tick 的状态表（不是增量合并）—— 消失的实体自然被清掉。
@@ -132,8 +135,8 @@ pub mod op {
 }
 
 /// [`op::STATE_PUSH`] 单条实体状态记录的定长部分（不含变长 ai 值）。
-/// `u8(1) + u16(2)*3 + i16(2)*2 + i8(1) + u8(1) + u16(2) + u8(1)` = 16。
-pub const STATE_RECORD_FIXED_LEN: usize = 16;
+/// `u8(1) + u16(2)*3 + i16(2)*4 + i8(1) + u8(1)*2 + u16(2)` = 20。
+pub const STATE_RECORD_FIXED_LEN: usize = 20;
 
 /// ai 槽数量（`ai_mask` 的位宽）。
 pub const STATE_AI_SLOTS: usize = 8;
@@ -146,6 +149,8 @@ pub const STATE_WALK_SPEED_SCALE: f32 = 256.0;
 pub const STATE_AI_SCALE: f32 = 16.0;
 /// target_distance 量化比例：`q = round(d * 4)`，u16 范围约 16383 px。
 pub const STATE_TARGET_DISTANCE_SCALE: f32 = 4.0;
+/// target_dx / target_dy 量化比例：`q = round(v * 4)`，i16 范围约 ±8191 px。
+pub const STATE_TARGET_DELTA_SCALE: f32 = 4.0;
 
 /// [`op::STATE_PUSH`] 记录里的标志位。
 pub mod state_flags {
@@ -511,11 +516,11 @@ mod tests {
     }
 
     #[test]
-    fn state_record_len_matches_v2_layout() {
-        assert_eq!(STATE_RECORD_FIXED_LEN, 16);
-        assert_eq!(state_record_len(0b0000_0000), 16);
-        assert_eq!(state_record_len(0b0000_0011), 20);
-        assert_eq!(state_record_len(0b1111_1111), 32);
+    fn state_record_len_matches_v5_layout() {
+        assert_eq!(STATE_RECORD_FIXED_LEN, 20);
+        assert_eq!(state_record_len(0b0000_0000), 20);
+        assert_eq!(state_record_len(0b0000_0011), 24);
+        assert_eq!(state_record_len(0b1111_1111), 36);
     }
 
     #[test]

@@ -366,11 +366,20 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
 - 日志仪表盘（当前置信度、接管数、降级原因）
 - **验收**：L1 下 Android 端 CPU 使用率降 15-20%；Windows 桌面开销 ≤ 5%
 
-### Phase 2：L2 TritEnginePort（~4 周）
+### Phase 2：L2 TritEnginePort（进行中）
 - 新建 `trit-engine` crate
-- `npc_ai_step` + `projectile_update_step` 纯函数（先覆盖最常见 20 种 NPC + 10 种 Projectile）
-- `ActionPlan` 系统
+- `npc_ai_step` + `projectile_update_step` 纯函数
+- `ActionPlan` 系统（`0x1F`，带 confidence）
 - Hook 链升级为 kernel-first 模式
+- 当前覆盖（编号为原版 `NPCID` / `ProjectileID`，含负 ID 体型变体；以 `trit-engine/src/registry.rs` 为准）：
+  - 史莱姆跳跃 AI：1、-1..-10、16（12 种）
+  - 僵尸地面追击：3、-44 / -45、-54 / -55（5 种）
+  - 飞行追击：2、-37..-43、5、6（10 种）
+  - 弹幕：1 / 2 / 3 / 4 抛物线、128 直线（5 种）
+  - 刻意不 port：Boss（4 Eye of Cthulhu、50 King Slime）、蠕虫体节（7..15）、骷髅（21、-46..-53）
+- 历史修正：早期表的注释与实际原版 ID 不符（4 = Eye of Cthulhu、5 = Servant of Cthulhu、
+  6 = Eater of Souls、10 = Giant Worm Head、14/15 = Eater of Worlds 体节），
+  现已改为「只登记真正有实现分支的类型」，并由 `every_ported_type_has_a_branch` 测试锁定。
 - **验收**：L2 下原版 AI CPU 降到 0（已跳过）；整体 CPU 使用率降 40-60%
 
 ### Phase 3：自动升级 + 仪表盘（~2 周）— 已实现

@@ -1,4 +1,4 @@
-//! Slime family AI —— Terraria 原版 Blue/Black Slime 的核心跳跃逻辑。
+//! Slime family AI —— Terraria 原版史莱姆家族（Blue / Green / Black / Slimeling 等）的核心跳跃逻辑。
 //!
 //! Terraria.NPC.AI 里 Slime 的逻辑（简化版，高频路径）：
 //! 1. 如果站在地上：随机停顿 0-60 tick 然后跳一下

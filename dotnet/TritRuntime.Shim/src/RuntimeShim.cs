@@ -497,7 +497,7 @@ public sealed class RuntimeShim : IDisposable
     {
         int count = states.Count;
 
-        // 先精确算长度（16 B 定长 + 每个非零 ai 槽 2 B），一次分配到位。
+        // 先精确算长度（20 B 定长 + 每个非零 ai 槽 2 B），一次分配到位。
         int payloadSize = 4;
         for (int i = 0; i < count; i++)
         {
@@ -547,6 +547,8 @@ public sealed class RuntimeShim : IDisposable
                 .U8(flags)
                 .I16(WireFormat.QuantizeI16(state.WalkSpeed, WireFormat.StateWalkSpeedScale))
                 .U16(WireFormat.QuantizeU16(state.TargetDistance, WireFormat.StateTargetDistanceScale))
+                .I16(WireFormat.QuantizeI16(state.TargetDx, WireFormat.StateTargetDeltaScale))
+                .I16(WireFormat.QuantizeI16(state.TargetDy, WireFormat.StateTargetDeltaScale))
                 .U8(aiMask);
 
             if ((aiMask & (1 << 0)) != 0)
@@ -1172,6 +1174,15 @@ public struct EntitySnapshot
 
     /// <summary>到目标的距离。</summary>
     public float TargetDistance;
+
+    /// <summary>
+    /// 目标相对实体的水平像素偏移（<c>实体中心.X - 目标中心.X</c>）。
+    /// 0 = 无目标 / 未知；引擎据此算追踪方向。
+    /// </summary>
+    public float TargetDx;
+
+    /// <summary>目标相对实体的垂直像素偏移（<c>实体中心.Y - 目标中心.Y</c>）。</summary>
+    public float TargetDy;
 
     /// <summary>脚下是否有方块。</summary>
     public bool TileBelow;
