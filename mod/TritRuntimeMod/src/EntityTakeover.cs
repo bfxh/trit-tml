@@ -32,6 +32,21 @@ namespace TritRuntimeMod;
 /// 碰撞、`timeLeft` 递减）。跳过它会让被接管的弹幕原地悬停、永不消失。
 /// 因此弹幕只参与预测 / 对拍（PatchAfterOrig），不进入 KernelFirst 缓存。
 /// </para>
+/// <para>
+/// <b>跳过 orig 的两条硬约束</b>（否则会冻结原版状态机）：
+/// ① 写入必须真的改变字段 —— 三个字段都等于当前值时跳过 orig 只剩副作用，
+/// 直接交回原版（史莱姆在地面时内核只重复输出当前朝向，就属于这一类）；
+/// ② 连续接管最多 4 tick —— `NPC.AI` 里的 `ai[]` 计时器、帧动画、目标选择不会自己前进，
+/// 定期跑一次原版把状态推进一步，同时给垂直模型一次真实观测。
+/// </para>
+/// <para>
+/// <b>垂直通道靠「学」而不是「猜」</b>：重力加速、落地反弹、悬停阻尼都在 `NPC.AI` 内部，
+/// 快照里既没有重力值也没有起跳冲量，写死常量就是假覆盖。这里的做法是在每一段
+/// 「跑了 orig 的 tick」里观测 AI 前后的 <c>velocity.Y</c>，拟合一步仿射动力学
+/// `vy_next = Alpha * vy + Beta`（常量重力是 Alpha=1 的特例；阻尼/阻力是 Beta≈0、
+/// Alpha&lt;1 的特例；终端速度退化成 Alpha=1、Beta=0）。模型要先被后续观测确认
+/// 才允许外推，出现冲量、碰撞、入水导致残差超限时自动交回原版并重新拟合。
+/// </para>
 /// </remarks>
 internal sealed class EntityTakeover
 {
@@ -80,6 +95,9 @@ internal sealed class EntityTakeover
 
     /// <summary>本 tick 被 KernelFirst 跳过 orig 的实体数（钩子层计数）。</summary>
     public int KernelFirstTakeoverCount { get; private set; }
+
+    /// <summary>本 tick 用学到的 Δvy 复现了垂直运动的实体数（<see cref="KernelFirstTakeoverCount"/> 的子集）。</summary>
+    public int KernelFirstVerticalCount { get; private set; }
 
     /// <summary>本 tick 被方向门接管的实体字段计数（AfterOrig 里 PatchAfterOrig fallback）。</summary>
     public int TakeoverCount { get; private set; }
@@ -137,6 +155,7 @@ internal sealed class EntityTakeover
         lastActionPlan = null;
         calibrationPending = false;
         KernelFirstTakeoverCount = 0;
+        KernelFirstVerticalCount = 0;
 
         if (settings.Takeover != TritSettings.TakeoverMode.ObserveOnly) return;
         if (autoPilot is null || !autoPilot.IsCalibrationTick()) return;
@@ -220,6 +239,7 @@ internal sealed class EntityTakeover
     public void PrepareKernelFirstCache()
     {
         KernelFirstTakeoverCount = 0;
+        KernelFirstVerticalCount = 0;
         kernelFirstCache = null;
         lastActionPlan = null;
         speedByEntity = null;
@@ -370,7 +390,7 @@ internal sealed class EntityTakeover
                 TargetDistance = targetDistance,
                 TargetDx = targetDx,
                 TargetDy = targetDy,
-                TileBelow = onGround,
+                TileBelow = tileBelow,
                 OnGround = onGround,
             });
         }
@@ -428,87 +448,108 @@ internal sealed class EntityTakeover
         ulong bucketKey = ((ulong)LaneMap.KindNpc << 32) | (uint)npc.whoAmI;
         if (!kernelFirstCache.TryGetValue(bucketKey, out var intents)) return false;
 
-        // 预检（幅度兜底）：通道只有方向、没有幅度的情形，静止时不能靠 0.1 兜底。
+        // 预检：内核只能给方向，给不了幅度的通道必须有「自己复现物理」的依据，
+        // 否则整只交回原版。必须在写任何字段之前判断，避免半接管（X 已改、Y 没改）。
         //
-        // Y 轴：STATE_PUSH 与 ACTION_PLAN 都不携带 vertical 速度大小。当前 |vy| ≈ 0 时，
-        //   无论内核预测向上（起跳，需要冲量）还是向下（下坠/下落攻击），写出去的都只是
-        //   ±0.1 —— 史莱姆退化成原地抖动，下坠实体变成"慢慢飘"。这一 tick 整只放弃接管，
-        //   让原版定冲量；下一 tick 速度非零后再按当前速度接管。
+        // Y 轴：快照没有垂直速度大小、没有重力、没有起跳冲量，但 AI 每一步对 vy 的
+        //   影响是可以观测的（见 ObserveNpcAiDelta）。空中且仿射模型（α·vy + β）
+        //   已被确认时按模型外推；在地面要求跳/冲量、或模型还没收敛时，交回原版定幅度。
         // X 轴：速度表（ACTION_PLAN 尾部）只有「水平速度就是移动速度」的地面家族。
-        //   该实体不在表里且 |vx| ≈ 0 时，KernelFirstVelocity 同样会兜成 0.1 并跳过 orig，
-        //   飞行家族会被卡在原地（原版本会逐 tick 加速）。此时也交回原版。
-        //
-        // 必须在写任何字段之前判断，避免半接管（X 已改、Y 没改）。
+        //   该实体不在表里且 |vx| ≈ 0 时，KernelFirstVelocity 只能兜成 0.1 并跳过 orig，
+        //   飞行家族会被卡在原地（原版本会逐 tick 加速）。此时同样交回原版。
         float speedMagnitude = SpeedOf(LaneMap.KindNpc, npc.whoAmI);
+        bool onGround = npc.collideY;
+        bool hasXIntent = false;
+        byte xDelta = 0;
+        bool hasDirectionIntent = false;
+        byte directionDelta = 0;
+        bool hasVerticalIntent = false;
+        byte verticalDelta = 0;
         foreach (var (key, delta, _) in intents)
         {
-            uint field = LaneMap.FieldOf(key);
-            if (field == LaneMap.FieldVelocityY
-                && Math.Abs(npc.velocity.Y) < GroundJumpVelocityEpsilon)
-            {
-                return false;
-            }
-
-            if (field == LaneMap.FieldVelocityX
-                && speedMagnitude <= 0f
-                && Math.Abs(npc.velocity.X) < GroundJumpVelocityEpsilon)
-            {
-                return false;
-            }
-        }
-
-        bool applied = false;
-        foreach (var (key, delta, _) in intents)
-        {
-            uint field = LaneMap.FieldOf(key);
-            float fdelta = delta == 2 ? +1f : -1f;
-
-            switch (field)
+            switch (LaneMap.FieldOf(key))
             {
                 case LaneMap.FieldVelocityX:
-                    // 有引擎速度大小时用它（史莱姆起跳 / 僵尸追击），否则保持当前绝对值。
-                    npc.velocity.X = KernelFirstVelocity(
-                        fdelta,
-                        npc.velocity.X,
-                        speedMagnitude);
-                    applied = true;
+                    hasXIntent = true;
+                    xDelta = delta;
+                    if (speedMagnitude <= 0f
+                        && Math.Abs(npc.velocity.X) < StationaryVelocityEpsilon)
+                    {
+                        return false;
+                    }
                     break;
                 case LaneMap.FieldVelocityY:
-                    npc.velocity.Y = KernelFirstSign(fdelta, npc.velocity.Y);
-                    applied = true;
+                    hasVerticalIntent = true;
+                    verticalDelta = delta;
                     break;
                 case LaneMap.FieldDirection:
-                    npc.direction = delta == 2 ? 1 : -1;
-                    applied = true;
+                    hasDirectionIntent = true;
+                    directionDelta = delta;
                     break;
             }
         }
 
-        if (applied)
+        // 连续接管到上限：强制跑一次 orig。跳过 orig 时 `NPC.AI` 的计时器、帧动画、
+        // 目标选择都不推进，长期接管会让状态机停摆（史莱姆的跳跃计时器就是一例）。
+        if (TakeoverStreakExhausted(npc)) return false;
+
+        // 垂直通道：内核要求改 vy → 必须能自己把这一步的物理算出来；
+        // 内核没要求改 vy 但实体在空中 → 原版 AI 仍可能在改它（重力、悬停阻尼、
+        // 撞墙反弹），跳过 orig 会把它冻住，一律交回原版。
+        float emulatedVelocityY = 0f;
+        bool emulateVertical = false;
+        if (hasVerticalIntent)
         {
-            KernelFirstTakeoverCount++;
-            totalKernelFirst++;
+            // 在地面却要改 vy：这是起跳/冲量，Δvy 记不到（落地那几 tick 不学习），交回原版。
+            if (onGround) return false;
+            if (!TryEmulateVertical(npc, verticalDelta, out emulatedVelocityY)) return false;
+            emulateVertical = true;
+        }
+        else if (!onGround || Math.Abs(npc.velocity.Y) >= GroundedVelocityLimit)
+        {
+            // 刚落地/撞墙留下的残余速度同样交给原版归零。
+            return false;
         }
 
-        return applied;
+        // 写入前先算好目标值：如果三个字段都等于当前值，跳过 orig 只会冻结状态机，
+        // 没有任何接管收益，直接交回原版。
+        float newVelocityX = hasXIntent
+            ? KernelFirstVelocity(xDelta == 2 ? +1f : -1f, npc.velocity.X, speedMagnitude)
+            : npc.velocity.X;
+        int newDirection = hasDirectionIntent ? (directionDelta == 2 ? 1 : -1) : npc.direction;
+
+        bool changes = newVelocityX != npc.velocity.X || newDirection != npc.direction;
+        if (emulateVertical && emulatedVelocityY != npc.velocity.Y)
+        {
+            changes = true;
+        }
+
+        if (!changes) return false;
+
+        if (hasXIntent)
+        {
+            // 有引擎速度大小时用它（史莱姆起跳 / 僵尸追击），否则保持当前绝对值。
+            npc.velocity.X = newVelocityX;
+        }
+
+        if (hasDirectionIntent)
+        {
+            npc.direction = newDirection;
+        }
+
+        if (emulateVertical)
+        {
+            npc.velocity.Y = emulatedVelocityY;
+        }
+
+        MarkTakeover(npc, emulateVertical);
+        KernelFirstTakeoverCount++;
+        totalKernelFirst++;
+        return true;
     }
 
-    /// <summary>判定「站在地面」的 vertical velocity 阈值（像素/tick）。</summary>
-    private const float GroundJumpVelocityEpsilon = 0.01f;
-
-    /// <summary>
-    /// KernelFirst 直接写字段：取内核预测方向的绝对值，确保非零，再乘方向符号。
-    /// <para>
-    /// <c>0.1</c> 只是最后兜底 —— 正常路径已被 <see cref="TryApplyKernelFirstToNpc"/> 的
-    /// 预检挡在前面（Y 轴静止时整只放弃接管），不应再出现「静止却预测移动」被写成 ±0.1。
-    /// </para>
-    /// </summary>
-    private static float KernelFirstSign(float sign, float currentValue)
-    {
-        float abs = currentValue < 0f ? -currentValue : currentValue;
-        if (abs < 0.01f) abs = 0.1f;  // 兜底：预检失效时的最小非零位移
-        return sign * abs;
-    }
+    /// <summary>判定「静止」的 velocity 阈值（像素/tick）。</summary>
+    private const float StationaryVelocityEpsilon = 0.01f;
 
     /// <summary>
     /// KernelFirst 水平速度：优先用引擎给出的速度大小；没有（未下发 / 该家族不提供）
@@ -533,6 +574,147 @@ internal sealed class EntityTakeover
         return speedByEntity.TryGetValue(((ulong)kind << 32) | (uint)slot, out float magnitude)
             ? magnitude
             : 0f;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 接管模型（连续接管上限 + 垂直一步仿射动力学）
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// 单个 NPC 槽位的接管模型（按槽位下标索引，槽位复用给别的类型时重置）。
+    /// </summary>
+    private struct NpcTakeoverTrack
+    {
+        /// <summary>建模时的 NPC 类型；与当前类型不符即视为新实体。</summary>
+        public int Type;
+
+        /// <summary>垂直一步动力学：`vy_next = Alpha * vy + Beta`，由观测对拟合。</summary>
+        public VerticalMotionModel Model;
+
+        /// <summary>连续接管的 tick 数；到达上限时强制跑一次 orig。</summary>
+        public int TakeoverStreak;
+    }
+
+    /// <summary>按 whoAmI 索引的接管模型表（容量跟 Main.npc 走，稳态零分配）。</summary>
+    private NpcTakeoverTrack[] npcTracks = Array.Empty<NpcTakeoverTrack>();
+
+    /// <summary>单 tick Δvy 的合理性上限；超过说明这一 tick 不是自由演化（冲量/碰撞/传送）。</summary>
+    private const float VerticalDeltaSanity = 4f;
+
+    /// <summary>
+    /// 连续接管多少 tick 后强制跑一次 orig（所有通道共用）。
+    /// <para>
+    /// 只跳过 orig 的代价是 `NPC.AI` 里的状态机（`ai[]` 计时器、帧动画、目标选择、
+    /// 声音/网络同步）也不推进。定期跑一次原版，把这类状态推进一步，同时给垂直模型
+    /// 一次真实观测 —— 非线性钳制（终端速度等）本地学不到，4 tick 的误差上限也可接受。
+    /// </para>
+    /// </summary>
+    private const int TakeoverStreakLimit = 4;
+
+    /// <summary>落地后残留垂直速度的上限：超过就交回原版归零。</summary>
+    private const float GroundedVelocityLimit = 0.5f;
+
+    /// <summary>
+    /// 钩子内 orig 之后调用：喂给垂直模型一对观测（<paramref name="velocityYBefore"/> →
+    /// 当前 <c>velocity.Y</c>）。
+    /// <para>
+    /// 采样点严格夹在 `NPC.AI` 两侧（<paramref name="velocityYBefore"/> /
+    /// <paramref name="onGroundBefore"/> 由调用方在 orig 之前取），所以差值只含 AI 的贡献 ——
+    /// 重力加在被跳过的那段代码里、还是 `Main.UpdateNPC` 里，都不影响这个差值。
+    /// </para>
+    /// <para>
+    /// 站在地面、或 Δvy 大到不像自由演化（冲量/碰撞/传送）时清空模型：
+    /// 这些样本对仿射模型没有意义，留着只会让拟合偏掉。
+    /// </para>
+    /// </summary>
+    public void ObserveNpcAiDelta(NPC npc, float velocityYBefore, bool onGroundBefore)
+    {
+        if (settings.Takeover != TritSettings.TakeoverMode.ReplaceOrig) return;
+        if (npc is null || !npc.active) return;
+
+        int slot = npc.whoAmI;
+        if (slot < 0) return;
+        EnsureTrackTable(slot);
+
+        ref NpcTakeoverTrack track = ref npcTracks[slot];
+        if (track.Type != npc.type)
+        {
+            track = default;
+            track.Type = npc.type;
+        }
+
+        if (onGroundBefore || Math.Abs(npc.velocity.Y - velocityYBefore) > VerticalDeltaSanity)
+        {
+            // 落地/贴地：模型作废，下一次起飞重新积累；冲量样本同样不可用于拟合。
+            track.Model.Reset();
+            track.TakeoverStreak = 0;
+            return;
+        }
+
+        track.Model.Observe(velocityYBefore, npc.velocity.Y);
+        track.TakeoverStreak = 0; // 这一 tick 跑过 orig，接管计数清零
+    }
+
+    /// <summary>
+    /// 判断能否用学到的仿射模型复现内核要求的那一步垂直变化。
+    /// <para>
+    /// 额外要求模型外推和内核预测的符号一致 —— 不一致说明模型已经跟不上
+    /// （撞墙、入水、悬停阻尼变化），交回原版并让观测把模型纠正回来。
+    /// </para>
+    /// </summary>
+    private bool TryEmulateVertical(NPC npc, byte delta, out float predicted)
+    {
+        predicted = 0f;
+        int slot = npc.whoAmI;
+        if (slot < 0 || slot >= npcTracks.Length) return false;
+
+        ref NpcTakeoverTrack track = ref npcTracks[slot];
+        if (track.Type != npc.type) return false;
+        if (!track.Model.CanPredict) return false;
+
+        predicted = track.Model.Predict(npc.velocity.Y);
+        float sign = delta == 2 ? +1f : -1f;
+        if (sign > 0f ? predicted < 0f : predicted > 0f) return false;
+        return true;
+    }
+
+    /// <summary>记一次接管（<paramref name="vertical"/> 标记是否走了垂直复现）。</summary>
+    private void MarkTakeover(NPC npc, bool vertical)
+    {
+        int slot = npc.whoAmI;
+        if (slot < 0 || slot >= npcTracks.Length) return;
+
+        ref NpcTakeoverTrack track = ref npcTracks[slot];
+        if (track.Type != npc.type)
+        {
+            // 还没观测过就接管（例如出生即在空中）：先建槽，接管计数从 1 开始。
+            track = default;
+            track.Type = npc.type;
+        }
+
+        track.TakeoverStreak++;
+        if (vertical)
+        {
+            KernelFirstVerticalCount++;
+        }
+    }
+
+    /// <summary>连续接管已达上限？到点必须跑一次 orig，让被跳过的那段状态机前进。</summary>
+    private bool TakeoverStreakExhausted(NPC npc)
+    {
+        int slot = npc.whoAmI;
+        if (slot < 0 || slot >= npcTracks.Length) return false;
+
+        ref NpcTakeoverTrack track = ref npcTracks[slot];
+        return track.Type == npc.type && track.TakeoverStreak >= TakeoverStreakLimit;
+    }
+
+    /// <summary>确保接管模型表覆盖到这个槽位（只在容量不足时扩容）。</summary>
+    private void EnsureTrackTable(int slot)
+    {
+        if (slot < npcTracks.Length) return;
+        int size = Math.Max(Main.npc.Length, slot + 1);
+        Array.Resize(ref npcTracks, size);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -643,8 +825,9 @@ internal sealed class EntityTakeover
             if (isKernelFirst && (KernelFirstTakeoverCount > 0 || TakeoverCount > 0))
             {
                 TritRuntimeMod.Instance?.Logger?.Info(
-                    $"[trit] KernelFirst：{plan.Count} plan → 跳过 orig {KernelFirstTakeoverCount} " +
-                    $"→ fallback 方向门 {TakeoverCount} → 对拍回写 {RecordedCount}");
+                    $"[trit] KernelFirst：{plan.Count} plan → 跳过 orig {KernelFirstTakeoverCount}" +
+                    $"（垂直复现 {KernelFirstVerticalCount}）→ fallback 方向门 {TakeoverCount} " +
+                    $"→ 对拍回写 {RecordedCount}");
             }
             else if (!isKernelFirst && (TakeoverCount > 0 || RecordedCount > 0))
             {

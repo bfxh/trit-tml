@@ -36,6 +36,11 @@ internal sealed class TritHooks
     private readonly TritSettings settings;
     private readonly WorldBridge bridge;
 
+    // 钩子里的 `Guarded(name, bridge.NoteXxx)` 是每实体每 tick 一次；方法组每转换一次
+    // 就新建一个委托，等于给热路径加了一个托管分配。这里预先缓存，稳态零分配。
+    private readonly Action noteNpcAi;
+    private readonly Action noteProjectileUpdate;
+
     private On_NPC.hook_AI? npcAi;
     private On_Projectile.hook_Update? projectileUpdate;
     private On_NetMessage.hook_SendData? netSendData;
@@ -58,6 +63,8 @@ internal sealed class TritHooks
         this.mod = mod;
         this.settings = settings;
         this.bridge = bridge;
+        noteNpcAi = bridge.NoteNpcAi;
+        noteProjectileUpdate = bridge.NoteProjectileUpdate;
     }
 
     /// <summary>本层是否已经因连续异常而停止工作。</summary>
@@ -73,21 +80,24 @@ internal sealed class TritHooks
         {
             npcAi = (orig, self) =>
             {
-                // KernelFirst: confidence >= 0.9999 的实体跳过 orig 直接写字段
-                if (KernelFirstActive)
+                // 接管调用同样要吞异常：KernelFirst 失败最多退回原版，
+                // 绝不能让 orig 漏调（本文件的铁律是 orig 恰好一次）。
+                if (KernelFirstActive && TryKernelFirst(self))
                 {
-                    var takeover = mod.Takeover;
-                    if (takeover?.TryApplyKernelFirstToNpc(self) == true)
-                    {
-                        // KernelFirst 接管成功 —— 不调 orig(self)，只做观测计数
-                        Guarded("On_NPC.AI", bridge.NoteNpcAi);
-                        return;
-                    }
+                    // KernelFirst 接管成功 —— 不调 orig(self)，只做观测计数
+                    Guarded("On_NPC.AI", noteNpcAi);
+                    return;
                 }
+
+                // 垂直通道学习：Δvy 必须夹在 orig 两侧采样（只看 AI 的贡献，
+                // 重力加在 AI 里还是 Main.UpdateNPC 里都不影响这个差值）。
+                float vyBefore = self.velocity.Y;
+                bool onGroundBefore = self.collideY;
 
                 // PatchAfterOrig / ObserveOnly / KernelFirst fallback: 正常走 orig + 观测
                 orig(self);
-                Guarded("On_NPC.AI", bridge.NoteNpcAi);
+                ObserveNpcAi(self, vyBefore, onGroundBefore);
+                Guarded("On_NPC.AI", noteNpcAi);
             };
             On_NPC.AI += npcAi;
         });
@@ -99,7 +109,7 @@ internal sealed class TritHooks
                 // 弹幕永远走 orig：Projectile.Update 本身就是位置积分 / 重力 / 碰撞 / timeLeft，
                 // 跳过它会让弹幕原地悬停（NPC 只跳过 NPC.AI，位置由 Main.UpdateNPC 负责，故不冲突）。
                 orig(self, i);
-                Guarded("On_Projectile.Update", bridge.NoteProjectileUpdate);
+                Guarded("On_Projectile.Update", noteProjectileUpdate);
             };
             On_Projectile.Update += projectileUpdate;
         });
@@ -205,27 +215,70 @@ internal sealed class TritHooks
         }
         catch (Exception ex)
         {
-            // 计数语义不变：**连续**失败才熔断。成功一次就归零是刻意的——
-            // 偶发的单条异常不该把整层观测停掉。代价是间歇性失败永远不会触发熔断，
-            // 于是"每次失败都打日志"会一直持续下去，所以日志必须另有节流兜底。
-            failures++;
+            ReportFailure(name, ex);
+        }
+    }
 
-            if (hookErrorLog.ShouldLog(out int dropped))
-            {
-                mod.Logger.Error(
-                    $"[trit] 钩子 {name} 观测异常（连续第 {failures} 次）：{ex}" +
-                    (dropped > 0 ? $"（自上次报告以来又吞掉 {dropped} 次）" : string.Empty));
-            }
+    /// <summary>KernelFirst 调用：异常只降级（返回 false → 本 tick 走原版）。</summary>
+    private bool TryKernelFirst(NPC self)
+    {
+        if (tripped)
+        {
+            return false;
+        }
 
-            int threshold = settings.MaxConsecutiveHookFailures;
-            if (threshold > 0 && failures >= threshold)
-            {
-                // 只置位不摘钩：在回调内部改动钩子链是不安全的。
-                // 置位后所有 Guarded 立即空转，orig 仍会被正常调用。
-                // 熔断这条**不节流**——它是状态变更，整个会话只可能发生一次。
-                tripped = true;
-                mod.Logger.Error($"[trit] 连续 {failures} 次异常，三进制观测层已停用（游戏逻辑不受影响）。");
-            }
+        try
+        {
+            return mod.Takeover?.TryApplyKernelFirstToNpc(self) == true;
+        }
+        catch (Exception ex)
+        {
+            ReportFailure("On_NPC.AI(takeover)", ex);
+            return false;
+        }
+    }
+
+    /// <summary>垂直通道的 Δvy 观测：失败只是模型少一个样本，不影响原版 AI。</summary>
+    private void ObserveNpcAi(NPC self, float velocityYBefore, bool onGroundBefore)
+    {
+        if (tripped)
+        {
+            return;
+        }
+
+        try
+        {
+            mod.Takeover?.ObserveNpcAiDelta(self, velocityYBefore, onGroundBefore);
+        }
+        catch (Exception ex)
+        {
+            ReportFailure("On_NPC.AI(observe)", ex);
+        }
+    }
+
+    /// <summary>连续失败计数 + 节流日志 + 熔断（Guarded / 接管调用共用）。</summary>
+    private void ReportFailure(string name, Exception ex)
+    {
+        // 计数语义不变：**连续**失败才熔断。成功一次就归零是刻意的——
+        // 偶发的单条异常不该把整层观测停掉。代价是间歇性失败永远不会触发熔断，
+        // 于是"每次失败都打日志"会一直持续下去，所以日志必须另有节流兜底。
+        failures++;
+
+        if (hookErrorLog.ShouldLog(out int dropped))
+        {
+            mod.Logger.Error(
+                $"[trit] 钩子 {name} 观测异常（连续第 {failures} 次）：{ex}" +
+                (dropped > 0 ? $"（自上次报告以来又吞掉 {dropped} 次）" : string.Empty));
+        }
+
+        int threshold = settings.MaxConsecutiveHookFailures;
+        if (threshold > 0 && failures >= threshold)
+        {
+            // 只置位不摘钩：在回调内部改动钩子链是不安全的。
+            // 置位后所有 Guarded 立即空转，orig 仍会被正常调用。
+            // 熔断这条**不节流**——它是状态变更，整个会话只可能发生一次。
+            tripped = true;
+            mod.Logger.Error($"[trit] 连续 {failures} 次异常，三进制观测层已停用（游戏逻辑不受影响）。");
         }
     }
 }
