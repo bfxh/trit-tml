@@ -314,7 +314,7 @@ PatchAfterOrig（仅当档位由自动升级设置，autoManaged=true）
   → 单 tick 样本 ≥ 20 且一致率跌破 80%
   → 本 tick 立即回落 ObserveOnly，清空窗口重新积累
 
-任何时刻玩家手动 trit takeover on|off → autoManaged=false，自动档不再降级该档位；
+任何时刻玩家手动 trit takeover on|off|replace → autoManaged=false，自动档不再降级该档位；
 trit takeover auto on|off 控制自动档本身。
 ```
 
@@ -417,8 +417,8 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
 
 ### Phase 3：自动升级 + 仪表盘（~2 周）— 已实现
 - 置信度长期跟踪 + 自动升级/降级逻辑（`TakeoverAutoPilot`，L0 低频校准取证）
-- `/trit takeover` 子命令（on / off / auto on|off / status）
-- `/trit takeover stats` 实时仪表盘（置信度、接管数、diff 率、升级窗口进度）
+- `/trit takeover` 子命令（on / off / replace / auto on|off / status）；`replace` 是 L2 KernelFirst 的唯一入口
+- `/trit takeover stats` 实时仪表盘（置信度、接管数、diff 率、升级窗口进度、垂直模型命中率/平均误差/回退次数）
 - **验收**：连续 30 天置信度 ≥ 95% 后自动升级到 L1；任何异常 1 tick 内自动降级
 
 ---

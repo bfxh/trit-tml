@@ -232,8 +232,16 @@ public sealed class TritCommand : ModCommand
                     return;
 
                 case "on":
+                    ApplyTakeoverMode(caller, mod!, TritSettings.TakeoverMode.PatchAfterOrig);
+                    return;
+
                 case "off":
-                    ApplyTakeoverMode(caller, mod!, arg == "on");
+                    ApplyTakeoverMode(caller, mod!, TritSettings.TakeoverMode.ObserveOnly);
+                    return;
+
+                case "replace":
+                case "l2":
+                    ApplyTakeoverMode(caller, mod!, TritSettings.TakeoverMode.ReplaceOrig);
                     return;
 
                 case "auto":
@@ -294,7 +302,7 @@ public sealed class TritCommand : ModCommand
         {
             Say(caller,
                 "接管层未创建（当前是 ObserveOnly 且自动档已关闭 / 校准间隔为 0，或本次装配失败）" +
-                "——先 trit takeover on 或 trit takeover auto on，重进世界后才有统计。",
+                "——先 trit takeover on / replace 或 trit takeover auto on，重进世界后才有统计。",
                 Color.Yellow);
             return;
         }
@@ -302,23 +310,34 @@ public sealed class TritCommand : ModCommand
         EntityTakeover.TakeoverSnapshot stats = takeover.Snapshot();
         Say(caller,
             $"[takeover] 本 tick：plan={stats.TickPlans} 对拍={stats.TickRecorded} " +
-            $"一致={stats.TickConsistent} 方向门={stats.TickTakeovers} KernelFirst={stats.TickKernelFirst}");
+            $"一致={stats.TickConsistent} 方向门={stats.TickTakeovers} KernelFirst={stats.TickKernelFirst}" +
+            $"（垂直 {stats.TickVertical} / 回退 {stats.TickVerticalFallback}）");
         Say(caller,
             $"  累计：plan={stats.TotalPlans} 对拍={stats.TotalRecorded} 一致={stats.TotalConsistent} " +
             $"一致率={stats.ConsistencyRate:P1} 方向门={stats.TotalTakeovers} " +
-            $"KernelFirst={stats.TotalKernelFirst}",
+            $"KernelFirst={stats.TotalKernelFirst}（垂直 {stats.TotalVertical} / 回退 {stats.TotalVerticalFallbacks}）",
             Color.Gray);
+        Say(caller, "  " + DescribeVerticalModel(stats), Color.Gray);
         Say(caller, "  " + (mod.AutoPilot?.Describe() ?? "自动档=未装载"), Color.Gray);
     }
 
-    /// <summary>切换接管开关并写回设置文件。</summary>
-    private static void ApplyTakeoverMode(CommandCaller caller, TritRuntimeMod mod, bool on)
+    /// <summary>垂直模型的一步预测精度（真机验证用的采集口径）。</summary>
+    private static string DescribeVerticalModel(EntityTakeover.TakeoverSnapshot stats)
+    {
+        if (stats.ModelEvalSamples == 0)
+        {
+            return "垂直模型：还没有评估样本（需要实体在空中跑过原版 AI）";
+        }
+
+        return $"垂直模型：样本={stats.ModelEvalSamples} 命中率={stats.ModelHitRate:P1} " +
+               $"平均误差={stats.ModelAverageError:F3}px 最大={stats.ModelMaxError:F3}px";
+    }
+
+    /// <summary>切换接管档位并写回设置文件（on=PatchAfterOrig，replace=ReplaceOrig，off=ObserveOnly）。</summary>
+    private static void ApplyTakeoverMode(CommandCaller caller, TritRuntimeMod mod, TritSettings.TakeoverMode target)
     {
         TritSettings settings = mod.Settings;
         TritSettings.TakeoverMode before = settings.Takeover;
-        TritSettings.TakeoverMode target = on
-            ? TritSettings.TakeoverMode.PatchAfterOrig
-            : TritSettings.TakeoverMode.ObserveOnly;
 
         if (before == target)
         {
@@ -339,14 +358,24 @@ public sealed class TritCommand : ModCommand
             Say(caller, "  写入设置时有问题：" + warning, Color.Yellow);
         }
 
-        if (on && !mod.KernelTakeoverConfigured)
+        if (target == TritSettings.TakeoverMode.ObserveOnly)
+        {
+            Say(caller, "  已立即停止接管：钩子全部回到 orig，内核预测不再被应用。", Color.Gray);
+            return;
+        }
+
+        if (target == TritSettings.TakeoverMode.ReplaceOrig)
+        {
+            Say(caller,
+                "  ReplaceOrig：符合条件的 NPC 会跳过原版 AI（目前只有地面水平朝向/速度 + 已收敛的垂直模型）。" +
+                " 异常时用 trit takeover off 立即回到纯观测。",
+                Color.Yellow);
+        }
+
+        if (!mod.KernelTakeoverConfigured)
         {
             // 内核配置在 Attach 时烘焙，没有热重载路径。
             Say(caller, "  内核启动时没有加载 takeover 配置，本会话不会产生预测 —— 请重进世界后生效。", Color.Yellow);
-        }
-        else if (!on)
-        {
-            Say(caller, "  已立即停止接管：钩子全部回到 orig，内核预测不再被应用。", Color.Gray);
         }
     }
 
@@ -743,6 +772,7 @@ public sealed class TritCommand : ModCommand
             Say(caller, "  trit gpu probe              强制重新探测（会卡一下，几百毫秒）", Color.Gray);
             Say(caller, "  trit takeover [status]      接管模式 / 自动档 / 内核配置 / 门槛", Color.Gray);
             Say(caller, "  trit takeover on|off        手动开关 L1 并写回设置文件（on 需内核已加载接管配置）", Color.Gray);
+            Say(caller, "  trit takeover replace      L2 KernelFirst：跳过符合条件的 NPC 原版 AI（风险最高，可随时 off）", Color.Gray);
             Say(caller, "  trit takeover auto on|off   自动档：长期置信度达标自动升 L1，异常自动降回 L0", Color.Gray);
             Say(caller, "  trit takeover stats         本 tick + 累计：plan / 对拍 / 一致率 / 接管数 / 升级窗口", Color.Gray);
             Say(caller, "  trit budget                 全局预算与各模组账本", Color.Gray);

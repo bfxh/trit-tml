@@ -99,6 +99,9 @@ internal sealed class EntityTakeover
     /// <summary>本 tick 用学到的 Δvy 复现了垂直运动的实体数（<see cref="KernelFirstTakeoverCount"/> 的子集）。</summary>
     public int KernelFirstVerticalCount { get; private set; }
 
+    /// <summary>本 tick 因为垂直模型未就绪 / 地面冲量而放弃 KernelFirst 的次数。</summary>
+    public int KernelFirstVerticalFallbackCount { get; private set; }
+
     /// <summary>本 tick 被方向门接管的实体字段计数（AfterOrig 里 PatchAfterOrig fallback）。</summary>
     public int TakeoverCount { get; private set; }
 
@@ -117,6 +120,12 @@ internal sealed class EntityTakeover
     private long totalConsistent;
     private long totalTakeovers;
     private long totalKernelFirst;
+    private long totalKernelFirstVertical;
+    private long totalVerticalFallbacks;
+    private long modelEvalSamples;
+    private long modelEvalHits;
+    private double modelErrorSum;
+    private float modelErrorMax;
 
     /// <summary>
     /// ReplaceOrig KernelFirst 的置信度门槛。
@@ -156,6 +165,7 @@ internal sealed class EntityTakeover
         calibrationPending = false;
         KernelFirstTakeoverCount = 0;
         KernelFirstVerticalCount = 0;
+        KernelFirstVerticalFallbackCount = 0;
 
         if (settings.Takeover != TritSettings.TakeoverMode.ObserveOnly) return;
         if (autoPilot is null || !autoPilot.IsCalibrationTick()) return;
@@ -173,18 +183,29 @@ internal sealed class EntityTakeover
     {
         public TakeoverSnapshot(
             int tickPlans, int tickRecorded, int tickConsistent, int tickTakeovers, int tickKernelFirst,
-            long totalPlans, long totalRecorded, long totalConsistent, long totalTakeovers, long totalKernelFirst)
+            int tickVertical, int tickVerticalFallback,
+            long totalPlans, long totalRecorded, long totalConsistent, long totalTakeovers, long totalKernelFirst,
+            long totalVertical, long totalVerticalFallbacks,
+            long modelSamples, long modelHits, double modelAverageError, float modelMaxError)
         {
             TickPlans = tickPlans;
             TickRecorded = tickRecorded;
             TickConsistent = tickConsistent;
             TickTakeovers = tickTakeovers;
             TickKernelFirst = tickKernelFirst;
+            TickVertical = tickVertical;
+            TickVerticalFallback = tickVerticalFallback;
             TotalPlans = totalPlans;
             TotalRecorded = totalRecorded;
             TotalConsistent = totalConsistent;
             TotalTakeovers = totalTakeovers;
             TotalKernelFirst = totalKernelFirst;
+            TotalVertical = totalVertical;
+            TotalVerticalFallbacks = totalVerticalFallbacks;
+            ModelEvalSamples = modelSamples;
+            ModelEvalHits = modelHits;
+            ModelAverageError = modelAverageError;
+            ModelMaxError = modelMaxError;
         }
 
         /// <summary>本 tick 内核输出 intent 条数。</summary>
@@ -202,6 +223,12 @@ internal sealed class EntityTakeover
         /// <summary>本 tick 跳过 orig 的实体数。</summary>
         public int TickKernelFirst { get; }
 
+        /// <summary>本 tick 走垂直复现的实体数（<see cref="TickKernelFirst"/> 的子集）。</summary>
+        public int TickVertical { get; }
+
+        /// <summary>本 tick 因垂直模型未就绪 / 地面冲量而放弃接管的次数。</summary>
+        public int TickVerticalFallback { get; }
+
         /// <summary>累计 plan 条数。</summary>
         public long TotalPlans { get; }
 
@@ -217,14 +244,46 @@ internal sealed class EntityTakeover
         /// <summary>累计跳过 orig 的实体数。</summary>
         public long TotalKernelFirst { get; }
 
+        /// <summary>累计走垂直复现的实体数。</summary>
+        public long TotalVertical { get; }
+
+        /// <summary>累计因垂直模型未就绪 / 地面冲量而放弃接管的次数。</summary>
+        public long TotalVerticalFallbacks { get; }
+
+        /// <summary>垂直模型的一步预测评估样本数（只在跑过 orig 的 tick 上采样）。</summary>
+        public long ModelEvalSamples { get; }
+
+        /// <summary>评估样本中「一步误差在容差内」的次数。</summary>
+        public long ModelEvalHits { get; }
+
+        /// <summary>垂直模型一步预测的平均绝对误差（像素/tick）。</summary>
+        public double ModelAverageError { get; }
+
+        /// <summary>垂直模型一步预测的最大绝对误差（像素/tick）。</summary>
+        public float ModelMaxError { get; }
+
         /// <summary>累计一致率；没有样本时返回 0。</summary>
         public double ConsistencyRate => TotalRecorded > 0 ? (double)TotalConsistent / TotalRecorded : 0d;
+
+        /// <summary>垂直模型命中率；没有评估样本时返回 0。</summary>
+        public double ModelHitRate => ModelEvalSamples > 0 ? (double)ModelEvalHits / ModelEvalSamples : 0d;
+    }
+
+    /// <summary>记一次「垂直通道没能接管」（地面冲量 / 模型未就绪）。</summary>
+    private void CountVerticalFallback()
+    {
+        KernelFirstVerticalFallbackCount++;
+        totalVerticalFallbacks++;
     }
 
     /// <summary>取当前统计（命令层 / 日志用）。</summary>
     public TakeoverSnapshot Snapshot() => new(
         PlanCount, RecordedCount, ConsistentCount, TakeoverCount, KernelFirstTakeoverCount,
-        totalPlans, totalRecorded, totalConsistent, totalTakeovers, totalKernelFirst);
+        KernelFirstVerticalCount, KernelFirstVerticalFallbackCount,
+        totalPlans, totalRecorded, totalConsistent, totalTakeovers, totalKernelFirst,
+        totalKernelFirstVertical, totalVerticalFallbacks,
+        modelEvalSamples, modelEvalHits,
+        modelEvalSamples > 0 ? modelErrorSum / modelEvalSamples : 0d, modelErrorMax);
 
     // ──────────────────────────────────────────────────────────────────────────
     // KernelFirst 缓存层（tick 开头 PreUpdateEntities 驱动）
@@ -240,6 +299,7 @@ internal sealed class EntityTakeover
     {
         KernelFirstTakeoverCount = 0;
         KernelFirstVerticalCount = 0;
+        KernelFirstVerticalFallbackCount = 0;
         kernelFirstCache = null;
         lastActionPlan = null;
         speedByEntity = null;
@@ -501,8 +561,16 @@ internal sealed class EntityTakeover
         if (onGround)
         {
             // 地面：起跳/冲量必须由原版定幅度（Δvy 记不到）；落地残余速度也交给原版归零。
-            if (hasVerticalIntent) return false;
-            if (Math.Abs(npc.velocity.Y) >= GroundedVelocityLimit) return false;
+            if (hasVerticalIntent)
+            {
+                CountVerticalFallback();
+                return false;
+            }
+
+            if (Math.Abs(npc.velocity.Y) >= GroundedVelocityLimit)
+            {
+                return false;
+            }
         }
         else if (TryEmulateVertical(npc, hasVerticalIntent, verticalDelta, out emulatedVelocityY))
         {
@@ -512,6 +580,7 @@ internal sealed class EntityTakeover
         {
             // 空中且模型还没确认：原版 AI 仍在改 vy（重力/阻尼/撞墙反弹），
             // 跳过 orig 会把它冻住。
+            CountVerticalFallback();
             return false;
         }
 
@@ -663,6 +732,25 @@ internal sealed class EntityTakeover
             return;
         }
 
+        // 模型评估：这一 tick 跑了原版，等于拿到一个「真值」样本 —— 先在拟合前用旧模型
+        // 预测一次，量出一步误差。这是收敛速度 / 命中率 / 回退率的采集口径。
+        if (track.Model.CanPredict)
+        {
+            float predicted = track.Model.Predict(velocityYBefore);
+            float error = Math.Abs(npc.velocity.Y - predicted);
+            modelEvalSamples++;
+            if (error <= 0.05f + 0.01f * Math.Abs(predicted))
+            {
+                modelEvalHits++;
+            }
+
+            modelErrorSum += error;
+            if (error > modelErrorMax)
+            {
+                modelErrorMax = error;
+            }
+        }
+
         track.Model.Observe(velocityYBefore, npc.velocity.Y);
         track.TakeoverStreak = 0; // 这一 tick 跑过 orig，接管计数清零
     }
@@ -711,6 +799,7 @@ internal sealed class EntityTakeover
         if (vertical)
         {
             KernelFirstVerticalCount++;
+            totalKernelFirstVertical++;
         }
     }
 
@@ -841,8 +930,8 @@ internal sealed class EntityTakeover
             {
                 TritRuntimeMod.Instance?.Logger?.Info(
                     $"[trit] KernelFirst：{plan.Count} plan → 跳过 orig {KernelFirstTakeoverCount}" +
-                    $"（垂直复现 {KernelFirstVerticalCount}）→ fallback 方向门 {TakeoverCount} " +
-                    $"→ 对拍回写 {RecordedCount}");
+                    $"（垂直 {KernelFirstVerticalCount} / 回退 {KernelFirstVerticalFallbackCount}）" +
+                    $"→ fallback 方向门 {TakeoverCount} → 对拍回写 {RecordedCount}");
             }
             else if (!isKernelFirst && (TakeoverCount > 0 || RecordedCount > 0))
             {

@@ -65,7 +65,9 @@ public sealed class TritSettings
     /// 接管模式（内核是否"替代"原版 C# AI/Update 的部分逻辑）。
     /// </summary>
     /// <remarks>
-    /// Phase 1 L1 MVP 只实现了 ObserveOnly 和 PatchAfterOrig。ReplaceOrig 是 L2 中接管的事。
+    /// 三档都已实现：ObserveOnly（零开销）、PatchAfterOrig（L1 事后修正）、
+    /// ReplaceOrig（L2 KernelFirst，跳过符合条件的 NPC 原版 AI）。
+    /// ReplaceOrig 风险最高，只由玩家显式开启（<c>/trit takeover replace</c>），自动档不会升级到它。
     /// </remarks>
     public enum TakeoverMode
     {
