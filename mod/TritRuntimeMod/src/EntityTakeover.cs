@@ -493,21 +493,25 @@ internal sealed class EntityTakeover
         // 目标选择都不推进，长期接管会让状态机停摆（史莱姆的跳跃计时器就是一例）。
         if (TakeoverStreakExhausted(npc)) return false;
 
-        // 垂直通道：内核要求改 vy → 必须能自己把这一步的物理算出来；
-        // 内核没要求改 vy 但实体在空中 → 原版 AI 仍可能在改它（重力、悬停阻尼、
-        // 撞墙反弹），跳过 orig 会把它冻住，一律交回原版。
+        // 垂直通道：内核有没有 vy 指令，只决定要不要额外做符号交叉校验。
+        // 真正的前提是「能不能把这一步的物理算出来」—— 有确认过的仿射模型就能复现
+        // 原版对 vy 的作用（重力、悬停阻尼、阻力），否则一律交回原版。
         float emulatedVelocityY = 0f;
         bool emulateVertical = false;
-        if (hasVerticalIntent)
+        if (onGround)
         {
-            // 在地面却要改 vy：这是起跳/冲量，Δvy 记不到（落地那几 tick 不学习），交回原版。
-            if (onGround) return false;
-            if (!TryEmulateVertical(npc, verticalDelta, out emulatedVelocityY)) return false;
+            // 地面：起跳/冲量必须由原版定幅度（Δvy 记不到）；落地残余速度也交给原版归零。
+            if (hasVerticalIntent) return false;
+            if (Math.Abs(npc.velocity.Y) >= GroundedVelocityLimit) return false;
+        }
+        else if (TryEmulateVertical(npc, hasVerticalIntent, verticalDelta, out emulatedVelocityY))
+        {
             emulateVertical = true;
         }
-        else if (!onGround || Math.Abs(npc.velocity.Y) >= GroundedVelocityLimit)
+        else
         {
-            // 刚落地/撞墙留下的残余速度同样交给原版归零。
+            // 空中且模型还没确认：原版 AI 仍在改 vy（重力/阻尼/撞墙反弹），
+            // 跳过 orig 会把它冻住。
             return false;
         }
 
@@ -643,9 +647,17 @@ internal sealed class EntityTakeover
             track.Type = npc.type;
         }
 
-        if (onGroundBefore || Math.Abs(npc.velocity.Y - velocityYBefore) > VerticalDeltaSanity)
+        if (onGroundBefore)
         {
-            // 落地/贴地：模型作废，下一次起飞重新积累；冲量样本同样不可用于拟合。
+            // 地面样本是「重力 − 支撑」，不能进拟合；但仿射系数是同一实体的物理常数，
+            // 跨落地保留 —— 下一次离地的第一 tick 就能直接复现，不必重新积累样本。
+            track.TakeoverStreak = 0;
+            return;
+        }
+
+        if (Math.Abs(npc.velocity.Y - velocityYBefore) > VerticalDeltaSanity)
+        {
+            // 空中的冲量/碰撞/传送：这一对样本不属于自由演化，清空重学。
             track.Model.Reset();
             track.TakeoverStreak = 0;
             return;
@@ -656,13 +668,14 @@ internal sealed class EntityTakeover
     }
 
     /// <summary>
-    /// 判断能否用学到的仿射模型复现内核要求的那一步垂直变化。
+    /// 判断能否用学到的仿射模型复现原版这一步对 vy 的作用。
     /// <para>
-    /// 额外要求模型外推和内核预测的符号一致 —— 不一致说明模型已经跟不上
-    /// （撞墙、入水、悬停阻尼变化），交回原版并让观测把模型纠正回来。
+    /// <paramref name="hasSign"/> 为 true 时（内核给了 vy 指令）额外要求模型外推和内核
+    /// 预测的符号一致 —— 不一致说明模型已经跟不上（撞墙、入水、悬停阻尼变化），
+    /// 交回原版并让观测把模型纠正回来。没有指令时只要求模型已确认。
     /// </para>
     /// </summary>
-    private bool TryEmulateVertical(NPC npc, byte delta, out float predicted)
+    private bool TryEmulateVertical(NPC npc, bool hasSign, byte delta, out float predicted)
     {
         predicted = 0f;
         int slot = npc.whoAmI;
@@ -673,6 +686,8 @@ internal sealed class EntityTakeover
         if (!track.Model.CanPredict) return false;
 
         predicted = track.Model.Predict(npc.velocity.Y);
+        if (!hasSign) return true;
+
         float sign = delta == 2 ? +1f : -1f;
         if (sign > 0f ? predicted < 0f : predicted > 0f) return false;
         return true;
