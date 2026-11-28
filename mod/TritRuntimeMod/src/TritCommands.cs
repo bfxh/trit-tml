@@ -322,6 +322,17 @@ public sealed class TritCommand : ModCommand
             $"  目标预测：本 tick {stats.TickTargetHits}/{stats.TickTargetSamples} " +
             $"累计 {stats.TotalTargetHits}/{stats.TotalTargetSamples} 命中率={stats.TargetHitRate:P1}",
             Color.Gray);
+        Say(caller,
+            $"  影子对拍：曼哈顿 {stats.TotalTargetManhattanHits}/{stats.TotalTargetSamples}" +
+            $"（{stats.TargetManhattanHitRate:P1}） | " +
+            $"曼哈顿+aggro {stats.TotalTargetAggroHits}/{stats.TotalTargetSamples}" +
+            $"（{stats.TargetAggroHitRate:P1}）",
+            Color.Gray);
+        Say(caller,
+            $"  样本跳过：KernelFirst 接管 {stats.TickTargetSkippedTakenOver}" +
+            $"（无真值） / 目标无效 {stats.TickTargetSkippedInvalid}（死亡/幽灵/不在表）",
+            Color.Gray);
+        Say(caller, "  目标偏差 Top（按内核错失）：\n" + takeover.FormatTargetTypeReport(), Color.Gray);
         Say(caller, "  " + (mod.AutoPilot?.Describe() ?? "自动档=未装载"), Color.Gray);
     }
 

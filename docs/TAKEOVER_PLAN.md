@@ -416,6 +416,12 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
   经 `ACTION_PLAN` 尾部目标表下发（`kind u8, slot u16, target_slot u16`，`0xFFFF` = 无目标）。
   本阶段 C# 只在 orig 之后把内核 target 与 `npc.target` 对拍，累计样本 / 命中率进
   `/trit takeover stats` 与周期日志，**不写 `npc.target`**（避免假覆盖）。
+  对拍口径：真值取 tick 开头推送那一刻的 `npc.target`（与内核同一份输入）；
+  本 tick 被 KernelFirst 接管（没跑 orig）的实体没有真值，跳过并单独计数；
+  目标玩家死亡 / 幽灵 / 不在推送玩家表里的样本同样跳过。
+  另做「影子对拍」：在同一份推送快照上并行算曼哈顿距离、曼哈顿距离 − aggro 两种候选，
+  与内核的欧氏口径对比命中率，并按 `npc.type` 输出偏差 Top，用来区分
+  「模型口径不对」与「这类 NPC 本来就不按最近玩家选目标」。
 - 历史修正：早期注释凭记忆写错过编号（把 4 当成 Eye of Cthulhu、10 当成 Giant Worm Head；
   实际 4 = Unholy Arrow、10 = Purification Powder，已在 `Projectile_IDs` 页核对），
   现已改为「只登记真正有实现分支的类型」，并由 `every_ported_type_has_a_branch` 测试锁定。

@@ -91,6 +91,31 @@ internal sealed class EntityTakeover
     /// <summary>玩家表复用缓冲（STATE_PUSH 尾部）。</summary>
     private readonly List<PlayerSnapshot> playerBuffer = new(16);
 
+    /// <summary>
+    /// tick 开头（AI 之前）推送那一刻的 NPC 真值快照：target / type / 中心坐标。
+    /// <para>内核的目标预测用的就是这批输入，对拍必须拿同一时刻的真值，
+    /// 否则「预测在 tick 头、答案在 tick 尾」会凭空多出一批错样本。</para>
+    /// </summary>
+    private int[] npcTargetAtPush = Array.Empty<int>();
+    private int[] npcTypeAtPush = Array.Empty<int>();
+    private float[] npcCenterXAtPush = Array.Empty<float>();
+    private float[] npcCenterYAtPush = Array.Empty<float>();
+
+    /// <summary>tick 开头各玩家槽位的 aggro（影子对拍用）。</summary>
+    private int[] playerAggroAtPush = Array.Empty<int>();
+
+    /// <summary>按 NPC 类型分桶的目标对拍统计（影子对拍，只观测）。</summary>
+    private readonly Dictionary<int, TargetTypeBucket> targetTypeBuckets = new(256);
+
+    /// <summary>单个 NPC 类型的目标对拍计数。</summary>
+    private struct TargetTypeBucket
+    {
+        public int Samples;
+        public int EuclideanHits;
+        public int ManhattanHits;
+        public int AggroHits;
+    }
+
     /// <summary>速度表复用字典（每 tick Clear 后重填，稳态零分配）。</summary>
     private readonly Dictionary<ulong, float> speedBuffer = new();
     private readonly Dictionary<ulong, List<(uint Key, byte Delta, float Confidence)>> bucketBuffer = new();
@@ -126,6 +151,18 @@ internal sealed class EntityTakeover
     /// <summary>本 tick 目标预测命中的样本数（<see cref="TargetSampleCount"/> 的子集）。</summary>
     public int TargetHitCount { get; private set; }
 
+    /// <summary>本 tick 影子对拍：按曼哈顿距离选玩家时的命中数。</summary>
+    public int TargetManhattanHitCount { get; private set; }
+
+    /// <summary>本 tick 影子对拍：按曼哈顿距离减 aggro 选玩家时的命中数。</summary>
+    public int TargetAggroHitCount { get; private set; }
+
+    /// <summary>本 tick 因实体被 KernelFirst 接管（没跑 orig、没有真值）而跳过的样本数。</summary>
+    public int TargetSkippedTakenOver { get; private set; }
+
+    /// <summary>本 tick 因目标玩家不在推送表 / 已死亡 / 幽灵而跳过的样本数。</summary>
+    public int TargetSkippedInvalid { get; private set; }
+
     // 进程内累计（命令层 /trit takeover stats 的长期观测口径，不持久化）。
     private long totalPlans;
     private long totalRecorded;
@@ -140,6 +177,8 @@ internal sealed class EntityTakeover
     private float modelErrorMax;
     private long totalTargetSamples;
     private long totalTargetHits;
+    private long totalTargetManhattanHits;
+    private long totalTargetAggroHits;
 
     /// <summary>
     /// ReplaceOrig KernelFirst 的置信度门槛。
@@ -201,7 +240,10 @@ internal sealed class EntityTakeover
             long totalPlans, long totalRecorded, long totalConsistent, long totalTakeovers, long totalKernelFirst,
             long totalVertical, long totalVerticalFallbacks,
             long modelSamples, long modelHits, double modelAverageError, float modelMaxError,
-            int tickTargetSamples, int tickTargetHits, long totalTargetSamples, long totalTargetHits)
+            int tickTargetSamples, int tickTargetHits, long totalTargetSamples, long totalTargetHits,
+            int tickTargetManhattan, int tickTargetAggro,
+            int tickSkippedTakenOver, int tickSkippedInvalid,
+            long totalTargetManhattan, long totalTargetAggro)
         {
             TickPlans = tickPlans;
             TickRecorded = tickRecorded;
@@ -225,6 +267,12 @@ internal sealed class EntityTakeover
             TickTargetHits = tickTargetHits;
             TotalTargetSamples = totalTargetSamples;
             TotalTargetHits = totalTargetHits;
+            TickTargetManhattanHits = tickTargetManhattan;
+            TickTargetAggroHits = tickTargetAggro;
+            TickTargetSkippedTakenOver = tickSkippedTakenOver;
+            TickTargetSkippedInvalid = tickSkippedInvalid;
+            TotalTargetManhattanHits = totalTargetManhattan;
+            TotalTargetAggroHits = totalTargetAggro;
         }
 
         /// <summary>本 tick 内核输出 intent 条数。</summary>
@@ -296,6 +344,32 @@ internal sealed class EntityTakeover
         /// <summary>目标预测命中率；没有样本时返回 0。</summary>
         public double TargetHitRate => TotalTargetSamples > 0 ? (double)TotalTargetHits / TotalTargetSamples : 0d;
 
+        /// <summary>本 tick 影子对拍（曼哈顿距离）命中数。</summary>
+        public int TickTargetManhattanHits { get; }
+
+        /// <summary>本 tick 影子对拍（曼哈顿距离 − aggro）命中数。</summary>
+        public int TickTargetAggroHits { get; }
+
+        /// <summary>本 tick 因 KernelFirst 接管（无真值）跳过的样本数。</summary>
+        public int TickTargetSkippedTakenOver { get; }
+
+        /// <summary>本 tick 因目标无效（不在玩家里 / 死亡 / 幽灵）跳过的样本数。</summary>
+        public int TickTargetSkippedInvalid { get; }
+
+        /// <summary>累计影子对拍（曼哈顿距离）命中数。</summary>
+        public long TotalTargetManhattanHits { get; }
+
+        /// <summary>累计影子对拍（曼哈顿距离 − aggro）命中数。</summary>
+        public long TotalTargetAggroHits { get; }
+
+        /// <summary>曼哈顿口径的目标命中率；没有样本时返回 0。</summary>
+        public double TargetManhattanHitRate =>
+            TotalTargetSamples > 0 ? (double)TotalTargetManhattanHits / TotalTargetSamples : 0d;
+
+        /// <summary>曼哈顿 − aggro 口径的目标命中率；没有样本时返回 0。</summary>
+        public double TargetAggroHitRate =>
+            TotalTargetSamples > 0 ? (double)TotalTargetAggroHits / TotalTargetSamples : 0d;
+
         /// <summary>累计一致率；没有样本时返回 0。</summary>
         public double ConsistencyRate => TotalRecorded > 0 ? (double)TotalConsistent / TotalRecorded : 0d;
 
@@ -318,7 +392,65 @@ internal sealed class EntityTakeover
         totalKernelFirstVertical, totalVerticalFallbacks,
         modelEvalSamples, modelEvalHits,
         modelEvalSamples > 0 ? modelErrorSum / modelEvalSamples : 0d, modelErrorMax,
-        TargetSampleCount, TargetHitCount, totalTargetSamples, totalTargetHits);
+        TargetSampleCount, TargetHitCount, totalTargetSamples, totalTargetHits,
+        TargetManhattanHitCount, TargetAggroHitCount,
+        TargetSkippedTakenOver, TargetSkippedInvalid,
+        totalTargetManhattanHits, totalTargetAggroHits);
+
+    /// <summary>
+    /// 按 NPC 类型输出目标对拍明细（按「内核错失数」降序，最多 <paramref name="top"/> 行）。
+    /// <para>用于区分「模型口径不对」与「这类 NPC 本来就不按最近玩家选目标」。</para>
+    /// </summary>
+    public string FormatTargetTypeReport(int top = 5)
+    {
+        if (targetTypeBuckets.Count == 0)
+        {
+            return "（暂无样本）";
+        }
+
+        var entries = new List<KeyValuePair<int, TargetTypeBucket>>(targetTypeBuckets);
+        entries.Sort((left, right) =>
+        {
+            int leftMisses = left.Value.Samples - left.Value.EuclideanHits;
+            int rightMisses = right.Value.Samples - right.Value.EuclideanHits;
+            int byMisses = rightMisses.CompareTo(leftMisses);
+            return byMisses != 0 ? byMisses : right.Value.Samples.CompareTo(left.Value.Samples);
+        });
+
+        var builder = new System.Text.StringBuilder();
+        int written = 0;
+        foreach (var entry in entries)
+        {
+            if (written >= top)
+            {
+                break;
+            }
+
+            TargetTypeBucket bucket = entry.Value;
+            int misses = bucket.Samples - bucket.EuclideanHits;
+            if (misses <= 0 && written > 0)
+            {
+                break;
+            }
+
+            if (written > 0)
+            {
+                builder.Append('\n');
+            }
+
+            builder.Append("    type=").Append(entry.Key)
+                .Append(" 样本=").Append(bucket.Samples)
+                .Append(" 内核=").Append(Percent(bucket.EuclideanHits, bucket.Samples))
+                .Append(" 曼哈顿=").Append(Percent(bucket.ManhattanHits, bucket.Samples))
+                .Append(" +aggro=").Append(Percent(bucket.AggroHits, bucket.Samples));
+            written++;
+        }
+
+        return builder.Length == 0 ? "（暂无偏差样本）" : builder.ToString();
+    }
+
+    private static string Percent(int hits, int samples) =>
+        samples > 0 ? ((double)hits / samples).ToString("P1") : "n/a";
 
     // ──────────────────────────────────────────────────────────────────────────
     // KernelFirst 缓存层（tick 开头 PreUpdateEntities 驱动）
@@ -431,6 +563,9 @@ internal sealed class EntityTakeover
         List<EntitySnapshot> states = stateBuffer;
         states.Clear();
 
+        // 真值快照表按世界容量对齐（NPC / 玩家数组长度固定，实际只扩容一次）。
+        EnsurePushTables(Main.npc.Length, Main.player.Length);
+
         NPC[] npcs = Main.npc;
         for (int i = 0; i < npcs.Length; i++)
         {
@@ -441,6 +576,13 @@ internal sealed class EntityTakeover
             }
 
             bool hasTarget = npc.HasValidTarget;
+
+            // 对拍真值：AI 之前的 target / type / 中心。内核此时拿到的也是同一份状态。
+            int npcSlot = npc.whoAmI;
+            npcTargetAtPush[npcSlot] = hasTarget ? npc.target : -1;
+            npcTypeAtPush[npcSlot] = npc.type;
+            npcCenterXAtPush[npcSlot] = npc.Center.X;
+            npcCenterYAtPush[npcSlot] = npc.Center.Y;
             float targetDistance = 0f;
             float targetDx = 0f;
             float targetDy = 0f;
@@ -514,6 +656,7 @@ internal sealed class EntityTakeover
                 Ghost = player.ghost,
                 Immune = player.immune,
             });
+            playerAggroAtPush[player.whoAmI] = player.aggro;
         }
 
         Projectile[] projectiles = Main.projectile;
@@ -883,22 +1026,60 @@ internal sealed class EntityTakeover
         Array.Resize(ref npcTracks, size);
     }
 
+    /// <summary>确保目标对拍真值表覆盖到当前世界容量（只扩容，不清旧值）。</summary>
+    private void EnsurePushTables(int npcCapacity, int playerCapacity)
+    {
+        if (npcTargetAtPush.Length < npcCapacity)
+        {
+            Array.Resize(ref npcTargetAtPush, npcCapacity);
+            Array.Resize(ref npcTypeAtPush, npcCapacity);
+            Array.Resize(ref npcCenterXAtPush, npcCapacity);
+            Array.Resize(ref npcCenterYAtPush, npcCapacity);
+        }
+
+        if (playerAggroAtPush.Length < playerCapacity)
+        {
+            Array.Resize(ref playerAggroAtPush, playerCapacity);
+        }
+    }
+
     // ──────────────────────────────────────────────────────────────────────────
     // AfterOrig（tick 末尾，KernelFirst 钩子全部跑完后）
     // ──────────────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// 目标预测对拍：内核在 tick 开头按位置预测的「最近玩家」 vs orig 跑完后 NPC 的真实 target。
-    /// <para>只统计原版确实有目标的活跃 NPC —— 没有目标的实体没有可比较的答案。</para>
-    /// <para>纯观测：不写 <c>npc.target</c>。</para>
+    /// 目标预测对拍（纯观测，不写 <c>npc.target</c>）。
+    /// <para>
+    /// 口径修正：
+    /// <list type="bullet">
+    /// <item>真值取 <b>推送那一刻</b>（AI 之前）的 target —— 与内核预测用的是同一份输入；</item>
+    /// <item>被 KernelFirst 接管（这一 tick 没跑 orig）的实体没有真值，直接跳过；</item>
+    /// <item>目标玩家不在推送表 / 已死亡 / 幽灵的样本跳过 —— 内核恒不选这类玩家。</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// 影子对拍：同一份推送快照上并行算「曼哈顿距离」「曼哈顿距离 − aggro」两种候选，
+    /// 分别累计命中率，用来区分「模型口径问题」和「统计口径问题」。
+    /// 内核自身用的是欧氏平方，即 <see cref="TargetHitCount"/>。
+    /// </para>
     /// </summary>
     private void CompareTargets()
     {
         TargetSampleCount = 0;
         TargetHitCount = 0;
+        TargetManhattanHitCount = 0;
+        TargetAggroHitCount = 0;
+        TargetSkippedTakenOver = 0;
+        TargetSkippedInvalid = 0;
 
         var targets = actionPlanTargetBuffer;
         if (targets.Count == 0)
+        {
+            return;
+        }
+
+        List<PlayerSnapshot> players = playerBuffer;
+        if (players.Count == 0)
         {
             return;
         }
@@ -907,20 +1088,107 @@ internal sealed class EntityTakeover
         foreach (var (kind, slot, targetSlot) in targets)
         {
             if (kind != LaneMap.KindNpc) continue;
-            if (slot < 0 || slot >= npcs.Length) continue;
+            if (slot < 0 || slot >= npcs.Length || slot >= npcTargetAtPush.Length) continue;
 
             NPC npc = npcs[slot];
-            if (npc is null || !npc.active || !npc.HasValidTarget) continue;
+            if (npc is null || !npc.active) continue;
+
+            // 这一 tick 被 KernelFirst 跳过 orig：target 不会更新，没有可比较的真值。
+            // TakeoverStreak 在跑 orig 时清零、接管成功时自增，因此 > 0 即「本 tick 接管过」。
+            if (slot < npcTracks.Length
+                && npcTracks[slot].Type == npc.type
+                && npcTracks[slot].TakeoverStreak > 0)
+            {
+                TargetSkippedTakenOver++;
+                continue;
+            }
+
+            // slot 被复用（type 变了）时旧快照不可信。
+            int truth = npcTargetAtPush[slot];
+            if (npcTypeAtPush[slot] != npc.type)
+            {
+                TargetSkippedInvalid++;
+                continue;
+            }
+
+            PlayerSnapshot truthPlayer = default;
+            bool found = false;
+            for (int i = 0; i < players.Count; i++)
+            {
+                if (players[i].Slot == truth)
+                {
+                    truthPlayer = players[i];
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found || !truthPlayer.Active || truthPlayer.Dead || truthPlayer.Ghost)
+            {
+                // 内核恒跳过这类玩家，没有可比较的答案（不是模型错）。
+                TargetSkippedInvalid++;
+                continue;
+            }
 
             TargetSampleCount++;
-            if (npc.target == targetSlot)
+
+            // 影子对拍：用与内核完全相同的推送快照（位置 + 玩家表），只换距离度量。
+            float npcX = npcCenterXAtPush[slot];
+            float npcY = npcCenterYAtPush[slot];
+            int manhattanWinner = -1;
+            int aggroWinner = -1;
+            float bestManhattan = 0f;
+            float bestAggro = 0f;
+            for (int i = 0; i < players.Count; i++)
             {
-                TargetHitCount++;
+                PlayerSnapshot player = players[i];
+                if (!player.Active || player.Dead || player.Ghost)
+                {
+                    continue;
+                }
+
+                float dx = npcX - player.CenterX;
+                float dy = npcY - player.CenterY;
+                float manhattan = Math.Abs(dx) + Math.Abs(dy);
+                int playerSlot = player.Slot;
+                int aggro = playerSlot >= 0 && playerSlot < playerAggroAtPush.Length
+                    ? playerAggroAtPush[playerSlot]
+                    : 0;
+
+                if (manhattanWinner < 0 || manhattan < bestManhattan)
+                {
+                    bestManhattan = manhattan;
+                    manhattanWinner = playerSlot;
+                }
+
+                float adjusted = manhattan - aggro;
+                if (aggroWinner < 0 || adjusted < bestAggro)
+                {
+                    bestAggro = adjusted;
+                    aggroWinner = playerSlot;
+                }
             }
+
+            if (truth == targetSlot) TargetHitCount++;
+            if (truth == manhattanWinner) TargetManhattanHitCount++;
+            if (truth == aggroWinner) TargetAggroHitCount++;
+
+            if (!targetTypeBuckets.TryGetValue(npc.type, out TargetTypeBucket bucket))
+            {
+                bucket = default;
+            }
+
+            bucket.Samples++;
+            if (truth == targetSlot) bucket.EuclideanHits++;
+            if (truth == manhattanWinner) bucket.ManhattanHits++;
+            if (truth == aggroWinner) bucket.AggroHits++;
+            targetTypeBuckets[npc.type] = bucket;
         }
 
         totalTargetSamples += TargetSampleCount;
         totalTargetHits += TargetHitCount;
+        totalTargetManhattanHits += TargetManhattanHitCount;
+        totalTargetAggroHits += TargetAggroHitCount;
     }
 
     /// <summary>
@@ -1034,13 +1302,16 @@ internal sealed class EntityTakeover
                     $"[trit] KernelFirst：{plan.Count} plan → 跳过 orig {KernelFirstTakeoverCount}" +
                     $"（垂直 {KernelFirstVerticalCount} / 回退 {KernelFirstVerticalFallbackCount}）" +
                     $"→ fallback 方向门 {TakeoverCount} → 对拍回写 {RecordedCount}" +
-                    $" → 目标 {TargetHitCount}/{TargetSampleCount}");
+                    $" → 目标 {TargetHitCount}/{TargetSampleCount}" +
+                    $"（曼哈顿 {TargetManhattanHitCount}/{TargetSampleCount}，" +
+                    $"跳过 接管 {TargetSkippedTakenOver}/无效 {TargetSkippedInvalid}）");
             }
             else if (!isKernelFirst && (TakeoverCount > 0 || RecordedCount > 0 || TargetSampleCount > 0))
             {
                 TritRuntimeMod.Instance?.Logger?.Info(
                     $"[trit] PatchAfterOrig：{plan.Count} plan → 对拍 {RecordedCount} → 方向门 {TakeoverCount}" +
-                    $" → 目标 {TargetHitCount}/{TargetSampleCount}");
+                    $" → 目标 {TargetHitCount}/{TargetSampleCount}" +
+                    $"（曼哈顿 {TargetManhattanHitCount}/{TargetSampleCount}）");
             }
         }
 
