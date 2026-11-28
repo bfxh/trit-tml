@@ -23,10 +23,11 @@ public sealed class NativeKernel : ITritKernel
     /// 本机期望的 ABI 版本。v2 新增并行任务池 / GPU / 全局预算；v3 新增
     /// <c>0x1A TXN_SUBMIT_BATCH</c> 且本壳每 tick 都用它；v4 将 <c>0x20 STATE_PUSH</c>
     /// 换成量化变长记录（16 B 定长 + ai 值）；v5 又加了 <c>target_dx / target_dy</c>
-    /// （定长 20 B）。老 DLL 必须被这里挡下，否则每 tick 都吃 BAD_OP 或读到错位数据，
-    /// 表象是模组完全失效。
+    /// （定长 20 B）；v6 再加 <c>pos_x / pos_y</c>（定长 28 B）与玩家表，并给
+    /// <c>ACTION_PLAN</c> 追加目标表。老 DLL 必须被这里挡下，否则每 tick 都吃 BAD_OP
+    /// 或读到错位数据，表象是模组完全失效。
     /// </summary>
-    public const uint ExpectedAbiVersion = 5;
+    public const uint ExpectedAbiVersion = 6;
 
     /// <summary>本机期望的最低运行时版本（0.1.0）。</summary>
     public const uint MinimumRuntimeVersion = 0x00_01_00_00;
@@ -222,7 +223,8 @@ public sealed class NativeKernel : ITritKernel
     /// </remarks>
     public void ReadActionPlanInto(
         List<(uint Key, byte Delta, float Confidence)> buffer,
-        List<(byte Kind, int Slot, float Magnitude)>? speeds = null)
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null,
+        List<(byte Kind, int Slot, int TargetSlot)>? targets = null)
     {
         var status = SubmitBorrowed(Opcode.ActionPlan, Array.Empty<byte>(), 0, out var payload);
         if (status != Status.Ok && status != Status.Conflict)
@@ -230,10 +232,11 @@ public sealed class NativeKernel : ITritKernel
             lastError = ReadLastError();
             buffer.Clear();
             speeds?.Clear();
+            targets?.Clear();
             return;
         }
 
-        KernelResponseMapper.ToActionPlanInto(payload, buffer, speeds);
+        KernelResponseMapper.ToActionPlanInto(payload, buffer, speeds, targets);
     }
 
     /// <summary>

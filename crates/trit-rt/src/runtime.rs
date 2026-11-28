@@ -299,10 +299,14 @@ pub struct TritRuntime {
     /// TritEnginePort 的实体状态表（`STATE_PUSH` 每 tick 整批替换）。
     /// 空表 = 引擎不参与，`ACTION_PLAN` 全走历史外推。
     /// 按 `(kind, slot)` 升序排列，用二分查找替代每 tick 重建 `BTreeMap`。
-    entity_states: Vec<((u8, i32), EntityState)>,
+    entity_states: Vec<((u8, i32), PushedEntity)>,
     /// `STATE_PUSH` 的解析暂存：解析成功才与 `entity_states` 交换，
     /// 载荷非法时旧表原样保留（与 BTreeMap 版本的「全有或全无」一致）。
-    state_scratch: Vec<((u8, i32), EntityState)>,
+    state_scratch: Vec<((u8, i32), PushedEntity)>,
+    /// 玩家表（`STATE_PUSH` 每 tick 整批替换）：内核用它预测 NPC 的目标玩家。
+    players: Vec<PlayerState>,
+    /// 玩家表的解析暂存，交换语义同上。
+    players_scratch: Vec<PlayerState>,
     /// 提交路径复用缓冲：解析出的意图、待落地合并批、仲裁结果。
     /// 稳态（单模组、无悬挂事务）下三者容量都不再增长。
     parse_buf: Vec<Intent>,
@@ -312,13 +316,31 @@ pub struct TritRuntime {
     plan_buf: Vec<(u32, Ternary, f32)>,
     /// 引擎速度大小表缓冲（`ACTION_PLAN` 尾部下发）：复用容量，稳态零分配。
     speed_buf: Vec<(u8, i32, f32)>,
+    /// 目标预测表缓冲（`ACTION_PLAN` 尾部下发）：复用容量，稳态零分配。
+    target_buf: Vec<(u8, i32, i32)>,
 }
 
 /// 一条实体状态（STATE_PUSH 推来的）。
 #[derive(Debug, Clone, Copy)]
+struct PushedEntity {
+    state: EntityState,
+    /// `flags & HAS_POSITION`：`state` 里的位置坐标是否可信。
+    has_position: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum EntityState {
     Npc(trit_engine::npc::NpcState),
     Projectile(trit_engine::projectile::ProjectileState),
+}
+
+/// `STATE_PUSH` 玩家表的一行（位置是玩家中心）。
+#[derive(Debug, Clone, Copy)]
+struct PlayerState {
+    slot: u16,
+    position_x: f32,
+    position_y: f32,
+    flags: u8,
 }
 
 /// TritEnginePort 输出的置信度：引擎等价逻辑，不靠历史统计。
@@ -384,6 +406,66 @@ fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Opti
     })
 }
 
+/// 为每个带位置的 NPC 预测「最近的玩家」。
+///
+/// 规则（内核消费者，纯观测用，本轮不写 `npc.target`）：
+/// - 跳过未 `ACTIVE`、已 `DEAD`、`GHOST` 的玩家；
+/// - 按中心平方距离取最小；全体并列时取 slot 小者；
+/// - NPC 无位置（`has_position == false`）或没有可用玩家时不输出。
+///
+/// 输出 `(kind, slot, target_slot)`，由 `ACTION_PLAN` 尾部目标表下发。
+fn predict_targets(
+    entity_states: &[((u8, i32), PushedEntity)],
+    players: &[PlayerState],
+    out: &mut Vec<(u8, i32, i32)>,
+) {
+    use crate::takeover::lane;
+
+    out.clear();
+    if players.is_empty() {
+        return;
+    }
+
+    for &((kind, slot), entity) in entity_states {
+        if kind != lane::KIND_NPC || !entity.has_position {
+            continue;
+        }
+        let EntityState::Npc(npc) = entity.state else {
+            continue;
+        };
+
+        let mut best: Option<(u16, f32)> = None;
+        for player in players {
+            if player.flags & wire::player_flags::ACTIVE == 0
+                || player.flags & (wire::player_flags::DEAD | wire::player_flags::GHOST) != 0
+            {
+                continue;
+            }
+            let dx = npc.position_x - player.position_x;
+            let dy = npc.position_y - player.position_y;
+            let distance_sq = dx * dx + dy * dy;
+            if !distance_sq.is_finite() {
+                continue;
+            }
+            // 更近，或等距但 slot 更小 → 替换；否则保留当前候选。
+            let replace = match best {
+                Some((best_slot, best_distance)) => {
+                    distance_sq < best_distance
+                        || (distance_sq == best_distance && player.slot < best_slot)
+                }
+                None => true,
+            };
+            if replace {
+                best = Some((player.slot, distance_sq));
+            }
+        }
+
+        if let Some((target_slot, _)) = best {
+            out.push((kind, slot, i32::from(target_slot)));
+        }
+    }
+}
+
 /// 双轨预测：TritEnginePort 优先，历史外推兜底。
 ///
 /// - 实体状态表为空（未 push / 托管回退 / 旧原生库）→ 纯历史外推，行为与 Phase 1 一致。
@@ -394,17 +476,22 @@ fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Opti
 ///
 /// `speeds` 收集引擎给出的实体级速度大小（每个实体每 tick 至多一条），
 /// 由 `ACTION_PLAN` 尾部速度表下发 —— 三元车道装不下浮点，故与方向分离。
+/// `targets` 收集带位置 NPC 的最近玩家预测，由 `ACTION_PLAN` 尾部目标表下发。
 fn merge_engine_predictions(
     fork: &crate::takeover::WorldProjectionFork,
-    entity_states: &[((u8, i32), EntityState)],
+    entity_states: &[((u8, i32), PushedEntity)],
+    players: &[PlayerState],
     tick: u64,
     out: &mut Vec<(u32, Ternary, f32)>,
     speeds: &mut Vec<(u8, i32, f32)>,
+    targets: &mut Vec<(u8, i32, i32)>,
 ) {
     use crate::takeover::lane;
 
     out.clear();
     speeds.clear();
+    // 目标预测与引擎是否 port 该 type 无关，先独立算完（也负责清空 targets）。
+    predict_targets(entity_states, players, targets);
     if entity_states.is_empty() {
         fork.predict_all_into(out);
         return;
@@ -433,7 +520,7 @@ fn merge_engine_predictions(
             }
             cached_delta =
                 if cursor < entity_states.len() && entity_states[cursor].0 == (kind, slot) {
-                    let delta = engine_delta(&entity_states[cursor].1, &mut rand);
+                    let delta = engine_delta(&entity_states[cursor].1.state, &mut rand);
                     // 每个实体每 tick 只登记一次速度大小（与方向字段共用同一次步进）。
                     if let Some(magnitude) = delta.and_then(|delta| delta.speed) {
                         speeds.push((kind, slot, magnitude));
@@ -501,11 +588,14 @@ impl TritRuntime {
             takeover_fork,
             entity_states: Vec::new(),
             state_scratch: Vec::new(),
+            players: Vec::new(),
+            players_scratch: Vec::new(),
             parse_buf: Vec::new(),
             batch_buf: Vec::new(),
             resolved_buf: Vec::new(),
             plan_buf: Vec::new(),
             speed_buf: Vec::new(),
+            target_buf: Vec::new(),
         }
     }
 
@@ -642,6 +732,8 @@ impl TritRuntime {
         self.prng = DeterministicPrng::new(0);
         self.entity_states.clear();
         self.state_scratch.clear();
+        self.players.clear();
+        self.players_scratch.clear();
         self.tick = 0;
         self.last_error.clear();
         self.pool.reset_session();
@@ -922,8 +1014,10 @@ impl TritRuntime {
         let Self {
             takeover_fork,
             entity_states,
+            players,
             plan_buf,
             speed_buf,
+            target_buf,
             ..
         } = self;
         let Some(fork) = takeover_fork.as_ref() else {
@@ -931,9 +1025,19 @@ impl TritRuntime {
             w.u32(0);
             return Ok(w.into_vec());
         };
-        merge_engine_predictions(fork, entity_states, tick, plan_buf, speed_buf);
+        merge_engine_predictions(
+            fork,
+            entity_states,
+            players,
+            tick,
+            plan_buf,
+            speed_buf,
+            target_buf,
+        );
 
-        let mut writer = Writer::with_capacity(4 + plan_buf.len() * 9 + 4 + speed_buf.len() * 7);
+        let mut writer = Writer::with_capacity(
+            4 + plan_buf.len() * 9 + 4 + speed_buf.len() * 7 + 4 + target_buf.len() * 5,
+        );
         writer.u32(plan_buf.len() as u32);
         for &(key, trit, conf) in plan_buf.iter() {
             writer.u32(key);
@@ -950,6 +1054,20 @@ impl TritRuntime {
             writer.u16(slot as u16);
             writer.u32(magnitude.to_bits());
         }
+
+        // 尾部目标表（v6 增量，同样向后兼容）：`[kind u8, slot u16, target_slot u16] * n`。
+        // `target_slot == 0xFFFF` 表示无目标；当前实现只输出有目标的实体。
+        writer.u32(target_buf.len() as u32);
+        for &(kind, slot, target_slot) in target_buf.iter() {
+            writer.u8(kind);
+            writer.u16(slot as u16);
+            let encoded = if target_slot < 0 {
+                wire::STATE_NO_TARGET_SLOT
+            } else {
+                (target_slot as u32).min(u16::MAX as u32) as u16
+            };
+            writer.u16(encoded);
+        }
         Ok(writer.into_vec())
     }
 
@@ -965,6 +1083,8 @@ impl TritRuntime {
         // 解析进复用暂存：成功才与当前表交换，非法载荷不破坏旧表。
         let mut scratch = std::mem::take(&mut self.state_scratch);
         scratch.clear();
+        let mut scratch_players = std::mem::take(&mut self.players_scratch);
+        scratch_players.clear();
         let parsed = (|| -> Result<(), RtError> {
             let mut reader = Reader::new(payload);
             let count = reader.u32()? as usize;
@@ -982,6 +1102,8 @@ impl TritRuntime {
                     wire::dequantize_u16(reader.u16()?, wire::STATE_TARGET_DISTANCE_SCALE);
                 let target_dx = wire::dequantize_i16(reader.i16()?, wire::STATE_TARGET_DELTA_SCALE);
                 let target_dy = wire::dequantize_i16(reader.i16()?, wire::STATE_TARGET_DELTA_SCALE);
+                let position_x = wire::dequantize_i32(reader.i32()?, wire::STATE_POSITION_SCALE);
+                let position_y = wire::dequantize_i32(reader.i32()?, wire::STATE_POSITION_SCALE);
 
                 // ai_mask 的每个置位对应一个 i16 值；未置位表示该槽为 0。
                 let ai_mask = reader.u8()?;
@@ -996,6 +1118,7 @@ impl TritRuntime {
                 let tile_below = flags & wire::state_flags::TILE_BELOW != 0;
                 let active = flags & wire::state_flags::ACTIVE != 0;
                 let has_target = flags & wire::state_flags::HAS_TARGET != 0;
+                let has_position = flags & wire::state_flags::HAS_POSITION != 0;
 
                 let state = match kind {
                     crate::takeover::lane::KIND_NPC => {
@@ -1003,8 +1126,8 @@ impl TritRuntime {
                             npc_type: entity_type,
                             velocity_x,
                             velocity_y,
-                            position_x: 0.0,
-                            position_y: 0.0,
+                            position_x,
+                            position_y,
                             direction,
                             life: 0,
                             life_max: 0,
@@ -1023,8 +1146,8 @@ impl TritRuntime {
                             proj_type: entity_type,
                             velocity_x,
                             velocity_y,
-                            position_x: 0.0,
-                            position_y: 0.0,
+                            position_x,
+                            position_y,
                             direction,
                             ai: [ai[0], ai[1]],
                             active,
@@ -1038,7 +1161,33 @@ impl TritRuntime {
                     // Player 等种类暂不参与引擎（字段语义不同），整条忽略。
                     _ => continue,
                 };
-                scratch.push(((kind, slot), state));
+                scratch.push((
+                    (kind, slot),
+                    PushedEntity {
+                        state,
+                        has_position,
+                    },
+                ));
+            }
+
+            // 玩家表（v6）：整批替换；缺失视为空表（内核不预测目标）。
+            if !reader.is_empty() {
+                let player_count = reader.u32()? as usize;
+                scratch_players.reserve(player_count.min(1024));
+                for _ in 0..player_count {
+                    let slot = reader.u16()?;
+                    let position_x =
+                        wire::dequantize_i32(reader.i32()?, wire::STATE_POSITION_SCALE);
+                    let position_y =
+                        wire::dequantize_i32(reader.i32()?, wire::STATE_POSITION_SCALE);
+                    let flags = reader.u8()?;
+                    scratch_players.push(PlayerState {
+                        slot,
+                        position_x,
+                        position_y,
+                        flags,
+                    });
+                }
             }
 
             if !reader.is_empty() {
@@ -1072,18 +1221,22 @@ impl TritRuntime {
                 }
                 scratch.truncate(write);
                 std::mem::swap(&mut self.entity_states, &mut scratch);
+                std::mem::swap(&mut self.players, &mut scratch_players);
                 self.state_scratch = scratch;
+                self.players_scratch = scratch_players;
                 Ok(Vec::new())
             }
             // 截断统一归类为 InvalidInput，方便 C# 侧区分「载荷非法」与其它解码错误。
             Err(RtError::Decode(message)) => {
                 self.state_scratch = scratch;
+                self.players_scratch = scratch_players;
                 Err(RtError::InvalidInput(format!(
                     "STATE_PUSH 载荷截断：{message}"
                 )))
             }
             Err(error) => {
                 self.state_scratch = scratch;
+                self.players_scratch = scratch_players;
                 Err(error)
             }
         }
@@ -2116,12 +2269,12 @@ mod tests {
         TritRuntime::new(config)
     }
 
-    /// 造一条 STATE_PUSH 记录（定长 20 字节 + 0 个 ai 值）。
+    /// 造一条 STATE_PUSH 记录（定长 28 字节 + 0 个 ai 值）。
     fn state_record(kind: u8, slot: i32, entity_type: i32, direction: i32) -> Vec<u8> {
         state_record_steering(kind, slot, entity_type, direction, 0.0, 0.0)
     }
 
-    /// 同上，附带目标偏移（`target_dx / target_dy`）。
+    /// 同上，附带目标偏移（`target_dx / target_dy`）；不带位置。
     fn state_record_steering(
         kind: u8,
         slot: i32,
@@ -2130,6 +2283,32 @@ mod tests {
         target_dx: f32,
         target_dy: f32,
     ) -> Vec<u8> {
+        state_record_full(
+            kind,
+            slot,
+            entity_type,
+            direction,
+            target_dx,
+            target_dy,
+            0.0,
+            0.0,
+            false,
+        )
+    }
+
+    /// 完整记录：目标偏移 + 中心位置（`has_position` 控制 `HAS_POSITION` 标志）。
+    #[allow(clippy::too_many_arguments)]
+    fn state_record_full(
+        kind: u8,
+        slot: i32,
+        entity_type: i32,
+        direction: i32,
+        target_dx: f32,
+        target_dy: f32,
+        position_x: f32,
+        position_y: f32,
+        has_position: bool,
+    ) -> Vec<u8> {
         let mut w = Writer::new();
         w.u8(kind);
         w.u16(slot as u16);
@@ -2137,10 +2316,14 @@ mod tests {
         w.i16(wire::quantize_i16(1.0, wire::STATE_VELOCITY_SCALE)); // velocity_x
         w.i16(0); // velocity_y
         w.i8(direction as i8);
-        w.u8(wire::state_flags::ON_GROUND
+        let mut flags = wire::state_flags::ON_GROUND
             | wire::state_flags::TILE_BELOW
             | wire::state_flags::ACTIVE
-            | wire::state_flags::HAS_TARGET);
+            | wire::state_flags::HAS_TARGET;
+        if has_position {
+            flags |= wire::state_flags::HAS_POSITION;
+        }
+        w.u8(flags);
         w.i16(wire::quantize_i16(2.0, wire::STATE_WALK_SPEED_SCALE)); // walk_speed
         w.u16(wire::quantize_u16(300.0, wire::STATE_TARGET_DISTANCE_SCALE)); // target_distance
         w.i16(wire::quantize_i16(
@@ -2151,7 +2334,19 @@ mod tests {
             target_dy,
             wire::STATE_TARGET_DELTA_SCALE,
         ));
+        w.i32((position_x * wire::STATE_POSITION_SCALE).round() as i32);
+        w.i32((position_y * wire::STATE_POSITION_SCALE).round() as i32);
         w.u8(0); // ai_mask：本次没有非零 ai
+        w.into_vec()
+    }
+
+    /// 造一条玩家表记录：`slot u16, pos_x i32, pos_y i32, flags u8`。
+    fn player_record(slot: u16, position_x: f32, position_y: f32, flags: u8) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u16(slot);
+        w.i32((position_x * wire::STATE_POSITION_SCALE).round() as i32);
+        w.i32((position_y * wire::STATE_POSITION_SCALE).round() as i32);
+        w.u8(flags);
         w.into_vec()
     }
 
@@ -2200,6 +2395,39 @@ mod tests {
             preds.push((key, delta, conf));
         }
         preds
+    }
+
+    /// 解析 ACTION_PLAN 尾部目标表（`[kind u8, slot u16, target_slot u16] * n`）。
+    fn read_action_plan_targets(out: &[u8]) -> Vec<(u8, i32, i32)> {
+        if out.len() < 4 {
+            return Vec::new();
+        }
+        let count = u32::from_le_bytes(out[..4].try_into().unwrap()) as usize;
+        let mut offset = 4 + count * 9;
+        if out.len() < offset + 4 {
+            return Vec::new();
+        }
+        let magnitude_count =
+            u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4 + magnitude_count * 7;
+        if out.len() < offset + 4 {
+            return Vec::new();
+        }
+        let n = u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if out.len() < offset + n * 5 {
+            return Vec::new();
+        }
+        (0..n)
+            .map(|index| {
+                let base = offset + index * 5;
+                (
+                    out[base],
+                    u16::from_le_bytes([out[base + 1], out[base + 2]]) as i32,
+                    u16::from_le_bytes([out[base + 3], out[base + 4]]) as i32,
+                )
+            })
+            .collect()
     }
 
     /// L0（无 fork）必须整包吞掉 STATE_PUSH：不解析、不建表、不报错。
@@ -2403,5 +2631,54 @@ mod tests {
                 "type {npc_type} 不应下发速度大小"
             );
         }
+    }
+
+    /// 内核对带位置的 NPC 预测「最近的活跃玩家」：跳过死亡 / 幽灵，
+    /// 距离相同取 slot 小者，结果写进 ACTION_PLAN 尾部目标表。
+    #[test]
+    fn predicts_nearest_active_player_for_positioned_npc() {
+        let mut rt = takeover_runtime();
+        let push = {
+            let mut w = Writer::new();
+            w.u32(1);
+            w.bytes(&state_record_full(1, 0, 3, 1, 0.0, 0.0, 0.0, 0.0, true));
+            // slot0 远、slot1 近、slot2 更近但已死亡、slot3 与 slot1 等距。
+            w.u32(4);
+            w.bytes(&player_record(0, 1000.0, 0.0, wire::player_flags::ACTIVE));
+            w.bytes(&player_record(1, 50.0, 0.0, wire::player_flags::ACTIVE));
+            w.bytes(&player_record(
+                2,
+                10.0,
+                0.0,
+                wire::player_flags::ACTIVE | wire::player_flags::DEAD,
+            ));
+            w.bytes(&player_record(3, -50.0, 0.0, wire::player_flags::ACTIVE));
+            w.into_vec()
+        };
+        rt.dispatch(op::STATE_PUSH, &push).unwrap();
+
+        let targets = read_action_plan_targets(&rt.dispatch(op::ACTION_PLAN, b"").unwrap());
+        assert_eq!(
+            targets,
+            vec![(crate::takeover::lane::KIND_NPC, 0, 1)],
+            "应取最近的活跃玩家，等距时取 slot 小者"
+        );
+    }
+
+    /// 没有 `HAS_POSITION` 的 NPC 不参与目标预测（0.0 不能当原点）。
+    #[test]
+    fn no_target_prediction_without_position_flag() {
+        let mut rt = takeover_runtime();
+        let push = {
+            let mut w = Writer::new();
+            w.u32(1);
+            w.bytes(&state_record(1, 0, 3, 1));
+            w.u32(1);
+            w.bytes(&player_record(0, 0.0, 0.0, wire::player_flags::ACTIVE));
+            w.into_vec()
+        };
+        rt.dispatch(op::STATE_PUSH, &push).unwrap();
+
+        assert!(read_action_plan_targets(&rt.dispatch(op::ACTION_PLAN, b"").unwrap()).is_empty());
     }
 }

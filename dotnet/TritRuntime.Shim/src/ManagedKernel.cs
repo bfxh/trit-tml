@@ -949,10 +949,12 @@ public sealed class ManagedKernel : ITritKernel
     /// </summary>
     public void ReadActionPlanInto(
         List<(uint Key, byte Delta, float Confidence)> buffer,
-        List<(byte Kind, int Slot, float Magnitude)>? speeds = null)
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null,
+        List<(byte Kind, int Slot, int TargetSlot)>? targets = null)
     {
         buffer.Clear();
         speeds?.Clear();
+        targets?.Clear();
     }
 
     /// <summary>查询。</summary>

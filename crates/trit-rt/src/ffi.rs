@@ -28,7 +28,11 @@ use crate::wire::{Writer, op};
 ///
 /// v5：`STATE_PUSH` 记录新增 `target_dx / target_dy`（定长 16 → 20 B），
 /// 让引擎能算追踪方向。v4 的 DLL 会按旧布局整体错位解析，必须递增版本挡下。
-pub const ABI_VERSION: u32 = 5;
+///
+/// v6：`STATE_PUSH` 记录新增 `pos_x / pos_y`（定长 20 → 28 B，i32 ×2），
+/// 载荷尾部追加玩家表；`ACTION_PLAN` 尾部追加目标表。v5 的 DLL 会按旧布局
+/// 整体错位解析，必须递增版本挡下。
+pub const ABI_VERSION: u32 = 6;
 
 /// 运行时版本：`0x00_MM_mm_pp`（0.1.0）。
 pub const RUNTIME_VERSION: u32 = 0x00_01_00_00;
@@ -620,7 +624,8 @@ pub unsafe extern "C" fn tt_rt_action_plan(handle: u64, out: *mut u8, cap: usize
 
 /// `0x20 STATE_PUSH`：整批推送实体状态（TritEnginePort 的输入）。
 ///
-/// 载荷：`count u32, [变长记录] * n`（见 `wire::STATE_RECORD_FIXED_LEN`）。
+/// 载荷：`count u32, [变长记录] * n, player_count u32, [玩家记录] * m`
+/// （见 `wire::STATE_RECORD_FIXED_LEN`、`wire::STATE_PLAYER_RECORD_LEN`）。
 ///
 /// 返回值：
 /// - `0` 全部 OK（包括 L0 零开销降级 —— 载荷被吞掉）

@@ -313,6 +313,29 @@ public enum StateFlags : byte
 
     /// <summary>NPC 有目标（引擎只判符号）。</summary>
     HasTarget = 1 << 3,
+
+    /// <summary>实体 <c>PositionX</c> / <c>PositionY</c> 有效。</summary>
+    HasPosition = 1 << 4,
+}
+
+/// <summary>STATE_PUSH 玩家表里的标志位，与 Rust <c>wire::player_flags</c> 一致。</summary>
+[Flags]
+public enum StatePlayerFlags : byte
+{
+    /// <summary>无。</summary>
+    None = 0,
+
+    /// <summary>玩家在线。</summary>
+    Active = 1 << 0,
+
+    /// <summary>玩家已死亡。</summary>
+    Dead = 1 << 1,
+
+    /// <summary>玩家处于幽灵/半透明状态。</summary>
+    Ghost = 1 << 2,
+
+    /// <summary>玩家处于无敌帧。</summary>
+    Immune = 1 << 3,
 }
 
 /// <summary>线格式读写器：小端整数 + 5 trits/byte 打包体（与 Rust trit-codec 逐字节一致）。</summary>
@@ -327,10 +350,14 @@ public static class Wire
     /// <summary>
     /// STATE_PUSH 单条实体状态记录的<b>定长部分</b>，与 Rust <c>wire::STATE_RECORD_FIXED_LEN</c> 一致：
     /// <c>kind u8(1) + slot u16(2) + type u16(2) + vel_x/vel_y i16(4) + dir i8(1) + flags u8(1)
-    /// + walk_speed i16(2) + target_distance u16(2) + target_dx/target_dy i16(4) + ai_mask u8(1) = 20</c>。
+    /// + walk_speed i16(2) + target_distance u16(2) + target_dx/target_dy i16(4)
+    /// + pos_x/pos_y i32(8) + ai_mask u8(1) = 28</c>。
     /// 每个非零 ai 槽再加一个 <c>i16</c>。
     /// </summary>
-    public const int StateRecordFixedLength = 20;
+    public const int StateRecordFixedLength = 28;
+
+    /// <summary>玩家表单条记录长度：<c>slot u16 + pos_x i32 + pos_y i32 + flags u8</c>。</summary>
+    public const int StatePlayerRecordLength = 11;
 
     /// <summary>ai 槽数量（<c>ai_mask</c> 的位宽）。</summary>
     public const int StateAiSlots = 8;
@@ -349,6 +376,9 @@ public static class Wire
 
     /// <summary>target_dx / target_dy 量化比例（<c>q = round(v * 4)</c>，i16 约 ±8191 px）。</summary>
     public const float StateTargetDeltaScale = 4f;
+
+    /// <summary>pos_x / pos_y 量化比例（<c>q = round(v * 16)</c>，i32 约 ±1.34 亿 px）。</summary>
+    public const float StatePositionScale = 16f;
 
     /// <summary>量化到 <see cref="short"/>（四舍五入 + 饱和；NaN → 0），与 Rust <c>quantize_i16</c> 一致。</summary>
     public static short QuantizeI16(float value, float scale)
@@ -374,6 +404,20 @@ public static class Wire
         }
 
         return scaled >= ushort.MaxValue ? ushort.MaxValue : (ushort)scaled;
+    }
+
+    /// <summary>量化到 <see cref="int"/>（四舍五入 + 饱和；NaN → 0），与 Rust <c>quantize_i32</c> 一致。</summary>
+    public static int QuantizeI32(float value, float scale)
+    {
+        float scaled = MathF.Round(value * scale, MidpointRounding.AwayFromZero);
+        if (float.IsNaN(scaled))
+        {
+            return 0;
+        }
+
+        return scaled >= int.MaxValue ? int.MaxValue
+            : scaled <= int.MinValue ? int.MinValue
+            : (int)scaled;
     }
 
     /// <summary>把 trit 序列打包成字节；最后不足 5 个的低位补 Neg（解码时按长度截断）。</summary>

@@ -93,29 +93,35 @@ public static class KernelResponseMapper
     /// <summary>
     /// ACTION_PLAN 载荷 → <c>(key, delta, confidence)</c>，原地填进调用方缓冲。
     /// 布局：<c>count u32, [key u32, delta u8, confidence f32] * n</c>，
-    /// 之后是**可选**速度表 <c>mag_count u32, [kind u8, slot u16, magnitude f32] * m</c>。
+    /// 之后是**可选**速度表 <c>mag_count u32, [kind u8, slot u16, magnitude f32] * m</c>，
+    /// 再之后是**可选**目标表 <c>target_count u32, [kind u8, slot u16, target_slot u16] * t</c>
+    /// （<c>target_slot == 0xFFFF</c> = 无目标）。
     /// </summary>
     /// <remarks>
     /// 与 <see cref="ToStepResult"/> 不同，这里吃 <see cref="ReadOnlySpan{T}"/>：
     /// 原生内核直接把输出缓冲里的切片传进来，省掉「整包响应复制成新数组」——
     /// 万级 intent 时那一份就是约 100 KB，而且每 tick 一次（直接进 LOH）。
     /// 校验/降级规则与旧的 <c>GetActionPlan</c> 解码完全一致：坏载荷只清空 buffer，不抛异常。
+    /// 两张尾部表都是可选增量：旧 DLL 不写、新客户端视为空表。
     /// </remarks>
     public static void ToActionPlanInto(
         ReadOnlySpan<byte> payload,
         List<(uint Key, byte Delta, float Confidence)> buffer,
-        List<(byte Kind, int Slot, float Magnitude)>? speeds = null)
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null,
+        List<(byte Kind, int Slot, int TargetSlot)>? targets = null)
     {
         buffer.Clear();
         speeds?.Clear();
+        targets?.Clear();
         if (payload.Length < 4)
         {
             return;
         }
 
         // count 是 i32：坏载荷给负数时按「空」处理（与旧解码一致）。
+        // count == 0 仍要继续读尾部表（目标预测可能没有 intent 但仍有目标）。
         int count = BinaryPrimitives.ReadInt32LittleEndian(payload);
-        if (count <= 0)
+        if (count < 0)
         {
             return;
         }
@@ -126,23 +132,21 @@ public static class KernelResponseMapper
             return;
         }
 
-        if (buffer.Capacity < count)
+        if (count > 0)
         {
-            buffer.Capacity = count;
-        }
+            if (buffer.Capacity < count)
+            {
+                buffer.Capacity = count;
+            }
 
-        for (int i = 0; i < count; i++)
-        {
-            int offset = 4 + (i * 9);
-            buffer.Add((
-                BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(offset, 4)),
-                payload[offset + 4],
-                BinaryPrimitives.ReadSingleLittleEndian(payload.Slice(offset + 5, 4))));
-        }
-
-        if (speeds is null)
-        {
-            return;
+            for (int i = 0; i < count; i++)
+            {
+                int offset = 4 + (i * 9);
+                buffer.Add((
+                    BinaryPrimitives.ReadUInt32LittleEndian(payload.Slice(offset, 4)),
+                    payload[offset + 4],
+                    BinaryPrimitives.ReadSingleLittleEndian(payload.Slice(offset + 5, 4))));
+            }
         }
 
         // 可选尾部速度表：旧 DLL 没有这一段（长度不够），视为无表；
@@ -154,23 +158,58 @@ public static class KernelResponseMapper
         }
 
         int magnitudeCount = BinaryPrimitives.ReadInt32LittleEndian(payload.Slice((int)tail, 4));
-        if (magnitudeCount <= 0 || payload.Length < tail + 4 + (magnitudeCount * 7L))
+        if (magnitudeCount < 0 || payload.Length < tail + 4 + (magnitudeCount * 7L))
         {
             return;
         }
 
-        if (speeds.Capacity < magnitudeCount)
+        if (speeds is not null && magnitudeCount > 0)
         {
-            speeds.Capacity = magnitudeCount;
+            if (speeds.Capacity < magnitudeCount)
+            {
+                speeds.Capacity = magnitudeCount;
+            }
+
+            for (int i = 0; i < magnitudeCount; i++)
+            {
+                int offset = (int)tail + 4 + (i * 7);
+                speeds.Add((
+                    payload[offset],
+                    BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(offset + 1, 2)),
+                    BinaryPrimitives.ReadSingleLittleEndian(payload.Slice(offset + 3, 4))));
+            }
         }
 
-        for (int i = 0; i < magnitudeCount; i++)
+        if (targets is null)
         {
-            int offset = (int)tail + 4 + (i * 7);
-            speeds.Add((
+            return;
+        }
+
+        // 可选尾部目标表（v6）：速度表之后。旧 DLL 没有这一段，视为无表。
+        long targetTail = tail + 4 + (magnitudeCount * 7L);
+        if (payload.Length < targetTail + 4)
+        {
+            return;
+        }
+
+        int targetCount = BinaryPrimitives.ReadInt32LittleEndian(payload.Slice((int)targetTail, 4));
+        if (targetCount < 0 || payload.Length < targetTail + 4 + (targetCount * 5L))
+        {
+            return;
+        }
+
+        if (targets.Capacity < targetCount)
+        {
+            targets.Capacity = targetCount;
+        }
+
+        for (int i = 0; i < targetCount; i++)
+        {
+            int offset = (int)targetTail + 4 + (i * 5);
+            targets.Add((
                 payload[offset],
                 BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(offset + 1, 2)),
-                BinaryPrimitives.ReadSingleLittleEndian(payload.Slice(offset + 3, 4))));
+                BinaryPrimitives.ReadUInt16LittleEndian(payload.Slice(offset + 3, 2))));
         }
     }
 

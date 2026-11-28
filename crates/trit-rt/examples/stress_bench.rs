@@ -110,10 +110,14 @@ fn arg(args: &[String], name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// 构造一整批 `STATE_PUSH` 载荷（NPC + 弹幕，按 `(kind, slot)` 升序，
+/// 构造一整批 `STATE_PUSH` 载荷（NPC + 弹幕 + 玩家表，按 `(kind, slot)` 升序，
 /// 与 mod 的采样顺序一致）。
-fn build_states_payload(npcs: usize, projectiles: usize) -> Vec<u8> {
-    let mut writer = Writer::with_capacity(4 + (npcs + projectiles) * wire::STATE_RECORD_FIXED_LEN);
+fn build_states_payload(npcs: usize, projectiles: usize, players: usize) -> Vec<u8> {
+    let mut writer = Writer::with_capacity(
+        4 + ((npcs + projectiles) * wire::STATE_RECORD_FIXED_LEN)
+            + 4
+            + (players * wire::STATE_PLAYER_RECORD_LEN),
+    );
     writer.u32((npcs + projectiles) as u32);
     for slot in 0..npcs {
         push_state_record(&mut writer, 1, slot as u16, 3);
@@ -121,10 +125,23 @@ fn build_states_payload(npcs: usize, projectiles: usize) -> Vec<u8> {
     for slot in 0..projectiles {
         push_state_record(&mut writer, 2, slot as u16, 1);
     }
+
+    // 玩家表：均匀分布，覆盖最近玩家预测分支。
+    writer.u32(players as u32);
+    for slot in 0..players {
+        writer
+            .u16(slot as u16)
+            .i32(wire::quantize_i32(
+                (slot as f32 * 640.0) - 960.0,
+                wire::STATE_POSITION_SCALE,
+            ))
+            .i32(0)
+            .u8(wire::player_flags::ACTIVE);
+    }
     writer.into_vec()
 }
 
-/// 写一条 20 字节定长状态记录（ai_mask = 0，不带变长 ai 值）。
+/// 写一条 28 字节定长状态记录（ai_mask = 0，不带变长 ai 值）。
 fn push_state_record(writer: &mut Writer, kind: u8, slot: u16, entity_type: u16) {
     writer
         .u8(kind)
@@ -136,7 +153,8 @@ fn push_state_record(writer: &mut Writer, kind: u8, slot: u16, entity_type: u16)
         .u8(wire::state_flags::ON_GROUND
             | wire::state_flags::TILE_BELOW
             | wire::state_flags::ACTIVE
-            | wire::state_flags::HAS_TARGET)
+            | wire::state_flags::HAS_TARGET
+            | wire::state_flags::HAS_POSITION)
         .i16(wire::quantize_i16(2.0, wire::STATE_WALK_SPEED_SCALE))
         .u16(wire::quantize_u16(300.0, wire::STATE_TARGET_DISTANCE_SCALE))
         // 目标向量：交替左右，覆盖「按偏移转向」的解析分支。
@@ -145,6 +163,12 @@ fn push_state_record(writer: &mut Writer, kind: u8, slot: u16, entity_type: u16)
             wire::STATE_TARGET_DELTA_SCALE,
         ))
         .i16(0)
+        // 实体中心：沿 x 轴错开，让「最近玩家」有区分度。
+        .i32(wire::quantize_i32(
+            slot as f32 * 32.0,
+            wire::STATE_POSITION_SCALE,
+        ))
+        .i32(0)
         .u8(0);
 }
 
@@ -180,7 +204,7 @@ fn main() {
     }
     let mut runtime = TritRuntime::new(config);
     let states_payload = if takeover {
-        build_states_payload(npcs, projectiles)
+        build_states_payload(npcs, projectiles, players)
     } else {
         Vec::new()
     };

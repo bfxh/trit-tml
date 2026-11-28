@@ -318,6 +318,10 @@ public sealed class TritCommand : ModCommand
             $"KernelFirst={stats.TotalKernelFirst}（垂直 {stats.TotalVertical} / 回退 {stats.TotalVerticalFallbacks}）",
             Color.Gray);
         Say(caller, "  " + DescribeVerticalModel(stats), Color.Gray);
+        Say(caller,
+            $"  目标预测：本 tick {stats.TickTargetHits}/{stats.TickTargetSamples} " +
+            $"累计 {stats.TotalTargetHits}/{stats.TotalTargetSamples} 命中率={stats.TargetHitRate:P1}",
+            Color.Gray);
         Say(caller, "  " + (mod.AutoPilot?.Describe() ?? "自动档=未装载"), Color.Gray);
     }
 

@@ -6,7 +6,7 @@
 `out` 前 8 字节（要求 `cap >= 8`）并回 `TT_ERR_BUFFER`，调用方扩容后重试即可。
 成功时响应统一装框 `[u32 payload_len][payload]`。
 
-- `ABI_VERSION = 5`（v2 并行任务池 / GPU / 全局预算；v3 批量事务；v4 `STATE_PUSH` 量化变长记录；v5 新增目标偏移）
+- `ABI_VERSION = 6`（v2 并行任务池 / GPU / 全局预算；v3 批量事务；v4 `STATE_PUSH` 量化变长记录；v5 新增目标偏移；v6 新增位置与玩家表）
 - `RUNTIME_VERSION = 0x00_01_00_00`
 
 ## 状态码
@@ -42,6 +42,7 @@
 | **v3** | 新增 `0x1A TXN_SUBMIT_BATCH`；C# 壳每 tick 都依赖它，故版本号必须递增——v2 的 DLL 与本壳混装时每次批量提交都会拿到 `TT_ERR_BAD_OP`，表现为「模组每 tick 失败、钩子被熔断」。壳在装载期就比对版本，不符直接退回托管内核（功能完整，只是慢）。`0x1B SESSION_RESET` 同属 v3，但它是**可选**操作，没有为它单独递增版本。 |
 | **v4** | `0x20 STATE_PUSH` 改为量化变长记录（16 B 定长 + 每个非零 ai 槽 2 B）。旧 DLL 会把新载荷当 83 B 定长解析，必须由壳在装载期挡下。 |
 | **v5** | `0x20 STATE_PUSH` 记录新增 `target_dx / target_dy`（定长 16 → 20 B），引擎据此算追踪朝向。v4 的 DLL 会按旧布局整体错位解析，必须由壳在装载期挡下。 |
+| **v6** | `0x20 STATE_PUSH` 记录新增 `pos_x / pos_y`（定长 20 → 28 B，i32 ×2），载荷尾部追加玩家表；`0x1F ACTION_PLAN` 尾部追加目标表。v5 的 DLL 会按旧布局整体错位解析，必须由壳在装载期挡下。 |
 
 ## opcode 表
 
@@ -59,8 +60,8 @@
 | `0x1C` | `TXN_APPLY` | 二进制 `count u32, [key u32, delta u8] * n` | 二进制 `applied u32, log_seq u64` |
 | `0x1D` | `PREDICTIONS` | 空 | 二进制 `count u32, [key u32, delta u8] * n` |
 | `0x1E` | `CONSISTENCY_RECORD` | 二进制 `count u32, [key u32, consistent u8] * n` | 空 |
-| `0x1F` | `ACTION_PLAN` | 空 | 二进制 `count u32, [key u32, delta u8, confidence f32] * n` + 可选速度表（见下） |
-| `0x20` | `STATE_PUSH` | 二进制 `count u32, [变长记录] * n`（见下） | 空 |
+| `0x1F` | `ACTION_PLAN` | 空 | 二进制 `count u32, [key u32, delta u8, confidence f32] * n` + 可选速度表 + 可选目标表（见下） |
+| `0x20` | `STATE_PUSH` | 二进制 `count u32, [变长记录] * n, player_count u32, [玩家记录] * m`（见下） | 空 |
 
 ### `0x1F ACTION_PLAN`
 
@@ -69,6 +70,8 @@ count u32
 [key u32, delta u8, confidence f32(IEEE754)] * count
 mag_count u32                                   # 可选速度表
 [kind u8, slot u16, magnitude f32(IEEE754)] * mag_count
+target_count u32                                # 可选目标表（v6）
+[kind u8, slot u16, target_slot u16] * target_count
 ```
 
 - `delta`：`1` = Neg、`2` = Pos、`0` = 弃权（不构成方向命令）。
@@ -76,8 +79,13 @@ mag_count u32                                   # 可选速度表
 - **速度表是可选增量**（Phase 2 追加）：车道值只有三值，装不下 `speed_magnitude` 的浮点值，
   故按实体（`kind` + `slot`）单独下发。只有「水平速度就是移动速度」的地面家族
   （史莱姆起跳 / 僵尸地面追击）会出现在表里；飞行家族与弹幕不下发。
+- **目标表是可选增量**（v6 追加）：内核按 `STATE_PUSH` 里的实体位置与玩家表，
+  为每个带位置的 NPC 预测「最近的玩家」（跳过未 active / 死亡 / 幽灵，等距取 slot 小者）。
+  `target_slot == 0xFFFF` 表示无目标；当前实现只输出有目标的实体。
+  本阶段消费端只做对拍统计，**不写 `npc.target`**。
 - 兼容性：旧客户端只按 `count * 9` 读 intent，忽略尾部；旧内核不写该段，新客户端视为无表。
-  因此**不递增 ABI 版本**。消费端只在 KernelFirst（ReplaceOrig）写 `velocity.X` 时使用它。
+  目标表同理，旧客户端停在速度表之后就不会再读。两张尾部表因此**不单独递增 ABI**。
+  消费端只在 KernelFirst（ReplaceOrig）写 `velocity.X` 时使用速度表。
 - 只对 **NPC** 生效：`Projectile.Update` 自带位置积分 / 重力 / 碰撞 / `timeLeft`，
   跳过它会让弹幕原地悬停，所以弹幕 intent 只参与对拍与方向门，不做 KernelFirst。
 - 消费端 KernelFirst（ReplaceOrig）的取舍规则，全部在写字段之前判定，
@@ -99,20 +107,26 @@ mag_count u32                                   # 可选速度表
   - **连续接管最多 4 tick**：`NPC.AI` 里的 `ai[]` 计时器 / 帧动画 / 目标选择不会自己
     前进，到点必须跑一次原版把状态推进一步，同时给垂直模型一次真实观测。终端速度
     这类本地学不到的非线性钳制，误差最多累积到这次回检（≤ 3 个 Δ）。
-  - 上述学习与门禁全在消费端，`ACTION_PLAN` / `STATE_PUSH` 的字段布局不变。
+  - 上述学习与门禁全在消费端；位置 / 玩家表 / 目标表由 v6 单独定义（见 `0x20` / `0x1F`）。
 
-### `0x20 STATE_PUSH`（v3，ABI 5）
+### `0x20 STATE_PUSH`（v6，ABI 6）
 
 每条记录：`kind u8 | slot u16 | type u16 | vel_x i16 | vel_y i16 | dir i8 | flags u8 |
-walk_speed i16 | target_distance u16 | target_dx i16 | target_dy i16 | ai_mask u8 |
-ai_q i16 × popcount(ai_mask)`。
+walk_speed i16 | target_distance u16 | target_dx i16 | target_dy i16 |
+pos_x i32 | pos_y i32 | ai_mask u8 | ai_q i16 × popcount(ai_mask)`。
 
-- 定长部分 **20 B**，常见 2 个非零 ai 槽 → **24 B**（旧版 83 B，v4 为 20 B）。
-- 量化：velocity / walk_speed `×256`，ai `×16`，target_distance `×4`，target_dx / target_dy `×4`；均为四舍五入 + 饱和。
+- 定长部分 **28 B**，常见 2 个非零 ai 槽 → **32 B**（v5 为 24 B）。
+- 量化：velocity / walk_speed `×256`，ai `×16`，target_distance `×4`，target_dx / target_dy `×4`，
+  pos_x / pos_y `×16`；均为四舍五入 + 饱和（位置是 i32，约 ±1.34 亿 px）。
 - `target_dx / target_dy` = `实体中心 - 目标中心`（像素，i16 约 ±8191 px）；无目标时写 0。
-- `flags`：bit0 `on_ground`、bit1 `tile_below`、bit2 `active`（Projectile）、bit3 `has_target`。
-- 位置、life、life_max、target 槽值、ai[2..7] 引擎不消费，不传输。
-- 整批替换上一 tick 的状态表；截断或多余字节返回 `TT_ERR_ARG` 且不改动已有表。
+- `pos_x / pos_y` = **实体中心**坐标；仅当 `flags` bit4 `has_position` 置位时有效。
+- `flags`：bit0 `on_ground`、bit1 `tile_below`、bit2 `active`（Projectile）、bit3 `has_target`、
+  bit4 `has_position`。
+- 玩家表（v6，整批替换）：`player_count u32, [slot u16 | pos_x i32 | pos_y i32 | flags u8] * m`。
+  位置是玩家**中心**，量化同 `×16`；flags：bit0 active、bit1 dead、bit2 ghost、bit3 immune。
+  缺失（载荷恰好结束于记录之后）视为空表。
+- life、life_max、target 槽值、ai[2..7] 引擎不消费，不传输。
+- 整批替换上一 tick 的状态表与玩家表；截断或多余字节返回 `TT_ERR_ARG` 且不改动已有表。
 - 内核未启用 takeover 时忽略载荷，零开销。
 
 > v2 新增的 6 个 opcode 一律用 **UTF-8 JSON**（既有 opcode 保持二进制不变，避免破坏兼容）。

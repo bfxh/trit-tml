@@ -409,7 +409,13 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
   跳过 orig 的两条硬约束：①写入必须真的改变字段（否则只剩副作用，直接交回原版，
   例如地面史莱姆只输出当前朝向）；②连续接管最多 4 tick —— `ai[]` 计时器、帧动画、
   目标选择都活在被跳过的 `NPC.AI` 里，到点必须跑一次原版推进状态，同时给垂直模型
-  一组真实观测（终端速度这类非线性钳制的误差最多累积 3 个 Δ）。协议字段不变，不升 ABI。
+  一组真实观测（终端速度这类非线性钳制的误差最多累积 3 个 Δ）。
+- 目标预测消费（v6，观测口径）：`STATE_PUSH` 记录带上实体中心坐标（i32 ×16，
+  `has_position` 门控），载荷尾部追加玩家表（slot / 中心 / active·dead·ghost·immune）；
+  内核为每个带位置的 NPC 取「最近的活跃玩家」（跳过死亡 / 幽灵，等距取 slot 小者），
+  经 `ACTION_PLAN` 尾部目标表下发（`kind u8, slot u16, target_slot u16`，`0xFFFF` = 无目标）。
+  本阶段 C# 只在 orig 之后把内核 target 与 `npc.target` 对拍，累计样本 / 命中率进
+  `/trit takeover stats` 与周期日志，**不写 `npc.target`**（避免假覆盖）。
 - 历史修正：早期注释凭记忆写错过编号（把 4 当成 Eye of Cthulhu、10 当成 Giant Worm Head；
   实际 4 = Unholy Arrow、10 = Purification Powder，已在 `Projectile_IDs` 页核对），
   现已改为「只登记真正有实现分支的类型」，并由 `every_ported_type_has_a_branch` 测试锁定。

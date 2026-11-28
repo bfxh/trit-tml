@@ -111,10 +111,13 @@ public interface ITritKernel : IDisposable
     ///
     /// <paramref name="speeds"/> 非空时额外接收引擎给出的实体级速度大小
     /// （`ACTION_PLAN` 尾部可选表，旧 DLL 缺失则为空）。
+    /// <paramref name="targets"/> 非空时额外接收内核预测的 NPC 目标槽
+    /// （`ACTION_PLAN` 尾部可选表，旧 DLL 缺失则为空）。
     /// </remarks>
     void ReadActionPlanInto(
         List<(uint Key, byte Delta, float Confidence)> buffer,
-        List<(byte Kind, int Slot, float Magnitude)>? speeds = null);
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null,
+        List<(byte Kind, int Slot, int TargetSlot)>? targets = null);
 
     /// <summary>查询。</summary>
     KernelResponse Query(byte[] query);

@@ -478,11 +478,13 @@ public sealed class RuntimeShim : IDisposable
     /// 原生内核走「从输出缓冲直接解析」的路径（<see cref="ITritKernel.ReadActionPlanInto"/>），
     /// 不再把整包响应复制成新数组：万级 intent 时每 tick 省约 100 KB 的 LOH 垃圾。
     /// <paramref name="speeds"/> 非空时额外接收引擎速度大小（可选尾部表，旧 DLL 为空）。
+    /// <paramref name="targets"/> 非空时额外接收内核预测的 NPC 目标槽（可选尾部表，旧 DLL 为空）。
     /// </remarks>
     public void GetActionPlanInto(
         List<(uint Key, byte Delta, float Confidence)> buffer,
-        List<(byte Kind, int Slot, float Magnitude)>? speeds = null) =>
-        host.Kernel.ReadActionPlanInto(buffer, speeds);
+        List<(byte Kind, int Slot, float Magnitude)>? speeds = null,
+        List<(byte Kind, int Slot, int TargetSlot)>? targets = null) =>
+        host.Kernel.ReadActionPlanInto(buffer, speeds, targets);
 
     /// <summary>
     /// 推送本 tick 的实体状态快照（Phase 2 TritEnginePort）。
@@ -495,13 +497,21 @@ public sealed class RuntimeShim : IDisposable
     /// 零开销降级：<c>takeover</c> 为 <c>None</c>（L0）时内核整包忽略；
     /// 托管回退与旧版原生库返回 <see langword="false"/>，调用方跳过即可。
     /// </summary>
+    /// <param name="states">实体状态（整批替换）。</param>
+    /// <param name="players">
+    /// 玩家表（整批替换，可选）：内核据此为 NPC 预测最近的玩家。
+    /// 旧 DLL 不识别这段尾部——但 ABI 版本门已经保证不会混装。
+    /// </param>
     /// <returns><see langword="true"/> = 内核接受了这批状态。</returns>
-    public bool PushEntityStates(IReadOnlyList<EntitySnapshot> states)
+    public bool PushEntityStates(
+        IReadOnlyList<EntitySnapshot> states,
+        IReadOnlyList<PlayerSnapshot>? players = null)
     {
         int count = states.Count;
+        int playerCount = players?.Count ?? 0;
 
-        // 先精确算长度（20 B 定长 + 每个非零 ai 槽 2 B），一次分配到位。
-        int payloadSize = 4;
+        // 先精确算长度（28 B 定长 + 每个非零 ai 槽 2 B + 玩家表），一次分配到位。
+        int payloadSize = 4 + 4 + (playerCount * WireFormat.StatePlayerRecordLength);
         for (int i = 0; i < count; i++)
         {
             int aiSlots = System.Numerics.BitOperations.PopCount(AiMask(states[i]));
@@ -540,6 +550,11 @@ public sealed class RuntimeShim : IDisposable
                 flags |= (byte)StateFlags.HasTarget;
             }
 
+            if (state.HasPosition)
+            {
+                flags |= (byte)StateFlags.HasPosition;
+            }
+
             writer
                 .U8(state.Kind)
                 .U16(ClampToU16(state.Slot))
@@ -552,6 +567,8 @@ public sealed class RuntimeShim : IDisposable
                 .U16(WireFormat.QuantizeU16(state.TargetDistance, WireFormat.StateTargetDistanceScale))
                 .I16(WireFormat.QuantizeI16(state.TargetDx, WireFormat.StateTargetDeltaScale))
                 .I16(WireFormat.QuantizeI16(state.TargetDy, WireFormat.StateTargetDeltaScale))
+                .I32(WireFormat.QuantizeI32(state.PositionX, WireFormat.StatePositionScale))
+                .I32(WireFormat.QuantizeI32(state.PositionY, WireFormat.StatePositionScale))
                 .U8(aiMask);
 
             if ((aiMask & (1 << 0)) != 0)
@@ -593,6 +610,38 @@ public sealed class RuntimeShim : IDisposable
             {
                 writer.I16(WireFormat.QuantizeI16(state.Ai7, WireFormat.StateAiScale));
             }
+        }
+
+        writer.U32((uint)playerCount);
+        for (int i = 0; i < playerCount; i++)
+        {
+            PlayerSnapshot player = players![i];
+            byte flags = 0;
+            if (player.Active)
+            {
+                flags |= (byte)StatePlayerFlags.Active;
+            }
+
+            if (player.Dead)
+            {
+                flags |= (byte)StatePlayerFlags.Dead;
+            }
+
+            if (player.Ghost)
+            {
+                flags |= (byte)StatePlayerFlags.Ghost;
+            }
+
+            if (player.Immune)
+            {
+                flags |= (byte)StatePlayerFlags.Immune;
+            }
+
+            writer
+                .U16(ClampToU16(player.Slot))
+                .I32(WireFormat.QuantizeI32(player.CenterX, WireFormat.StatePositionScale))
+                .I32(WireFormat.QuantizeI32(player.CenterY, WireFormat.StatePositionScale))
+                .U8(flags);
         }
 
         var response = host.Kernel.Submit(Opcode.StatePush, writer.RawBuffer, writer.Length);
@@ -1105,13 +1154,14 @@ public static class EntityKinds
 /// 一条实体状态快照，对应 STATE_PUSH 的一条变长记录。
 /// </summary>
 /// <remarks>
-/// v2 协议只传输引擎真正消费的字段：kind/slot/type、velocity、direction、flags、
-/// walk_speed、target_distance、非零 ai 槽。
-/// <see cref="PositionX"/>、<see cref="PositionY"/>、<see cref="Life"/>、
-/// <see cref="LifeMax"/>、<see cref="Target"/> 的槽值、<see cref="Ai2"/>..<see cref="Ai7"/>
-/// 不再上线（保留字段是为了不破坏模组侧构造代码）。
+/// 只传输引擎真正消费的字段：kind/slot/type、velocity、direction、flags、
+/// walk_speed、target_distance、position、非零 ai 槽。
+/// <see cref="Life"/>、<see cref="LifeMax"/>、<see cref="Target"/> 的槽值、
+/// <see cref="Ai2"/>..<see cref="Ai7"/> 不再上线（保留字段是为了不破坏模组侧构造代码）。
 /// Projectile 复用：<see cref="OnGround"/> = <c>active</c>、
 /// <see cref="Target"/> 仅用于 <c>HasTarget</c> 标志；重力在内核侧固定 0.08。
+/// <see cref="PositionX"/> / <see cref="PositionY"/> 是**实体中心**，
+/// 且必须同时置 <see cref="HasPosition"/> —— 内核只信置位的坐标。
 /// </remarks>
 public struct EntitySnapshot
 {
@@ -1130,10 +1180,10 @@ public struct EntitySnapshot
     /// <summary>垂直速度。</summary>
     public float VelocityY;
 
-    /// <summary>X 坐标。</summary>
+    /// <summary>X 坐标（实体中心，配合 <see cref="HasPosition"/> 使用）。</summary>
     public float PositionX;
 
-    /// <summary>Y 坐标。</summary>
+    /// <summary>Y 坐标（实体中心，配合 <see cref="HasPosition"/> 使用）。</summary>
     public float PositionY;
 
     /// <summary>朝向（-1 / 1）。</summary>
@@ -1192,4 +1242,38 @@ public struct EntitySnapshot
 
     /// <summary>是否站在地面（Projectile 复用为 <c>active</c>）。</summary>
     public bool OnGround;
+
+    /// <summary>
+    /// <see cref="PositionX"/> / <see cref="PositionY"/> 是否有效。
+    /// 未置位时内核不拿这对坐标做目标预测（避免把默认 0,0 当成原点）。
+    /// </summary>
+    public bool HasPosition;
+}
+
+/// <summary>
+/// 一名玩家的状态（STATE_PUSH 尾部玩家表的一行）。
+/// <see cref="CenterX"/> / <see cref="CenterY"/> 是玩家**中心**坐标。
+/// </summary>
+public struct PlayerSnapshot
+{
+    /// <summary>玩家槽位（<c>whoAmI</c>）。</summary>
+    public int Slot;
+
+    /// <summary>中心 X 坐标。</summary>
+    public float CenterX;
+
+    /// <summary>中心 Y 坐标。</summary>
+    public float CenterY;
+
+    /// <summary>玩家在线。</summary>
+    public bool Active;
+
+    /// <summary>玩家已死亡。</summary>
+    public bool Dead;
+
+    /// <summary>玩家处于幽灵/半透明状态。</summary>
+    public bool Ghost;
+
+    /// <summary>玩家处于无敌帧。</summary>
+    public bool Immune;
 }

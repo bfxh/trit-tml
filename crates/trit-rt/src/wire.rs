@@ -123,28 +123,46 @@ pub mod op {
     /// 实体状态推送（Phase 2 TritEnginePort）：把当前世界的完整实体状态喂给内核，
     /// 让 `trit-engine` 能跑原版等价 AI 而不是只做历史外推。
     ///
-    /// 载荷：`count u32, [record] * n`，每条 record 变长：
+    /// 载荷：`count u32, [record] * n, player_count u32, [player] * m`，每条 record 变长：
     /// `kind u8, slot u16, type u16, vel_x i16, vel_y i16, dir i8, flags u8,
     ///  walk_speed i16, target_distance u16, target_dx i16, target_dy i16,
-    ///  ai_mask u8, ai_q i16 * popcount(ai_mask)`。
+    ///  pos_x i32, pos_y i32, ai_mask u8, ai_q i16 * popcount(ai_mask)`。
     ///
-    /// 定长部分 [`STATE_RECORD_FIXED_LEN`](crate::wire::STATE_RECORD_FIXED_LEN) = 20 字节，
+    /// 定长部分 [`STATE_RECORD_FIXED_LEN`](crate::wire::STATE_RECORD_FIXED_LEN) = 28 字节，
     /// 每个非零 ai 槽再加 2 字节。
     /// `target_dx / target_dy` 是 `实体中心 - 目标中心` 的像素偏移（有符号），
     /// 引擎用它算追踪方向；无目标时为 0。
-    /// 位置 / 生命 / target 槽值 / ai[2..8] 引擎不消费，不再传输（旧版每条 83 字节）。
+    /// `pos_x / pos_y` 是实体**中心**坐标（i32，量化见
+    /// [`STATE_POSITION_SCALE`](crate::wire::STATE_POSITION_SCALE)），仅当
+    /// [`state_flags::HAS_POSITION`](crate::wire::state_flags::HAS_POSITION) 置位时有效；
+    /// 内核用它为 NPC 预测「最近的玩家」（见尾部玩家表）。
+    /// 生命 / target 槽值 / ai[2..8] 引擎不消费，不再传输（旧版每条 83 字节）。
     ///
-    /// 响应：空。整批**替换**上一 tick 的状态表（不是增量合并）—— 消失的实体自然被清掉。
+    /// 玩家表（v6 新增，整批替换）：`player_count u32, [slot u16, pos_x i32, pos_y i32,
+    /// flags u8] * player_count`。位置同样是**玩家中心**，量化同
+    /// [`STATE_POSITION_SCALE`](crate::wire::STATE_POSITION_SCALE)。
+    /// flags 见 [`player_flags`](crate::wire::player_flags)。
+    ///
+    /// 响应：空。整批**替换**上一 tick 的状态表与玩家表（不是增量合并）—— 消失的实体自然被清掉。
     /// `takeover_fork == None`（L0）时忽略载荷，零开销。
     pub const STATE_PUSH: u32 = 0x20;
 }
 
 /// [`op::STATE_PUSH`] 单条实体状态记录的定长部分（不含变长 ai 值）。
-/// `u8(1) + u16(2)*3 + i16(2)*4 + i8(1) + u8(1)*2 + u16(2)` = 20。
-pub const STATE_RECORD_FIXED_LEN: usize = 20;
+/// `u8(1) + u16(2)*3 + i16(2)*4 + i8(1) + u8(1)*2 + u16(2) + i32(4)*2` = 28。
+pub const STATE_RECORD_FIXED_LEN: usize = 28;
 
 /// ai 槽数量（`ai_mask` 的位宽）。
 pub const STATE_AI_SLOTS: usize = 8;
+
+/// [`op::STATE_PUSH`] 玩家表单条记录长度：`slot u16 + pos_x i32 + pos_y i32 + flags u8`。
+pub const STATE_PLAYER_RECORD_LEN: usize = 11;
+
+/// [`op::ACTION_PLAN`] 目标表单条记录长度：`kind u8 + slot u16 + target_slot u16`。
+pub const STATE_TARGET_RECORD_LEN: usize = 5;
+
+/// 目标表里「没有目标」的哨兵值。
+pub const STATE_NO_TARGET_SLOT: u16 = u16::MAX;
 
 /// velocity / walk_speed 量化比例：`q = round(v * 256)`，范围约 ±128。
 pub const STATE_VELOCITY_SCALE: f32 = 256.0;
@@ -156,6 +174,8 @@ pub const STATE_AI_SCALE: f32 = 16.0;
 pub const STATE_TARGET_DISTANCE_SCALE: f32 = 4.0;
 /// target_dx / target_dy 量化比例：`q = round(v * 4)`，i16 范围约 ±8191 px。
 pub const STATE_TARGET_DELTA_SCALE: f32 = 4.0;
+/// pos_x / pos_y 量化比例：`q = round(v * 16)`，i32 范围约 ±1.34 亿 px。
+pub const STATE_POSITION_SCALE: f32 = 16.0;
 
 /// [`op::STATE_PUSH`] 记录里的标志位。
 pub mod state_flags {
@@ -167,6 +187,20 @@ pub mod state_flags {
     pub const ACTIVE: u8 = 1 << 2;
     /// NPC 有目标（旧版 `target >= 0`；引擎只判符号）。
     pub const HAS_TARGET: u8 = 1 << 3;
+    /// `pos_x / pos_y` 有效。未置位时位置视为未知（**不要**把 0.0 当原点）。
+    pub const HAS_POSITION: u8 = 1 << 4;
+}
+
+/// 玩家表里的标志位。
+pub mod player_flags {
+    /// 玩家在线。
+    pub const ACTIVE: u8 = 1 << 0;
+    /// 玩家已死亡。
+    pub const DEAD: u8 = 1 << 1;
+    /// 玩家处于幽灵/半透明状态。
+    pub const GHOST: u8 = 1 << 2;
+    /// 玩家处于无敌帧（免疫伤害）。
+    pub const IMMUNE: u8 = 1 << 3;
 }
 
 /// 一条 STATE_PUSH 记录的总字节数（定长部分 + 2 × 非零 ai 槽数）。
@@ -188,6 +222,22 @@ pub fn quantize_i16(value: f32, scale: f32) -> i16 {
 /// 反量化 i16。
 #[inline]
 pub fn dequantize_i16(value: i16, scale: f32) -> f32 {
+    value as f32 / scale
+}
+
+/// 量化到 i32（四舍五入 + 饱和）。位置坐标用。
+#[inline]
+pub fn quantize_i32(value: f32, scale: f32) -> i32 {
+    let scaled = (value * scale).round();
+    if scaled.is_nan() {
+        return 0;
+    }
+    scaled.clamp(i32::MIN as f32, i32::MAX as f32) as i32
+}
+
+/// 反量化 i32（位置坐标用）。
+#[inline]
+pub fn dequantize_i32(value: i32, scale: f32) -> f32 {
     value as f32 / scale
 }
 
@@ -521,11 +571,13 @@ mod tests {
     }
 
     #[test]
-    fn state_record_len_matches_v5_layout() {
-        assert_eq!(STATE_RECORD_FIXED_LEN, 20);
-        assert_eq!(state_record_len(0b0000_0000), 20);
-        assert_eq!(state_record_len(0b0000_0011), 24);
-        assert_eq!(state_record_len(0b1111_1111), 36);
+    fn state_record_len_matches_v6_layout() {
+        assert_eq!(STATE_RECORD_FIXED_LEN, 28);
+        assert_eq!(state_record_len(0b0000_0000), 28);
+        assert_eq!(state_record_len(0b0000_0011), 32);
+        assert_eq!(state_record_len(0b1111_1111), 44);
+        assert_eq!(STATE_PLAYER_RECORD_LEN, 11);
+        assert_eq!(STATE_TARGET_RECORD_LEN, 5);
     }
 
     #[test]

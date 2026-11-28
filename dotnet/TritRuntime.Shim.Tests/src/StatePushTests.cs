@@ -235,4 +235,58 @@ public sealed class StatePushTests
         Assert.NotEmpty(plan);
         Assert.Empty(speeds);
     }
+
+    /// <summary>ACTION_PLAN 尾部目标表：给带位置的 NPC 挑最近的活跃玩家（跳过死亡）。</summary>
+    [Fact]
+    public void ActionPlanCarriesNearestPlayerTarget()
+    {
+        var path = NativeLibraryLocator.Find();
+        if (path is null)
+        {
+            return;
+        }
+
+        using var shim = RuntimeShim.Attach(new RuntimeHostOptions
+        {
+            LibraryPath = path,
+            ConfigJson = TakeoverConfig,
+            AllowDefaultProbing = false,
+        });
+
+        Assert.True(shim.PushEntityStates(
+            new[]
+            {
+                new EntitySnapshot
+                {
+                    Kind = EntityKinds.Npc,
+                    Slot = 5,
+                    Type = 3,
+                    VelocityX = 0.4f,
+                    Direction = 1,
+                    Target = 7,
+                    PositionX = 0f,
+                    PositionY = 0f,
+                    HasPosition = true,
+                    WalkSpeed = 1.4f,
+                    TileBelow = true,
+                    OnGround = true,
+                },
+            },
+            new[]
+            {
+                new PlayerSnapshot { Slot = 0, CenterX = 1000f, CenterY = 0f, Active = true },
+                new PlayerSnapshot { Slot = 1, CenterX = 50f, CenterY = 0f, Active = true },
+                new PlayerSnapshot { Slot = 2, CenterX = 10f, CenterY = 0f, Active = true, Dead = true },
+            }));
+
+        var plan = new List<(uint Key, byte Delta, float Confidence)>();
+        var speeds = new List<(byte Kind, int Slot, float Magnitude)>();
+        var targets = new List<(byte Kind, int Slot, int TargetSlot)>();
+        shim.GetActionPlanInto(plan, speeds, targets);
+
+        var entry = Assert.Single(targets);
+        Assert.Equal(EntityKinds.Npc, entry.Kind);
+        Assert.Equal(5, entry.Slot);
+        Assert.Equal(1, entry.TargetSlot);
+    }
 }

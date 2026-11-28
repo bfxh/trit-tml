@@ -85,6 +85,12 @@ internal sealed class EntityTakeover
     /// <summary>ActionPlan 尾部速度表复用缓冲。</summary>
     private readonly List<(byte Kind, int Slot, float Magnitude)> actionPlanSpeedBuffer = new(512);
 
+    /// <summary>ActionPlan 尾部目标表复用缓冲（内核预测的 NPC 目标槽）。</summary>
+    private readonly List<(byte Kind, int Slot, int TargetSlot)> actionPlanTargetBuffer = new(512);
+
+    /// <summary>玩家表复用缓冲（STATE_PUSH 尾部）。</summary>
+    private readonly List<PlayerSnapshot> playerBuffer = new(16);
+
     /// <summary>速度表复用字典（每 tick Clear 后重填，稳态零分配）。</summary>
     private readonly Dictionary<ulong, float> speedBuffer = new();
     private readonly Dictionary<ulong, List<(uint Key, byte Delta, float Confidence)>> bucketBuffer = new();
@@ -114,6 +120,12 @@ internal sealed class EntityTakeover
     /// <summary>本 tick 对拍结果为一致的样本数（<see cref="RecordedCount"/> 的子集）。</summary>
     public int ConsistentCount { get; private set; }
 
+    /// <summary>本 tick 目标预测对拍样本数（只统计「原版确实有目标」的 NPC）。</summary>
+    public int TargetSampleCount { get; private set; }
+
+    /// <summary>本 tick 目标预测命中的样本数（<see cref="TargetSampleCount"/> 的子集）。</summary>
+    public int TargetHitCount { get; private set; }
+
     // 进程内累计（命令层 /trit takeover stats 的长期观测口径，不持久化）。
     private long totalPlans;
     private long totalRecorded;
@@ -126,6 +138,8 @@ internal sealed class EntityTakeover
     private long modelEvalHits;
     private double modelErrorSum;
     private float modelErrorMax;
+    private long totalTargetSamples;
+    private long totalTargetHits;
 
     /// <summary>
     /// ReplaceOrig KernelFirst 的置信度门槛。
@@ -173,7 +187,7 @@ internal sealed class EntityTakeover
         // 校准与 KernelFirst 用同一个采样位置（AI 之前），这样引擎预测描述的是
         // "本 tick 待执行的变化"，tick 末尾才能和原版实际结果对齐。
         PushEntityStates();
-        shim.GetActionPlanInto(actionPlanBuffer);
+        shim.GetActionPlanInto(actionPlanBuffer, targets: actionPlanTargetBuffer);
         lastActionPlan = actionPlanBuffer;
         calibrationPending = lastActionPlan.Count > 0;
     }
@@ -186,7 +200,8 @@ internal sealed class EntityTakeover
             int tickVertical, int tickVerticalFallback,
             long totalPlans, long totalRecorded, long totalConsistent, long totalTakeovers, long totalKernelFirst,
             long totalVertical, long totalVerticalFallbacks,
-            long modelSamples, long modelHits, double modelAverageError, float modelMaxError)
+            long modelSamples, long modelHits, double modelAverageError, float modelMaxError,
+            int tickTargetSamples, int tickTargetHits, long totalTargetSamples, long totalTargetHits)
         {
             TickPlans = tickPlans;
             TickRecorded = tickRecorded;
@@ -206,6 +221,10 @@ internal sealed class EntityTakeover
             ModelEvalHits = modelHits;
             ModelAverageError = modelAverageError;
             ModelMaxError = modelMaxError;
+            TickTargetSamples = tickTargetSamples;
+            TickTargetHits = tickTargetHits;
+            TotalTargetSamples = totalTargetSamples;
+            TotalTargetHits = totalTargetHits;
         }
 
         /// <summary>本 tick 内核输出 intent 条数。</summary>
@@ -262,6 +281,21 @@ internal sealed class EntityTakeover
         /// <summary>垂直模型一步预测的最大绝对误差（像素/tick）。</summary>
         public float ModelMaxError { get; }
 
+        /// <summary>本 tick 目标预测对拍样本数。</summary>
+        public int TickTargetSamples { get; }
+
+        /// <summary>本 tick 目标预测命中的样本数。</summary>
+        public int TickTargetHits { get; }
+
+        /// <summary>累计目标预测样本数。</summary>
+        public long TotalTargetSamples { get; }
+
+        /// <summary>累计目标预测命中数。</summary>
+        public long TotalTargetHits { get; }
+
+        /// <summary>目标预测命中率；没有样本时返回 0。</summary>
+        public double TargetHitRate => TotalTargetSamples > 0 ? (double)TotalTargetHits / TotalTargetSamples : 0d;
+
         /// <summary>累计一致率；没有样本时返回 0。</summary>
         public double ConsistencyRate => TotalRecorded > 0 ? (double)TotalConsistent / TotalRecorded : 0d;
 
@@ -283,7 +317,8 @@ internal sealed class EntityTakeover
         totalPlans, totalRecorded, totalConsistent, totalTakeovers, totalKernelFirst,
         totalKernelFirstVertical, totalVerticalFallbacks,
         modelEvalSamples, modelEvalHits,
-        modelEvalSamples > 0 ? modelErrorSum / modelEvalSamples : 0d, modelErrorMax);
+        modelEvalSamples > 0 ? modelErrorSum / modelEvalSamples : 0d, modelErrorMax,
+        TargetSampleCount, TargetHitCount, totalTargetSamples, totalTargetHits);
 
     // ──────────────────────────────────────────────────────────────────────────
     // KernelFirst 缓存层（tick 开头 PreUpdateEntities 驱动）
@@ -314,7 +349,7 @@ internal sealed class EntityTakeover
         // 后续 ActionPlan 才能给出原版等价的 delta（confidence 固定 1.0）。
         PushEntityStates();
 
-        shim.GetActionPlanInto(actionPlanBuffer, actionPlanSpeedBuffer);
+        shim.GetActionPlanInto(actionPlanBuffer, actionPlanSpeedBuffer, actionPlanTargetBuffer);
         var plan = actionPlanBuffer;
         lastActionPlan = plan;
 
@@ -436,8 +471,10 @@ internal sealed class EntityTakeover
                 Type = npc.type,
                 VelocityX = npc.velocity.X,
                 VelocityY = npc.velocity.Y,
-                PositionX = npc.position.X,
-                PositionY = npc.position.Y,
+                // 内核需要「实体中心」来挑最近的玩家（协议里 pos 与 target_dx 同语义）。
+                PositionX = npc.Center.X,
+                PositionY = npc.Center.Y,
+                HasPosition = true,
                 Direction = npc.direction,
                 Life = npc.life,
                 LifeMax = npc.lifeMax,
@@ -452,6 +489,30 @@ internal sealed class EntityTakeover
                 TargetDy = targetDy,
                 TileBelow = tileBelow,
                 OnGround = onGround,
+            });
+        }
+
+        // 玩家表（整批替换）：内核据此为带位置的 NPC 预测最近的玩家。
+        List<PlayerSnapshot> players = playerBuffer;
+        players.Clear();
+        Player[] playerList = Main.player;
+        for (int i = 0; i < playerList.Length; i++)
+        {
+            Player player = playerList[i];
+            if (player is null || !player.active)
+            {
+                continue;
+            }
+
+            players.Add(new PlayerSnapshot
+            {
+                Slot = player.whoAmI,
+                CenterX = player.Center.X,
+                CenterY = player.Center.Y,
+                Active = true,
+                Dead = player.dead,
+                Ghost = player.ghost,
+                Immune = player.immune,
             });
         }
 
@@ -471,8 +532,9 @@ internal sealed class EntityTakeover
                 Type = projectile.type,
                 VelocityX = projectile.velocity.X,
                 VelocityY = projectile.velocity.Y,
-                PositionX = projectile.position.X,
-                PositionY = projectile.position.Y,
+                PositionX = projectile.Center.X,
+                PositionY = projectile.Center.Y,
+                HasPosition = true,
                 Direction = projectile.direction,
                 Life = projectile.timeLeft,
                 // 弹幕没有追踪目标槽：显式 -1，避免默认 0 被当成「有目标」。
@@ -484,7 +546,7 @@ internal sealed class EntityTakeover
             });
         }
 
-        shim.PushEntityStates(states);
+        shim.PushEntityStates(states, players);
     }
 
     /// <summary>kernelFirstCache 当前有多少个实体（调试/日志用）。</summary>
@@ -826,6 +888,42 @@ internal sealed class EntityTakeover
     // ──────────────────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// 目标预测对拍：内核在 tick 开头按位置预测的「最近玩家」 vs orig 跑完后 NPC 的真实 target。
+    /// <para>只统计原版确实有目标的活跃 NPC —— 没有目标的实体没有可比较的答案。</para>
+    /// <para>纯观测：不写 <c>npc.target</c>。</para>
+    /// </summary>
+    private void CompareTargets()
+    {
+        TargetSampleCount = 0;
+        TargetHitCount = 0;
+
+        var targets = actionPlanTargetBuffer;
+        if (targets.Count == 0)
+        {
+            return;
+        }
+
+        NPC[] npcs = Main.npc;
+        foreach (var (kind, slot, targetSlot) in targets)
+        {
+            if (kind != LaneMap.KindNpc) continue;
+            if (slot < 0 || slot >= npcs.Length) continue;
+
+            NPC npc = npcs[slot];
+            if (npc is null || !npc.active || !npc.HasValidTarget) continue;
+
+            TargetSampleCount++;
+            if (npc.target == targetSlot)
+            {
+                TargetHitCount++;
+            }
+        }
+
+        totalTargetSamples += TargetSampleCount;
+        totalTargetHits += TargetHitCount;
+    }
+
+    /// <summary>
     /// 在 TritRuntimeMod.OnWorldTick 末尾所有原版 AI 跑完后调用。
     /// <para>
     /// KernelFirst 完整版对拍策略：
@@ -850,7 +948,7 @@ internal sealed class EntityTakeover
         bool isKernelFirst = settings.Takeover == TritSettings.TakeoverMode.ReplaceOrig;
         if (!(isKernelFirst && lastActionPlan is not null))
         {
-            shim.GetActionPlanInto(actionPlanBuffer);
+            shim.GetActionPlanInto(actionPlanBuffer, targets: actionPlanTargetBuffer);
         }
 
         var plan = actionPlanBuffer;
@@ -859,6 +957,10 @@ internal sealed class EntityTakeover
         RecordedCount = 0;
         ConsistentCount = 0;
         totalPlans += plan.Count;
+
+        // 目标预测对拍：tick 开头内核按位置挑「最近玩家」，这里和 orig 跑完的
+        // npc.target 对比。纯观测，不写 npc.target。
+        CompareTargets();
 
         if (plan.Count == 0)
         {
@@ -931,12 +1033,14 @@ internal sealed class EntityTakeover
                 TritRuntimeMod.Instance?.Logger?.Info(
                     $"[trit] KernelFirst：{plan.Count} plan → 跳过 orig {KernelFirstTakeoverCount}" +
                     $"（垂直 {KernelFirstVerticalCount} / 回退 {KernelFirstVerticalFallbackCount}）" +
-                    $"→ fallback 方向门 {TakeoverCount} → 对拍回写 {RecordedCount}");
+                    $"→ fallback 方向门 {TakeoverCount} → 对拍回写 {RecordedCount}" +
+                    $" → 目标 {TargetHitCount}/{TargetSampleCount}");
             }
-            else if (!isKernelFirst && (TakeoverCount > 0 || RecordedCount > 0))
+            else if (!isKernelFirst && (TakeoverCount > 0 || RecordedCount > 0 || TargetSampleCount > 0))
             {
                 TritRuntimeMod.Instance?.Logger?.Info(
-                    $"[trit] PatchAfterOrig：{plan.Count} plan → 对拍 {RecordedCount} → 方向门 {TakeoverCount}");
+                    $"[trit] PatchAfterOrig：{plan.Count} plan → 对拍 {RecordedCount} → 方向门 {TakeoverCount}" +
+                    $" → 目标 {TargetHitCount}/{TargetSampleCount}");
             }
         }
 
