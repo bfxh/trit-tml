@@ -420,8 +420,9 @@ TritHooks 回到纯观测：orig(self); bridge.NoteNpcAi();
   本 tick 被 KernelFirst 接管（没跑 orig）的实体没有真值，跳过并单独计数；
   目标玩家死亡 / 幽灵 / 不在推送玩家表里的样本同样跳过。
   另做「影子对拍」：在同一份推送快照上并行算曼哈顿距离、曼哈顿距离 − aggro 两种候选，
-  与内核的欧氏口径对比命中率，并按 `npc.type` 输出偏差 Top，用来区分
-  「模型口径不对」与「这类 NPC 本来就不按最近玩家选目标」。
+  按 `npc.type` 输出偏差 Top。内核本身已改用曼哈顿距离（与原版 `TargetClosest`
+  的 taxicab 口径一致），影子里的「曼哈顿」用于交叉校验两侧输入是否一致，
+  「+aggro」用于评估仇恨值带来的剩余偏差。
 - 历史修正：早期注释凭记忆写错过编号（把 4 当成 Eye of Cthulhu、10 当成 Giant Worm Head；
   实际 4 = Unholy Arrow、10 = Purification Powder，已在 `Projectile_IDs` 页核对），
   现已改为「只登记真正有实现分支的类型」，并由 `every_ported_type_has_a_branch` 测试锁定。

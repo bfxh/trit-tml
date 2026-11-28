@@ -1060,7 +1060,8 @@ internal sealed class EntityTakeover
     /// <para>
     /// 影子对拍：同一份推送快照上并行算「曼哈顿距离」「曼哈顿距离 − aggro」两种候选，
     /// 分别累计命中率，用来区分「模型口径问题」和「统计口径问题」。
-    /// 内核自身用的是欧氏平方，即 <see cref="TargetHitCount"/>。
+    /// 内核自身已改用曼哈顿距离（<see cref="TargetHitCount"/> 应恒等于曼哈顿命中数，
+    /// 二者不等即说明两侧输入/过滤不一致）；`+aggro` 是额外的对照口径。
     /// </para>
     /// </summary>
     private void CompareTargets()

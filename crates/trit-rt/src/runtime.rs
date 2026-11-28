@@ -410,7 +410,8 @@ fn engine_delta(state: &EntityState, rand: &mut trit_engine::prng::Prng) -> Opti
 ///
 /// 规则（内核消费者，纯观测用，本轮不写 `npc.target`）：
 /// - 跳过未 `ACTIVE`、已 `DEAD`、`GHOST` 的玩家；
-/// - 按中心平方距离取最小；全体并列时取 slot 小者；
+/// - 按**曼哈顿距离** `|dx| + |dy|` 取最小 —— 原版多数敌人的 `TargetClosest`
+///   用的就是 taxicab 距离而不是欧氏距离；全体并列时取 slot 小者；
 /// - NPC 无位置（`has_position == false`）或没有可用玩家时不输出。
 ///
 /// 输出 `(kind, slot, target_slot)`，由 `ACTION_PLAN` 尾部目标表下发。
@@ -443,20 +444,20 @@ fn predict_targets(
             }
             let dx = npc.position_x - player.position_x;
             let dy = npc.position_y - player.position_y;
-            let distance_sq = dx * dx + dy * dy;
-            if !distance_sq.is_finite() {
+            let distance = dx.abs() + dy.abs();
+            if !distance.is_finite() {
                 continue;
             }
             // 更近，或等距但 slot 更小 → 替换；否则保留当前候选。
             let replace = match best {
                 Some((best_slot, best_distance)) => {
-                    distance_sq < best_distance
-                        || (distance_sq == best_distance && player.slot < best_slot)
+                    distance < best_distance
+                        || (distance == best_distance && player.slot < best_slot)
                 }
                 None => true,
             };
             if replace {
-                best = Some((player.slot, distance_sq));
+                best = Some((player.slot, distance));
             }
         }
 
@@ -2663,6 +2664,27 @@ mod tests {
             vec![(crate::takeover::lane::KIND_NPC, 0, 1)],
             "应取最近的活跃玩家，等距时取 slot 小者"
         );
+    }
+
+    /// 距离度量必须是曼哈顿（taxicab）而不是欧氏：
+    /// A 在 (0,40) → 欧氏 40 / 曼哈顿 40；B 在 (28,28) → 欧氏 ≈39.6 / 曼哈顿 56。
+    /// 原版 TargetClosest 选 A，欧氏会误选 B。
+    #[test]
+    fn predicts_by_manhattan_not_euclidean() {
+        let mut rt = takeover_runtime();
+        let push = {
+            let mut w = Writer::new();
+            w.u32(1);
+            w.bytes(&state_record_full(1, 0, 3, 1, 0.0, 0.0, 0.0, 0.0, true));
+            w.u32(2);
+            w.bytes(&player_record(0, 0.0, 40.0, wire::player_flags::ACTIVE));
+            w.bytes(&player_record(1, 28.0, 28.0, wire::player_flags::ACTIVE));
+            w.into_vec()
+        };
+        rt.dispatch(op::STATE_PUSH, &push).unwrap();
+
+        let targets = read_action_plan_targets(&rt.dispatch(op::ACTION_PLAN, b"").unwrap());
+        assert_eq!(targets, vec![(crate::takeover::lane::KIND_NPC, 0, 0)]);
     }
 
     /// 没有 `HAS_POSITION` 的 NPC 不参与目标预测（0.0 不能当原点）。
